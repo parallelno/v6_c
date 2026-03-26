@@ -1,4 +1,4 @@
-# Plan: C Compiler Targeting the Intel 8080
+# Plan: C Compiler Written in Rust Targeting the Intel 8080
 
 ## 1. Audit of Existing C‑to‑8080/Z80 Compilers
 
@@ -23,7 +23,7 @@ The `__global` static‑allocation model is the single biggest performance win f
 * No IR‑level optimization passes beyond tree simplification — no CSE, no dead‑code elimination, no loop transformations. → *Addressed in Phase 2 (§3) and Phase 5.*
 * No peephole optimizer on emitted assembly. → *Addressed in Phase 1 (step 1.9) and Phase 2 (step 2.6).*
 * No register allocator — the 8080's scarce register set is managed by fixed templates. → *Addressed in Phase 5 (step 5.1).*
-* The `__global` mode requires whole‑program compilation (all call paths known); separate compilation or function pointers break the model. → *Addressed in Phase 6 (step 6.1, 6.2).*
+* The `__global` mode requires whole‑program compilation (all call paths known); separate compilation or function pointers break the model.
 
 ---
 
@@ -298,14 +298,6 @@ Each routine is hand‑optimized for the 8080 instruction set. The multiply/divi
 - [ ] **5.5 Jump threading & branch optimization** — Eliminate chains of unconditional jumps; invert branch conditions to remove extra jumps.
 - [ ] **5.6 Floating‑point support** — Software IEEE‑754 (32‑bit) library in assembly; `float` type in the compiler.
 - [ ] **5.7 Variadic functions** — `stdarg.h` support via stack mode.
-
-### Phase 6 — Separate Compilation & Function Pointers
-
-**Goal:** Overcome the limitations of whole‑program static allocation; support modular and dynamic programs.
-
-- [ ] **6.1 Separate compilation** — Support compiling individual translation units independently and linking them together. Requires a symbol‑table export/import mechanism and relaxing the requirement that all call paths are known at compile time.
-- [ ] **6.2 Function pointers & indirect calls** — Support function pointers with automatic fall‑back to stack mode for functions whose address is taken. Enable callback patterns and vtable‑style dispatch.
-- [ ] **6.3 Dynamic call‑graph analysis** — Hybrid mode: use static allocation for functions proven non‑recursive and not called indirectly; automatically switch to stack mode for the rest.
 
 ---
 
