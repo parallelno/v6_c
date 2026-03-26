@@ -1,4 +1,5 @@
 mod ast;
+mod lexer;
 mod types;
 
 fn main() {
