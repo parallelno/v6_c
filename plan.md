@@ -4,7 +4,7 @@
 
 ### 1.1 c8080 (alemorf/c8080)
 
-**Overview.** c8080 is an open‑source C compiler written in C++ that directly targets the Intel 8080. It outputs assembly for the **sjasmplus** assembler and supports CP/M, Iskra‑1080 Tartu, and Specialist output formats. It also compiles a simpler "CMM" language. The compiler includes a C parser, an expression‑tree IR, tree‑level optimizations, and an 8080 code generator.
+**Overview.** c8080 is an open‑source C compiler written in C++ that directly targets the Intel 8080. It includes a C parser, an expression‑tree IR, tree‑level optimizations, and an 8080 code generator.
 
 **Key performance‑relevant design choices:**
 
@@ -19,11 +19,11 @@
 **Performance assessment.**
 The `__global` static‑allocation model is the single biggest performance win for 8080 targets. On an 8080 there is **no frame pointer register** and computing `SP + offset` costs 20+ cycles per access. Eliminating that overhead makes compiled C competitive with hand‑written assembly for non‑recursive code. The register‑passing convention adds a smaller but still worthwhile improvement.
 
-**Limitations to learn from:**
-* No IR‑level optimization passes beyond tree simplification — no CSE, no dead‑code elimination, no loop transformations.
-* No peephole optimizer on emitted assembly.
-* No register allocator — the 8080's scarce register set is managed by fixed templates.
-* The `__global` mode requires whole‑program compilation (all call paths known); separate compilation or function pointers break the model.
+**Limitations to learn from** (addressed in later phases of our plan):
+* No IR‑level optimization passes beyond tree simplification — no CSE, no dead‑code elimination, no loop transformations. → *Addressed in Phase 2 (§3) and Phase 5.*
+* No peephole optimizer on emitted assembly. → *Addressed in Phase 1 (step 1.9) and Phase 2 (step 2.6).*
+* No register allocator — the 8080's scarce register set is managed by fixed templates. → *Addressed in Phase 5 (step 5.1).*
+* The `__global` mode requires whole‑program compilation (all call paths known); separate compilation or function pointers break the model. → *Addressed in Phase 6 (step 6.1, 6.2).*
 
 ---
 
@@ -65,7 +65,7 @@ The z88dk project publishes the most thorough benchmark comparison of Z80 C comp
 | **P0** | Produce the fastest possible 8080 machine code for the supported C subset. |
 | **P1** | Keep the architecture modular so additional C features can be added incrementally. |
 | **P2** | Emit readable, debuggable assembly. |
-| **P3** | Keep the compiler itself simple and maintainable (written in C). |
+| **P3** | Keep the compiler itself simple and maintainable (written in Rust). |
 
 ### 2.2 High‑Level Architecture
 
@@ -89,7 +89,7 @@ The compiler is a single‑pass‑per‑stage pipeline:
 4. **IR optimization passes** → constant folding/propagation, dead‑code elimination, strength reduction, common sub‑expression elimination.
 5. **Code generator** → Intel 8080 assembly with physical register allocation.
 6. **Peephole optimizer** → pattern‑matched rewriting of emitted assembly.
-7. **Output** → assembly text for an external assembler (e.g. sjasmplus, zmac, or a custom minimal assembler).
+7. **Output** → assembly text for the **v6asm** assembler (https://github.com/parallelno/v6_assembler), targeting the Vector 06 computer (starting address `0x100`).
 
 ### 2.3 Calling Convention & Memory Model
 
@@ -215,10 +215,6 @@ JZ label            JZ label
 CALL func           JMP func
 RET              →   (deleted)
 
-// Combine increments
-INX H               INX H
-INX H           →   INX H  (keep both — but flag for LXI+DAD if 3+)
-INX H
 ```
 
 The peephole runs in a loop until no more rules fire (fixed‑point).
@@ -255,7 +251,7 @@ Each routine is hand‑optimized for the 8080 instruction set. The multiply/divi
 - [ ] **1.7 Code generator** — Translate IR to 8080 assembly. Pattern‑matched instruction selection. Linear‑scan register allocation within basic blocks.
 - [ ] **1.8 Assembly runtime** — Hand‑written 8080 assembly for `__mul16`, `__div16u`, `__div16s`, `__mod16u`, `__mod16s`, `__shl16`, `__shr16u`, `__shr16s`.
 - [ ] **1.9 Peephole optimizer** — 10–15 rules covering the most common redundancies.
-- [ ] **1.10 Assembly output** — Emit a complete `.asm` file for sjasmplus (or equivalent assembler).
+- [ ] **1.10 Assembly output** — Emit a complete `.asm` file for the **v6asm** assembler, targeting Vector 06 (ORG `0x100`).
 - [ ] **1.11 Test** — Compile and run Sieve of Eratosthenes on an 8080 emulator. Validate correctness. Measure cycle count.
 
 ### Phase 2 — Optimizations & Expanded Types
@@ -281,14 +277,14 @@ Each routine is hand‑optimized for the 8080 instruction set. The multiply/divi
 - [ ] **3.5 Multi‑dimensional arrays & initializer lists.**
 - [ ] **3.6 Stack mode improvements** — Software frame pointer; efficient SP‑relative access helpers.
 
-### Phase 4 — Standard Library & Targets
+### Phase 4 — Standard Library & Vector 06 Target
 
-**Goal:** Usable for real‑world 8080 programs.
+**Goal:** Usable for real‑world Vector 06 programs.
 
 - [ ] **4.1 Full string.h** — All standard string functions in assembly.
 - [ ] **4.2 stdio.h subset** — `printf` (integer formats), `puts`, `getchar`, `putchar`.
 - [ ] **4.3 stdlib.h subset** — `malloc`/`free`, `atoi`, `abs`, `rand`.
-- [ ] **4.4 Target support** — CP/M (.COM output), raw binary, Intel HEX. Target‑specific I/O stubs.
+- [ ] **4.4 Vector 06 target support** — Binary output (ORG `0x100`). Vector 06‑specific I/O stubs (keyboard, display).
 - [ ] **4.5 Linker integration** — Support multi‑file compilation; resolve extern symbols across translation units.
 
 ### Phase 5 — Advanced Optimizations
@@ -303,6 +299,14 @@ Each routine is hand‑optimized for the 8080 instruction set. The multiply/divi
 - [ ] **5.6 Floating‑point support** — Software IEEE‑754 (32‑bit) library in assembly; `float` type in the compiler.
 - [ ] **5.7 Variadic functions** — `stdarg.h` support via stack mode.
 
+### Phase 6 — Separate Compilation & Function Pointers
+
+**Goal:** Overcome the limitations of whole‑program static allocation; support modular and dynamic programs.
+
+- [ ] **6.1 Separate compilation** — Support compiling individual translation units independently and linking them together. Requires a symbol‑table export/import mechanism and relaxing the requirement that all call paths are known at compile time.
+- [ ] **6.2 Function pointers & indirect calls** — Support function pointers with automatic fall‑back to stack mode for functions whose address is taken. Enable callback patterns and vtable‑style dispatch.
+- [ ] **6.3 Dynamic call‑graph analysis** — Hybrid mode: use static allocation for functions proven non‑recursive and not called indirectly; automatically switch to stack mode for the rest.
+
 ---
 
 ## 4. Project Structure
@@ -310,21 +314,22 @@ Each routine is hand‑optimized for the 8080 instruction set. The multiply/divi
 ```
 v6_c/
 ├── plan.md                  # This document
+├── Cargo.toml               # Rust project manifest
 ├── src/
-│   ├── main.c               # Driver: CLI, file I/O, pipeline orchestration
-│   ├── lexer.c / lexer.h    # Tokenizer
-│   ├── preproc.c / preproc.h # Preprocessor
-│   ├── parser.c / parser.h  # Recursive-descent parser → AST
-│   ├── ast.c / ast.h        # AST node definitions and utilities
-│   ├── types.c / types.h    # Type system
-│   ├── ir.c / ir.h          # Three-address IR definitions
-│   ├── ir_gen.c / ir_gen.h  # AST → IR lowering
-│   ├── ir_opt.c / ir_opt.h  # IR optimization passes
-│   ├── callgraph.c / .h     # Call-graph analysis, static allocation
-│   ├── codegen.c / codegen.h # IR → 8080 assembly
-│   ├── regalloc.c / .h      # Register allocator
-│   ├── peephole.c / .h      # Peephole optimizer
-│   └── emit.c / emit.h      # Assembly text emitter
+│   ├── main.rs              # Driver: CLI, file I/O, pipeline orchestration
+│   ├── lexer.rs             # Tokenizer
+│   ├── preproc.rs           # Preprocessor
+│   ├── parser.rs            # Recursive-descent parser → AST
+│   ├── ast.rs               # AST node definitions and utilities
+│   ├── types.rs             # Type system
+│   ├── ir.rs                # Three-address IR definitions
+│   ├── ir_gen.rs            # AST → IR lowering
+│   ├── ir_opt.rs            # IR optimization passes
+│   ├── callgraph.rs         # Call-graph analysis, static allocation
+│   ├── codegen.rs           # IR → 8080 assembly
+│   ├── regalloc.rs          # Register allocator
+│   ├── peephole.rs          # Peephole optimizer
+│   └── emit.rs              # Assembly text emitter (v6asm format)
 ├── runtime/
 │   ├── mul16.asm             # 16-bit multiply
 │   ├── div16.asm             # 16-bit divide/modulo
@@ -333,7 +338,7 @@ v6_c/
 │   ├── shift.asm             # Shift routines
 │   ├── cmp.asm               # Comparison helpers
 │   ├── memcpy.asm            # Memory operations
-│   └── crt0.asm              # C runtime startup
+│   └── crt0.asm              # C runtime startup (Vector 06, ORG 0x100)
 ├── include/
 │   ├── stdint.h
 │   ├── stdbool.h
@@ -347,7 +352,6 @@ v6_c/
 │   ├── dhrystone.c            # Dhrystone 2.1
 │   ├── fannkuch.c             # Fannkuch benchmark
 │   └── unit/                  # Per-feature unit tests
-├── Makefile
 └── README.md
 ```
 
@@ -375,5 +379,5 @@ Based on the z88dk benchmark data (scaled to 8080 cycle counts, ~2× Z80 due to 
 | Assembly runtime library | Audit §1.2: assembly math libs deliver 2–4× speedups — the single most impactful investment after code generation. |
 | Peephole optimizer on assembly | Low complexity, high value (audit §1.2 — Hitech‑C's global optimizer is its main advantage). |
 | Recursive‑descent parser | Simplicity; no external tools (yacc/bison); easy to extend for new C features. |
-| Written in C | Self‑hosting is a future possibility; aligns with the target domain. |
-| Separate assembler (sjasmplus) | Mature tool; avoids writing an assembler; focus effort on compilation quality. |
+| Written in Rust | Memory safety, strong type system, excellent pattern matching for IR/AST transforms, modern tooling (cargo). |
+| Separate assembler (v6asm) | Purpose‑built for Vector 06 targets; avoids writing an assembler; focus effort on compilation quality. |
