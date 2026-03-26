@@ -31,7 +31,7 @@ The `__global` static‑allocation model is the single biggest performance win f
 
 The z88dk project publishes the most thorough benchmark comparison of Z80 C compilers. Although Z80 is a superset of 8080, the results are directly relevant: every Z80 compiler must still use the 8080 base instruction set for core integer work, and the 8080 lacks the Z80 index registers (IX/IY) that some compilers rely on for stack frames.
 
-**Compilers tested:** Hitech‑C CPM v3.09, Hitech‑C Z80 v7.80, IAR Z80 V4.06A, SDCC 4.2.0, z88dk/sccz80 (classic & new libs), z88dk/sdcc (classic & new libs).
+**Compilers tested:** Hitech‑C CP/M v3.09, Hitech‑C Z80 v7.80, IAR Z80 V4.06A, SDCC 4.2.0, z88dk/sccz80 (classic & new libs), z88dk/sdcc (classic & new libs).
 
 #### Benchmark Summary
 
@@ -249,7 +249,7 @@ Each routine is hand‑optimized for the 8080 instruction set. The multiply/divi
 - [ ] **1.1 Lexer** — Tokenize C source: keywords, identifiers, integer constants, string literals, operators, punctuation.
 - [ ] **1.2 Preprocessor** — `#include`, `#define`, `#ifdef`/`#ifndef`/`#endif`, `#if`/`#elif`/`#else`.
 - [ ] **1.3 Parser** — Recursive‑descent parser producing an AST. Support: functions, global/local variables, `if`/`else`, `while`, `for`, `return`, basic expressions.
-- [ ] **1.4 Type system** — `char`, `int`, `unsigned char`, `unsigned int`, pointers. Implicit widening. Cast operator.
+- [ ] **1.4 Type system** — `char`, `int`, `long`, `unsigned` variants, pointers. Implicit widening. Cast operator.
 - [ ] **1.5 AST → IR lowering** — Translate AST to three‑address code with virtual registers.
 - [ ] **1.6 Call‑graph analysis** — Build the static call graph; detect recursion; assign fixed addresses for global‑mode functions.
 - [ ] **1.7 Code generator** — Translate IR to 8080 assembly. Pattern‑matched instruction selection. Linear‑scan register allocation within basic blocks.
@@ -357,11 +357,11 @@ v6_c/
 
 Based on the z88dk benchmark data (scaled to 8080 cycle counts, ~2× Z80 due to missing Z80‑specific optimizations like `IX`/`IY` frame access, `DJNZ`, block instructions):
 
-| Benchmark | Target (cycles) | Rationale |
-|---|---|---|
-| Sieve | ≤ 5,000,000 | Beat sccz80; match SDCC/IAR territory via static allocation + peephole. |
-| Dhrystone | ≤ 300,000,000 | Competitive with Hitech‑C on pure 8080 (no Z80 extras). |
-| Pi (32‑bit) | ≤ 5,000,000,000 | Depends primarily on assembly `__div32`; target z88dk‑small‑int‑math level. |
+| Benchmark | Target (cycles) | Est. Time @2 MHz | Rationale |
+|---|---|---|---|
+| Sieve | ≤ 5,000,000 | ≤ 2.5 s | Beat sccz80; match SDCC/IAR territory via static allocation + peephole. |
+| Dhrystone | ≤ 300,000,000 | ≤ 150 s | Competitive with Hitech‑C on pure 8080 (no Z80 extras). |
+| Pi (32‑bit) | ≤ 5,000,000,000 | ≤ 42 min | Depends primarily on assembly `__div32`; target z88dk‑small‑int‑math level. |
 
 ---
 
