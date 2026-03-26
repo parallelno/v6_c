@@ -243,17 +243,17 @@ Each routine is hand‑optimized for the 8080 instruction set. The multiply/divi
 
 **Goal:** Compile a single‑file C program (Sieve of Eratosthenes) to correct, runnable 8080 code.
 
-- [ ] **1.1 Lexer** — Tokenize C source: keywords, identifiers, integer constants, string literals, operators, punctuation.
-- [ ] **1.2 Preprocessor** — `#include`, `#define`, `#ifdef`/`#ifndef`/`#endif`, `#if`/`#elif`/`#else`.
-- [ ] **1.3 Parser** — Recursive‑descent parser producing an AST. Support: functions, global/local variables, `if`/`else`, `while`, `for`, `return`, basic expressions.
-- [ ] **1.4 Type system** — `char`, `int`, `long`, `unsigned` variants, pointers. Implicit widening. Cast operator.
-- [ ] **1.5 AST → IR lowering** — Translate AST to three‑address code with virtual registers.
-- [ ] **1.6 Call‑graph analysis** — Build the static call graph; detect recursion; assign fixed addresses for global‑mode functions.
-- [ ] **1.7 Code generator** — Translate IR to 8080 assembly. Pattern‑matched instruction selection. Linear‑scan register allocation within basic blocks.
-- [ ] **1.8 Assembly runtime** — Hand‑written 8080 assembly for `__mul16`, `__div16u`, `__div16s`, `__mod16u`, `__mod16s`, `__shl16`, `__shr16u`, `__shr16s`.
-- [ ] **1.9 Peephole optimizer** — 10–15 rules covering the most common redundancies.
-- [ ] **1.10 Assembly output** — Emit a complete `.asm` file for the **v6asm** assembler, targeting Vector 06 (ORG `0x100`).
-- [ ] **1.11 Test** — Compile and run Sieve of Eratosthenes on an 8080 emulator. Validate correctness. Measure cycle count.
+- [x] **1.1 Lexer** — Tokenize C source: keywords, identifiers, integer constants, string literals, operators, punctuation.
+- [x] **1.2 Preprocessor** — `#include`, `#define`, `#ifdef`/`#ifndef`/`#endif`, `#if`/`#elif`/`#else`.
+- [x] **1.3 Parser** — Recursive‑descent parser producing an AST. Support: functions, global/local variables, `if`/`else`, `while`, `for`, `return`, basic expressions.
+- [x] **1.4 Type system** — `char`, `int`, `long`, `unsigned` variants, pointers. Implicit widening. Cast operator.
+- [x] **1.5 AST → IR lowering** — Translate AST to three‑address code with virtual registers.
+- [x] **1.6 Call‑graph analysis** — Build the static call graph; detect recursion; assign fixed addresses for global‑mode functions.
+- [x] **1.7 Code generator** — Translate IR to 8080 assembly. Pattern‑matched instruction selection. Linear‑scan register allocation within basic blocks.
+- [x] **1.8 Assembly runtime** — Hand‑written 8080 assembly for `__mul16`, `__div16u`, `__div16s`, `__mod16u`, `__mod16s`, `__shl16`, `__shr16u`, `__shr16s`.
+- [x] **1.9 Peephole optimizer** — 10–15 rules covering the most common redundancies.
+- [x] **1.10 Assembly output** — Emit a complete `.asm` file for the **v6asm** assembler, targeting Vector 06 (ORG `0x100`).
+- [x] **1.11 Test** — Compile and run Sieve of Eratosthenes on an 8080 emulator. Validate correctness. Measure cycle count.
 
 ### Phase 2 — Optimizations & Expanded Types
 
