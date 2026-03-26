@@ -4,6 +4,7 @@ mod codegen;
 mod emit;
 mod ir;
 mod ir_gen;
+mod ir_opt;
 mod lexer;
 mod parser;
 mod peephole;
@@ -120,12 +121,15 @@ fn compile_source(source: &str, filename: &str) -> Result<Vec<String>, String> {
         })?;
 
     // 4. IR generation
-    let ir_program = ir_gen::generate(&program).map_err(|errs| {
+    let mut ir_program = ir_gen::generate(&program).map_err(|errs| {
         errs.iter()
             .map(|e| format!("{}:{}: {}", filename, e.line, e.message))
             .collect::<Vec<_>>()
             .join("\n")
     })?;
+
+    // 4.5. IR optimization
+    ir_opt::optimize(&mut ir_program);
 
     // 5. Call-graph analysis
     let analysis = callgraph::analyze(&ir_program, None);
