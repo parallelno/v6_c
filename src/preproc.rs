@@ -97,6 +97,9 @@ fn default_file_reader(path: &Path) -> Result<String, String> {
 /// Maximum `#include` nesting depth.
 const MAX_INCLUDE_DEPTH: usize = 64;
 
+/// Maximum recursion depth for macro expansion.
+const MAX_MACRO_RECURSION: usize = 256;
+
 /// The C preprocessor.
 pub struct Preprocessor {
     /// Defined macros: name → definition.
@@ -667,7 +670,7 @@ impl Preprocessor {
         line: u32,
         recursion: usize,
     ) -> Result<String, PreprocError> {
-        if recursion > 256 {
+        if recursion > MAX_MACRO_RECURSION {
             return Err(PreprocError::new(
                 "macro expansion recursion limit exceeded",
                 filename,
@@ -2303,6 +2306,15 @@ mod tests {
         let params = vec!["a".to_string(), "b".to_string()];
         let args = vec!["1".to_string(), "2".to_string()];
         assert_eq!(substitute_params(body, &params, &args), "\"a\" + 2");
+    }
+
+    #[test]
+    fn subst_param_not_substring() {
+        // Parameter `a` should not match inside identifier `ab`.
+        let body = "ab + a";
+        let params = vec!["a".to_string()];
+        let args = vec!["99".to_string()];
+        assert_eq!(substitute_params(body, &params, &args), "ab + 99");
     }
 
     // -- replace_undefined_idents -------------------------------------
