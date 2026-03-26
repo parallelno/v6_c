@@ -13,7 +13,9 @@ __mul32:
 	STA __res32+1
 	STA __res32+2
 	STA __res32+3
-	MVI B,32		; loop counter
+	; Loop terminates when the multiplier (__op2) becomes zero after
+	; repeated right-shifting.  The early-exit check avoids unnecessary
+	; iterations when the multiplier has few set bits.
 __mul32_loop:
 	; test low bit of multiplier (__op2)
 	LDA __op2

@@ -787,12 +787,14 @@ impl CodeGenerator {
                 self.mark(dst, PhysReg::HL);
             }
             Width::W32 => {
-                // Use 32-bit runtime helpers: shift count in B, value in __op1
+                // Use 32-bit runtime helpers: shift count in B, value in __op1.
+                // The shift count is a small integer (0..31); only the low byte
+                // is meaningful even though the vreg may be W32.
                 self.ensure(rhs, PhysReg::BC);
                 let shift_count_label = self.w32_mem_label(rhs);
                 let lhs_label = self.w32_mem_label(lhs);
                 self.emit_w32_to_op1(&lhs_label);
-                // Reload shift count into B
+                // Reload shift count (low byte only) into B
                 self.emit_inst(&format!("LDA {}", shift_count_label));
                 self.emit_inst("MOV B,A");
                 let helper = if is_right {

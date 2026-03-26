@@ -496,7 +496,6 @@ fn strength_reduce(func: &mut IrFunction) -> bool {
             IrOp::Mul { dst, lhs, rhs, width, signed: _ } => {
                 if let Some(&val) = constants.get(&rhs.id) {
                     if val > 0 && is_power_of_two(val) {
-                        let _shift = val.trailing_zeros() as i64;
                         let shift_reg = VReg::new(rhs.id, rhs.width);
                         instr.op = IrOp::Shl {
                             dst: *dst,
@@ -504,8 +503,8 @@ fn strength_reduce(func: &mut IrFunction) -> bool {
                             rhs: shift_reg,
                             width: *width,
                         };
-                        // We need to also change the rhs LoadImm to the shift amount.
-                        // We'll do that in a second pass below.
+                        // The rhs LoadImm value is updated in a second pass below
+                        // to hold the shift amount (log2(val)).
                         changed = true;
                         continue;
                     }
@@ -513,7 +512,6 @@ fn strength_reduce(func: &mut IrFunction) -> bool {
                 // Also check if lhs is the power-of-2 constant (commutative)
                 if let Some(&val) = constants.get(&lhs.id) {
                     if val > 0 && is_power_of_two(val) {
-                        let _shift = val.trailing_zeros() as i64;
                         let shift_reg = VReg::new(lhs.id, lhs.width);
                         instr.op = IrOp::Shl {
                             dst: *dst,
