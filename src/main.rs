@@ -1,5 +1,6 @@
 mod ast;
 mod ir;
+mod ir_gen;
 mod lexer;
 mod parser;
 mod preproc;
