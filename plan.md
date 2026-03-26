@@ -5,6 +5,7 @@
 ### 1.1 c8080 (alemorf/c8080)
 
 **Overview.** c8080 is an open‑source C compiler written in C++ that directly targets the Intel 8080. It includes a C parser, an expression‑tree IR, tree‑level optimizations, and an 8080 code generator.
+The name of the compiler executable file is v6c.
 
 **Key performance‑relevant design choices:**
 
