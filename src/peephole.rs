@@ -1,0 +1,607 @@
+//! Peephole optimizer for Intel 8080 assembly.
+//!
+//! Performs pattern-matched rewriting on the assembly text produced by
+//! [`crate::codegen`].  The optimizer repeatedly scans the instruction
+//! stream, applying local rewrite rules (windows of 2–3 instructions)
+//! until a fixed-point is reached (no rule fires).
+//!
+//! ## Assembly format assumptions
+//!
+//! | Kind        | Format                     |
+//! |-------------|----------------------------|
+//! | Instruction | `\tOPCODE operands`        |
+//! | Label       | `name:` (no leading tab)   |
+//! | Comment     | `; text`                   |
+//! | Empty       | blank line                 |
+
+// ---------------------------------------------------------------------------
+// Parsed line representation
+// ---------------------------------------------------------------------------
+
+/// A single assembly line in a structured form.
+#[derive(Debug, Clone, PartialEq)]
+enum Line {
+    /// A label definition (e.g. `func_name:`).  Stored *without* the colon.
+    Label(String),
+    /// An instruction with an opcode and optional operands.
+    Instruction { opcode: String, operands: String },
+    /// A comment line (starts with `;`).
+    Comment(String),
+    /// A blank / whitespace-only line.
+    Empty,
+}
+
+/// Parse a raw assembly string into a [`Line`].
+fn parse_line(raw: &str) -> Line {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Line::Empty;
+    }
+    if trimmed.starts_with(';') {
+        return Line::Comment(raw.to_string());
+    }
+    // Labels have no leading whitespace and end with ':'
+    if !raw.starts_with('\t') && !raw.starts_with(' ') && trimmed.ends_with(':') {
+        let name = trimmed.trim_end_matches(':').to_string();
+        return Line::Label(name);
+    }
+    // Instructions: split on first whitespace after the opcode.
+    let inst = trimmed;
+    if let Some(pos) = inst.find(|c: char| c == ' ' || c == '\t') {
+        let opcode = inst[..pos].to_uppercase();
+        let operands = inst[pos..].trim().to_string();
+        Line::Instruction { opcode, operands }
+    } else {
+        Line::Instruction {
+            opcode: inst.to_uppercase(),
+            operands: String::new(),
+        }
+    }
+}
+
+/// Render a [`Line`] back to its assembly text representation.
+fn render_line(line: &Line) -> String {
+    match line {
+        Line::Label(name) => format!("{}:", name),
+        Line::Instruction { opcode, operands } => {
+            if operands.is_empty() {
+                format!("\t{}", opcode)
+            } else {
+                format!("\t{} {}", opcode, operands)
+            }
+        }
+        Line::Comment(text) => text.clone(),
+        Line::Empty => String::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Return `true` if the opcode is an unconditional jump.
+fn is_unconditional_jump(opcode: &str) -> bool {
+    opcode == "JMP"
+}
+
+/// Return `true` if the line is a label definition.
+fn is_label(line: &Line) -> bool {
+    matches!(line, Line::Label(_))
+}
+
+/// Return `true` if the instruction is a `MOV X,X` (self-move).
+fn is_self_move(opcode: &str, operands: &str) -> bool {
+    if opcode != "MOV" {
+        return false;
+    }
+    let parts: Vec<&str> = operands.split(',').map(str::trim).collect();
+    parts.len() == 2 && parts[0] == parts[1]
+}
+
+// ---------------------------------------------------------------------------
+// Peephole rules
+// ---------------------------------------------------------------------------
+
+/// Apply all peephole rules to `lines`.  Returns `true` if any change was
+/// made (so the caller knows to iterate again).
+fn apply_rules(lines: &mut Vec<Line>) -> bool {
+    let mut changed = false;
+
+    // --- Rule 15: Remove NOP instructions --------------------------------
+    changed |= rule_remove_nop(lines);
+
+    // --- Rule 4: Remove self-move (MOV X,X) ------------------------------
+    changed |= rule_remove_self_move(lines);
+
+    // --- Rule 13: Merge adjacent labels ----------------------------------
+    changed |= rule_merge_adjacent_labels(lines);
+
+    // --- Two-instruction window rules ------------------------------------
+    changed |= rule_two_window(lines);
+
+    // --- Rule 10: Remove dead code after unconditional jump --------------
+    changed |= rule_dead_code_after_jump(lines);
+
+    changed
+}
+
+// ---------------------------------------------------------------------------
+// Individual rules
+// ---------------------------------------------------------------------------
+
+/// Rule 15 – Remove `NOP` instructions.
+fn rule_remove_nop(lines: &mut Vec<Line>) -> bool {
+    let before = lines.len();
+    lines.retain(|l| {
+        !matches!(l, Line::Instruction { opcode, .. } if opcode == "NOP")
+    });
+    lines.len() != before
+}
+
+/// Rule 4 – Remove self-moves (`MOV A,A`, `MOV H,H`, etc.).
+fn rule_remove_self_move(lines: &mut Vec<Line>) -> bool {
+    let before = lines.len();
+    lines.retain(|l| {
+        !matches!(l, Line::Instruction { opcode, operands }
+            if is_self_move(opcode, operands))
+    });
+    lines.len() != before
+}
+
+/// Rule 13 – Merge adjacent labels.
+///
+/// When `L1:` is immediately followed by `L2:`, rewrite every reference to
+/// `L2` so it points to `L1`, then delete `L2:`.
+fn rule_merge_adjacent_labels(lines: &mut Vec<Line>) -> bool {
+    // Build rename map: later label → earlier label.
+    let mut rename: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+    let mut i = 0;
+    while i + 1 < lines.len() {
+        if let (Line::Label(a), Line::Label(b)) = (&lines[i], &lines[i + 1]) {
+            // b is the later label; rename it to a (follow transitive renames).
+            let target = rename.get(a).cloned().unwrap_or_else(|| a.clone());
+            rename.insert(b.clone(), target);
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+
+    if rename.is_empty() {
+        return false;
+    }
+
+    // Rewrite operand references and delete merged labels.
+    let mut out: Vec<Line> = Vec::with_capacity(lines.len());
+    for line in lines.iter() {
+        match line {
+            Line::Label(name) if rename.contains_key(name) => {
+                // Drop the merged label.
+            }
+            Line::Instruction { opcode, operands } => {
+                let new_operands = rename
+                    .get(operands.trim())
+                    .cloned()
+                    .unwrap_or_else(|| operands.clone());
+                out.push(Line::Instruction {
+                    opcode: opcode.clone(),
+                    operands: new_operands,
+                });
+            }
+            other => out.push(other.clone()),
+        }
+    }
+
+    *lines = out;
+    true
+}
+
+/// Rules 1, 2, 3, 5, 7, 8, 12 – Two/three instruction window rules.
+///
+/// Scans a sliding window of consecutive *instructions* (skipping labels,
+/// comments, and blanks) and applies the first matching rewrite.
+fn rule_two_window(lines: &mut Vec<Line>) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+    while i + 1 < lines.len() {
+        // Find the next pair of instructions.
+        let a = &lines[i];
+        let b = &lines[i + 1];
+
+        match (a, b) {
+            // --- Rule 1: SHLD addr / LHLD addr → SHLD addr --------------
+            (
+                Line::Instruction { opcode: op_a, operands: addr_a },
+                Line::Instruction { opcode: op_b, operands: addr_b },
+            ) if op_a == "SHLD" && op_b == "LHLD" && addr_a == addr_b => {
+                lines.remove(i + 1);
+                changed = true;
+            }
+
+            // --- Rule 2: LHLD addr / SHLD addr → LHLD addr --------------
+            (
+                Line::Instruction { opcode: op_a, operands: addr_a },
+                Line::Instruction { opcode: op_b, operands: addr_b },
+            ) if op_a == "LHLD" && op_b == "SHLD" && addr_a == addr_b => {
+                lines.remove(i + 1);
+                changed = true;
+            }
+
+            // --- Rule 3: CALL func / RET → JMP func ---------------------
+            (
+                Line::Instruction { opcode: op_a, operands: func },
+                Line::Instruction { opcode: op_b, .. },
+            ) if op_a == "CALL" && op_b == "RET" => {
+                lines[i] = Line::Instruction {
+                    opcode: "JMP".to_string(),
+                    operands: func.clone(),
+                };
+                lines.remove(i + 1);
+                changed = true;
+            }
+
+            // --- Rule 7: LHLD addr / LHLD addr → single LHLD addr ------
+            (
+                Line::Instruction { opcode: op_a, operands: addr_a },
+                Line::Instruction { opcode: op_b, operands: addr_b },
+            ) if op_a == "LHLD" && op_b == "LHLD" && addr_a == addr_b => {
+                lines.remove(i + 1);
+                changed = true;
+            }
+
+            // --- Rule 8: SHLD addr / SHLD addr → single SHLD addr ------
+            (
+                Line::Instruction { opcode: op_a, operands: addr_a },
+                Line::Instruction { opcode: op_b, operands: addr_b },
+            ) if op_a == "SHLD" && op_b == "SHLD" && addr_a == addr_b => {
+                lines.remove(i + 1);
+                changed = true;
+            }
+
+            // --- Rule 12: PUSH X / POP X → deleted ----------------------
+            (
+                Line::Instruction { opcode: op_a, operands: reg_a },
+                Line::Instruction { opcode: op_b, operands: reg_b },
+            ) if op_a == "PUSH" && op_b == "POP" && reg_a.trim() == reg_b.trim() => {
+                lines.remove(i + 1);
+                lines.remove(i);
+                changed = true;
+                // Don't advance i; re-examine at the current position.
+                continue;
+            }
+
+            _ => {}
+        }
+
+        // --- Rule 5: ORA L / CPI 0 → just ORA L  (three-instr window) --
+        // ORA already sets the zero flag, so a subsequent CPI 0 is dead.
+        if i + 1 < lines.len() {
+            if let (
+                Line::Instruction { opcode: op_a, operands: _ },
+                Line::Instruction { opcode: op_b, operands: imm },
+            ) = (&lines[i], &lines[i + 1])
+            {
+                if op_a == "ORA" && op_b == "CPI" && imm.trim() == "0" {
+                    lines.remove(i + 1);
+                    changed = true;
+                }
+            }
+        }
+
+        i += 1;
+    }
+    changed
+}
+
+/// Rule 10 – Remove dead code after an unconditional jump.
+///
+/// Any non-label instruction between a `JMP` and the next label is
+/// unreachable and can be deleted.
+fn rule_dead_code_after_jump(lines: &mut Vec<Line>) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+    while i < lines.len() {
+        if let Line::Instruction { opcode, .. } = &lines[i] {
+            if is_unconditional_jump(opcode) {
+                // Delete everything after this JMP until we hit a label.
+                let mut j = i + 1;
+                while j < lines.len() && !is_label(&lines[j]) {
+                    // Keep comments – they're harmless and often useful.
+                    if matches!(lines[j], Line::Comment(_) | Line::Empty) {
+                        j += 1;
+                        continue;
+                    }
+                    lines.remove(j);
+                    changed = true;
+                }
+            }
+        }
+        i += 1;
+    }
+    changed
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Optimize a sequence of Intel 8080 assembly lines using peephole rules.
+///
+/// The optimizer parses each line into a structured form, then repeatedly
+/// applies pattern-matched rewrite rules until no rule fires (fixed-point
+/// iteration).  The optimized lines are returned as plain strings.
+///
+/// # Example
+///
+/// ```ignore
+/// let asm = vec![
+///     "\tSHLD _x".to_string(),
+///     "\tLHLD _x".to_string(),
+/// ];
+/// let opt = peephole_optimize(asm);
+/// assert_eq!(opt, vec!["\tSHLD _x"]);
+/// ```
+pub fn peephole_optimize(lines: Vec<String>) -> Vec<String> {
+    let mut parsed: Vec<Line> = lines.iter().map(|s| parse_line(s)).collect();
+
+    loop {
+        if !apply_rules(&mut parsed) {
+            break;
+        }
+    }
+
+    parsed.iter().map(render_line).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Convenience: build a `Vec<String>` from string slices.
+    fn asm(lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|s| s.to_string()).collect()
+    }
+
+    // -- Rule 1: Remove redundant load after store ------------------------
+
+    #[test]
+    fn rule1_shld_lhld_same_addr() {
+        let input = asm(&["\tSHLD _x", "\tLHLD _x"]);
+        let out = peephole_optimize(input);
+        assert_eq!(out, asm(&["\tSHLD _x"]));
+    }
+
+    #[test]
+    fn rule1_different_addr_preserved() {
+        let input = asm(&["\tSHLD _x", "\tLHLD _y"]);
+        let out = peephole_optimize(input);
+        assert_eq!(out, asm(&["\tSHLD _x", "\tLHLD _y"]));
+    }
+
+    // -- Rule 2: Remove redundant store after load ------------------------
+
+    #[test]
+    fn rule2_lhld_shld_same_addr() {
+        let input = asm(&["\tLHLD _x", "\tSHLD _x"]);
+        let out = peephole_optimize(input);
+        assert_eq!(out, asm(&["\tLHLD _x"]));
+    }
+
+    // -- Rule 3: Tail-call optimisation -----------------------------------
+
+    #[test]
+    fn rule3_call_ret_becomes_jmp() {
+        let input = asm(&["\tCALL _puts", "\tRET"]);
+        let out = peephole_optimize(input);
+        assert_eq!(out, asm(&["\tJMP _puts"]));
+    }
+
+    #[test]
+    fn rule3_call_without_ret_unchanged() {
+        let input = asm(&["\tCALL _puts", "\tMOV A,B"]);
+        let out = peephole_optimize(input);
+        assert_eq!(out, asm(&["\tCALL _puts", "\tMOV A,B"]));
+    }
+
+    // -- Rule 4: Remove self-move -----------------------------------------
+
+    #[test]
+    fn rule4_self_move_deleted() {
+        let input = asm(&["\tMOV A,A", "\tMOV H,H", "\tMOV A,B"]);
+        let out = peephole_optimize(input);
+        assert_eq!(out, asm(&["\tMOV A,B"]));
+    }
+
+    // -- Rule 5: Remove redundant CPI 0 after ORA ------------------------
+
+    #[test]
+    fn rule5_ora_cpi_zero() {
+        let input = asm(&["\tORA L", "\tCPI 0", "\tJZ L1"]);
+        let out = peephole_optimize(input);
+        assert_eq!(out, asm(&["\tORA L", "\tJZ L1"]));
+    }
+
+    #[test]
+    fn rule5_ora_cpi_nonzero_kept() {
+        let input = asm(&["\tORA L", "\tCPI 1"]);
+        let out = peephole_optimize(input);
+        assert_eq!(out, asm(&["\tORA L", "\tCPI 1"]));
+    }
+
+    // -- Rule 6: LXI H,0 already optimal ---------------------------------
+
+    #[test]
+    fn rule6_lxi_h_zero_unchanged() {
+        let input = asm(&["\tLXI H,0"]);
+        let out = peephole_optimize(input);
+        assert_eq!(out, asm(&["\tLXI H,0"]));
+    }
+
+    // -- Rule 7: Duplicate LHLD -------------------------------------------
+
+    #[test]
+    fn rule7_duplicate_lhld() {
+        let input = asm(&["\tLHLD _x", "\tLHLD _x"]);
+        let out = peephole_optimize(input);
+        assert_eq!(out, asm(&["\tLHLD _x"]));
+    }
+
+    // -- Rule 8: Duplicate SHLD -------------------------------------------
+
+    #[test]
+    fn rule8_duplicate_shld() {
+        let input = asm(&["\tSHLD _x", "\tSHLD _x"]);
+        let out = peephole_optimize(input);
+        assert_eq!(out, asm(&["\tSHLD _x"]));
+    }
+
+    // -- Rule 9: INX H after LHLD (keep both, recognize pattern) ----------
+
+    #[test]
+    fn rule9_inx_after_lhld_preserved() {
+        let input = asm(&["\tLHLD _arr", "\tINX H"]);
+        let out = peephole_optimize(input);
+        assert_eq!(out, asm(&["\tLHLD _arr", "\tINX H"]));
+    }
+
+    // -- Rule 10: Dead code after JMP -------------------------------------
+
+    #[test]
+    fn rule10_dead_code_after_jmp() {
+        let input = asm(&["\tJMP L1", "\tMOV A,B", "\tADD C", "L1:"]);
+        let out = peephole_optimize(input);
+        assert_eq!(out, asm(&["\tJMP L1", "L1:"]));
+    }
+
+    #[test]
+    fn rule10_comments_preserved_after_jmp() {
+        let input = asm(&["\tJMP L1", "; comment", "\tMOV A,B", "L1:"]);
+        let out = peephole_optimize(input);
+        assert_eq!(out, asm(&["\tJMP L1", "; comment", "L1:"]));
+    }
+
+    #[test]
+    fn rule10_label_stops_deletion() {
+        let input = asm(&["\tJMP L1", "L2:", "\tMOV A,B", "L1:"]);
+        let out = peephole_optimize(input);
+        assert_eq!(out, asm(&["\tJMP L1", "L2:", "\tMOV A,B", "L1:"]));
+    }
+
+    // -- Rule 11: LXI H,0 / DAD SP kept as-is ----------------------------
+
+    #[test]
+    fn rule11_lxi_dad_sp_unchanged() {
+        let input = asm(&["\tLXI H,0", "\tDAD SP"]);
+        let out = peephole_optimize(input);
+        assert_eq!(out, asm(&["\tLXI H,0", "\tDAD SP"]));
+    }
+
+    // -- Rule 12: PUSH / POP same register --------------------------------
+
+    #[test]
+    fn rule12_push_pop_same_deleted() {
+        let input = asm(&["\tPUSH H", "\tPOP H"]);
+        let out = peephole_optimize(input);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn rule12_push_pop_different_kept() {
+        let input = asm(&["\tPUSH H", "\tPOP D"]);
+        let out = peephole_optimize(input);
+        assert_eq!(out, asm(&["\tPUSH H", "\tPOP D"]));
+    }
+
+    // -- Rule 13: Merge adjacent labels -----------------------------------
+
+    #[test]
+    fn rule13_merge_adjacent_labels() {
+        let input = asm(&["L1:", "L2:", "\tJMP L2"]);
+        let out = peephole_optimize(input);
+        assert_eq!(out, asm(&["L1:", "\tJMP L1"]));
+    }
+
+    #[test]
+    fn rule13_three_adjacent_labels() {
+        let input = asm(&["L1:", "L2:", "L3:", "\tJMP L3"]);
+        let out = peephole_optimize(input);
+        assert_eq!(out, asm(&["L1:", "\tJMP L1"]));
+    }
+
+    // -- Rule 14: 16-bit zero test pattern (keep as-is) -------------------
+
+    #[test]
+    fn rule14_16bit_zero_test_preserved() {
+        let input = asm(&["\tMOV A,H", "\tORA L", "\tJZ L1"]);
+        let out = peephole_optimize(input);
+        assert_eq!(out, asm(&["\tMOV A,H", "\tORA L", "\tJZ L1"]));
+    }
+
+    // -- Rule 15: Remove NOPs --------------------------------------------
+
+    #[test]
+    fn rule15_nop_removed() {
+        let input = asm(&["\tNOP", "\tMOV A,B", "\tNOP"]);
+        let out = peephole_optimize(input);
+        assert_eq!(out, asm(&["\tMOV A,B"]));
+    }
+
+    // -- Fixed-point iteration -------------------------------------------
+
+    #[test]
+    fn fixed_point_multi_pass() {
+        // First pass: SHLD/LHLD collapses, then the duplicate SHLD collapses.
+        let input = asm(&["\tSHLD _x", "\tLHLD _x", "\tSHLD _x"]);
+        let out = peephole_optimize(input);
+        assert_eq!(out, asm(&["\tSHLD _x"]));
+    }
+
+    #[test]
+    fn fixed_point_push_pop_chain() {
+        // Two consecutive PUSH/POP pairs.
+        let input = asm(&["\tPUSH H", "\tPOP H", "\tPUSH D", "\tPOP D"]);
+        let out = peephole_optimize(input);
+        assert!(out.is_empty());
+    }
+
+    // -- Misc: labels, comments, empty lines preserved --------------------
+
+    #[test]
+    fn labels_and_comments_preserved() {
+        let input = asm(&["main:", "; entry point", "\tRET", ""]);
+        let out = peephole_optimize(input);
+        assert_eq!(out, asm(&["main:", "; entry point", "\tRET", ""]));
+    }
+
+    #[test]
+    fn empty_input() {
+        let out = peephole_optimize(vec![]);
+        assert!(out.is_empty());
+    }
+
+    // -- Combined rules ---------------------------------------------------
+
+    #[test]
+    fn combined_tail_call_and_dead_code() {
+        let input = asm(&[
+            "\tCALL _func",
+            "\tRET",
+            "\tMOV A,B",  // dead after the JMP that replaces CALL/RET
+            "next:",
+        ]);
+        let out = peephole_optimize(input);
+        assert_eq!(out, asm(&["\tJMP _func", "next:"]));
+    }
+
+    #[test]
+    fn combined_nop_and_self_move() {
+        let input = asm(&["\tNOP", "\tMOV A,A", "\tMOV A,B", "\tNOP"]);
+        let out = peephole_optimize(input);
+        assert_eq!(out, asm(&["\tMOV A,B"]));
+    }
+}
