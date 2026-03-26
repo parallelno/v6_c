@@ -99,6 +99,52 @@ impl CodeGenerator {
     fn ir_label(label: Label) -> String {
         format!("L{}", label.0)
     }
+
+    /// Get the memory label for a W32 vreg (spilling to memory if needed).
+    /// Returns the label where the low 16 bits are stored; high 16 are at label+2.
+    fn w32_mem_label(&mut self, vreg: VReg) -> String {
+        // If already in memory, return that label.
+        if let Some(Location::Memory(label)) = self.regalloc.get_location(vreg).cloned() {
+            return label;
+        }
+        // If in a register, spill to get a memory label.
+        // The spill only saves the low 16 bits; that's acceptable for
+        // the current W32 model where we track low 16 in registers and
+        // the full 32-bit value is at the global/spill label.
+        let save_ops = self.regalloc.save_all();
+        self.emit_moves(&save_ops);
+        if let Some(Location::Memory(label)) = self.regalloc.get_location(vreg).cloned() {
+            return label;
+        }
+        // Fallback: create a fresh spill label.
+        let label = format!("__w32_{}", self.label_counter);
+        self.label_counter += 1;
+        label
+    }
+
+    /// Copy a W32 value from memory `src_label` to `__op1`.
+    fn emit_w32_to_op1(&mut self, src_label: &str) {
+        self.emit_inst(&format!("LHLD {}", src_label));
+        self.emit_inst("SHLD __op1");
+        self.emit_inst(&format!("LHLD {}+2", src_label));
+        self.emit_inst("SHLD __op1+2");
+    }
+
+    /// Copy a W32 value from memory `src_label` to `__op2`.
+    fn emit_w32_to_op2(&mut self, src_label: &str) {
+        self.emit_inst(&format!("LHLD {}", src_label));
+        self.emit_inst("SHLD __op2");
+        self.emit_inst(&format!("LHLD {}+2", src_label));
+        self.emit_inst("SHLD __op2+2");
+    }
+
+    /// Copy a W32 value from `__op1` to memory `dst_label`.
+    fn emit_op1_to_w32(&mut self, dst_label: &str) {
+        self.emit_inst("LHLD __op1");
+        self.emit_inst(&format!("SHLD {}", dst_label));
+        self.emit_inst("LHLD __op1+2");
+        self.emit_inst(&format!("SHLD {}+2", dst_label));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -389,9 +435,26 @@ impl CodeGenerator {
                 self.emit_inst(&format!("MVI A,{}", v));
                 self.mark(dst, PhysReg::A);
             }
-            Width::W16 | Width::W32 => {
+            Width::W16 => {
                 let v = (value & 0xFFFF) as u16;
                 self.emit_inst(&format!("LXI H,{}", v));
+                self.mark(dst, PhysReg::HL);
+            }
+            Width::W32 => {
+                let lo = (value & 0xFFFF) as u16;
+                let hi = ((value >> 16) & 0xFFFF) as u16;
+                self.emit_inst(&format!("LXI H,{}", lo));
+                self.mark(dst, PhysReg::HL);
+                // Spill immediately so the full value is in memory.
+                let save_ops = self.regalloc.save_all();
+                self.emit_moves(&save_ops);
+                // Store high 16 bits next to the low 16.
+                if let Some(Location::Memory(label)) = self.regalloc.get_location(dst).cloned() {
+                    self.emit_inst(&format!("LXI H,{}", hi));
+                    self.emit_inst(&format!("SHLD {}+2", label));
+                }
+                // Reload low 16 into HL for downstream use.
+                self.emit_inst(&format!("LXI H,{}", lo));
                 self.mark(dst, PhysReg::HL);
             }
         }
@@ -552,40 +615,88 @@ impl CodeGenerator {
                 self.emit_inst("CALL __mul16");
                 self.mark(dst, PhysReg::HL);
             }
-            Width::W16 | Width::W32 => {
+            Width::W16 => {
                 self.ensure_de(rhs);
                 self.ensure_hl(lhs);
                 self.emit_inst("CALL __mul16");
+                self.mark(dst, PhysReg::HL);
+            }
+            Width::W32 => {
+                let lhs_label = self.w32_mem_label(lhs);
+                let rhs_label = self.w32_mem_label(rhs);
+                self.emit_w32_to_op1(&lhs_label);
+                self.emit_w32_to_op2(&rhs_label);
+                self.emit_inst("CALL __mul32");
+                // Result is in __op1; copy to dst's location.
+                let save_ops = self.regalloc.save_all();
+                self.emit_moves(&save_ops);
+                self.emit_inst("LHLD __op1");
                 self.mark(dst, PhysReg::HL);
             }
         }
     }
 
     fn gen_div(&mut self, dst: VReg, lhs: VReg, rhs: VReg, width: Width, signed: bool) {
-        let helper = if signed { "__div16s" } else { "__div16u" };
-        self.ensure_de(rhs);
-        self.ensure_hl(lhs);
-        self.emit_inst(&format!("CALL {}", helper));
         match width {
             Width::W8 => {
+                let helper = if signed { "__div16s" } else { "__div16u" };
+                self.ensure_de(rhs);
+                self.ensure_hl(lhs);
+                self.emit_inst(&format!("CALL {}", helper));
                 self.emit_inst("MOV A,L");
                 self.mark(dst, PhysReg::A);
             }
-            _ => self.mark(dst, PhysReg::HL),
+            Width::W16 => {
+                let helper = if signed { "__div16s" } else { "__div16u" };
+                self.ensure_de(rhs);
+                self.ensure_hl(lhs);
+                self.emit_inst(&format!("CALL {}", helper));
+                self.mark(dst, PhysReg::HL);
+            }
+            Width::W32 => {
+                let helper = if signed { "__div32s" } else { "__div32u" };
+                let lhs_label = self.w32_mem_label(lhs);
+                let rhs_label = self.w32_mem_label(rhs);
+                self.emit_w32_to_op1(&lhs_label);
+                self.emit_w32_to_op2(&rhs_label);
+                self.emit_inst(&format!("CALL {}", helper));
+                let save_ops = self.regalloc.save_all();
+                self.emit_moves(&save_ops);
+                self.emit_inst("LHLD __op1");
+                self.mark(dst, PhysReg::HL);
+            }
         }
     }
 
     fn gen_mod(&mut self, dst: VReg, lhs: VReg, rhs: VReg, width: Width, signed: bool) {
-        let helper = if signed { "__mod16s" } else { "__mod16u" };
-        self.ensure_de(rhs);
-        self.ensure_hl(lhs);
-        self.emit_inst(&format!("CALL {}", helper));
         match width {
             Width::W8 => {
+                let helper = if signed { "__mod16s" } else { "__mod16u" };
+                self.ensure_de(rhs);
+                self.ensure_hl(lhs);
+                self.emit_inst(&format!("CALL {}", helper));
                 self.emit_inst("MOV A,L");
                 self.mark(dst, PhysReg::A);
             }
-            _ => self.mark(dst, PhysReg::HL),
+            Width::W16 => {
+                let helper = if signed { "__mod16s" } else { "__mod16u" };
+                self.ensure_de(rhs);
+                self.ensure_hl(lhs);
+                self.emit_inst(&format!("CALL {}", helper));
+                self.mark(dst, PhysReg::HL);
+            }
+            Width::W32 => {
+                let helper = if signed { "__mod32s" } else { "__mod32u" };
+                let lhs_label = self.w32_mem_label(lhs);
+                let rhs_label = self.w32_mem_label(rhs);
+                self.emit_w32_to_op1(&lhs_label);
+                self.emit_w32_to_op2(&rhs_label);
+                self.emit_inst(&format!("CALL {}", helper));
+                let save_ops = self.regalloc.save_all();
+                self.emit_moves(&save_ops);
+                self.emit_inst("LHLD __op1");
+                self.mark(dst, PhysReg::HL);
+            }
         }
     }
 
@@ -658,7 +769,7 @@ impl CodeGenerator {
                 self.emit_label(&done_lbl);
                 self.mark(dst, PhysReg::A);
             }
-            Width::W16 | Width::W32 => {
+            Width::W16 => {
                 // Use runtime helpers: shift count in B, value in HL
                 self.ensure(rhs, PhysReg::BC);
                 self.ensure_hl(lhs);
@@ -673,6 +784,30 @@ impl CodeGenerator {
                     "__shl16"
                 };
                 self.emit_inst(&format!("CALL {}", helper));
+                self.mark(dst, PhysReg::HL);
+            }
+            Width::W32 => {
+                // Use 32-bit runtime helpers: shift count in B, value in __op1
+                self.ensure(rhs, PhysReg::BC);
+                let shift_count_label = self.w32_mem_label(rhs);
+                let lhs_label = self.w32_mem_label(lhs);
+                self.emit_w32_to_op1(&lhs_label);
+                // Reload shift count into B
+                self.emit_inst(&format!("LDA {}", shift_count_label));
+                self.emit_inst("MOV B,A");
+                let helper = if is_right {
+                    if arithmetic {
+                        "__shr32s"
+                    } else {
+                        "__shr32u"
+                    }
+                } else {
+                    "__shl32"
+                };
+                self.emit_inst(&format!("CALL {}", helper));
+                let save_ops = self.regalloc.save_all();
+                self.emit_moves(&save_ops);
+                self.emit_inst("LHLD __op1");
                 self.mark(dst, PhysReg::HL);
             }
         }
