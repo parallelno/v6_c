@@ -1,0 +1,11 @@
+[package]
+name = "v6c"
+version = "0.1.0"
+edition = "2021"
+description = "C compiler targeting Intel 8080 for Vector 06 computer"
+
+[[bin]]
+name = "v6c"
+path = "src/main.rs"
+
+[dependencies]
