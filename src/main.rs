@@ -5,6 +5,7 @@ mod ir_gen;
 mod lexer;
 mod parser;
 mod preproc;
+mod regalloc;
 mod types;
 
 fn main() {
