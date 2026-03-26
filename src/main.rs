@@ -1,4 +1,5 @@
 mod ast;
+mod callgraph;
 mod ir;
 mod ir_gen;
 mod lexer;
