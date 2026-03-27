@@ -60,7 +60,9 @@ fn optimize_function(func: &mut IrFunction) {
     loop {
         let mut changed = false;
         changed |= constant_fold_and_propagate(func);
+        changed |= load_store_forwarding(func);
         changed |= strength_reduce(func);
+        changed |= narrow_byte_ops(func);
         changed |= dead_code_eliminate(func);
         changed |= cse(func);
         changed |= jump_threading(func);
@@ -69,6 +71,349 @@ fn optimize_function(func: &mut IrFunction) {
             break;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Memory-versioned load/store forwarding
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+struct MemValue {
+    version: u32,
+    src: VReg,
+}
+
+/// Forward known values for static/global memory locations within a block.
+///
+/// This tracks a simple per-label memory version and replaces
+/// `LoadGlobal dst, L` with `Copy dst, src` when the latest value for `L`
+/// in the current region is known to come from `src`.
+fn load_store_forwarding(func: &mut IrFunction) -> bool {
+    let mut changed = false;
+    let mut mem_state: HashMap<String, MemValue> = HashMap::new();
+    let mut version: u32 = 1;
+    let mut out = Vec::with_capacity(func.body.len());
+
+    for instr in &func.body {
+        match &instr.op {
+            IrOp::Label { .. }
+            | IrOp::Jump { .. }
+            | IrOp::JumpIfTrue { .. }
+            | IrOp::JumpIfFalse { .. }
+            | IrOp::Return { .. } => {
+                mem_state.clear();
+                out.push(instr.clone());
+            }
+            IrOp::StoreGlobal { addr_label, src } => {
+                mem_state.insert(
+                    addr_label.clone(),
+                    MemValue {
+                        version,
+                        src: *src,
+                    },
+                );
+                version = version.wrapping_add(1);
+                out.push(instr.clone());
+            }
+            IrOp::LoadGlobal { dst, addr_label } => {
+                if let Some(mem) = mem_state.get(addr_label) {
+                    let _observed_version = mem.version;
+                    if mem.src.id != dst.id {
+                        out.push(IrInstr {
+                            op: IrOp::Copy {
+                                dst: *dst,
+                                src: mem.src,
+                            },
+                            line: instr.line,
+                        });
+                        changed = true;
+                    } else {
+                        out.push(instr.clone());
+                    }
+                } else {
+                    out.push(instr.clone());
+                }
+            }
+            IrOp::StorePtr { .. } | IrOp::LoadPtr { .. } | IrOp::StoreLocal { .. } => {
+                // Unknown memory aliasing invalidates forwarding facts.
+                mem_state.clear();
+                out.push(instr.clone());
+            }
+            IrOp::Call { .. } => {
+                // Calls are conservatively treated as memory clobbers.
+                mem_state.clear();
+                out.push(instr.clone());
+            }
+            _ => out.push(instr.clone()),
+        }
+    }
+
+    if changed {
+        func.body = out;
+    }
+    changed
+}
+
+// ---------------------------------------------------------------------------
+// Sparse byte-range facts and narrowing
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ValueRangeFact {
+    min: i64,
+    max: i64,
+    known: Option<i64>,
+    valid: bool,
+}
+
+impl ValueRangeFact {
+    fn unknown() -> Self {
+        Self {
+            min: i64::MIN,
+            max: i64::MAX,
+            known: None,
+            valid: false,
+        }
+    }
+
+    fn exact(value: i64) -> Self {
+        Self {
+            min: value,
+            max: value,
+            known: Some(value),
+            valid: true,
+        }
+    }
+
+    fn interval(min: i64, max: i64) -> Self {
+        Self {
+            min,
+            max,
+            known: if min == max { Some(min) } else { None },
+            valid: true,
+        }
+    }
+
+    fn is_byte(self) -> bool {
+        self.valid && self.min >= 0 && self.max <= 0xFF
+    }
+}
+
+fn narrow_byte_ops(func: &mut IrFunction) -> bool {
+    let facts = compute_value_ranges(func);
+    let mut changed = false;
+
+    for instr in &mut func.body {
+        match &mut instr.op {
+            IrOp::And { dst, lhs, rhs, width }
+            | IrOp::Or { dst, lhs, rhs, width }
+            | IrOp::Xor { dst, lhs, rhs, width }
+            | IrOp::Add { dst, lhs, rhs, width }
+            | IrOp::Sub { dst, lhs, rhs, width }
+            | IrOp::Shl { dst, lhs, rhs, width }
+                if *width == Width::W16 =>
+            {
+                let lhs_byte = facts.get(&lhs.id).copied().unwrap_or_default().is_byte();
+                let rhs_byte = facts.get(&rhs.id).copied().unwrap_or_default().is_byte();
+                let dst_byte = facts.get(&dst.id).copied().unwrap_or_default().is_byte();
+                if lhs_byte && rhs_byte && dst_byte {
+                    *width = Width::W8;
+                    changed = true;
+                }
+            }
+            IrOp::Div {
+                dst,
+                lhs,
+                rhs,
+                width,
+                signed,
+            }
+            | IrOp::Mod {
+                dst,
+                lhs,
+                rhs,
+                width,
+                signed,
+            } if *width == Width::W16 && !*signed => {
+                let lhs_byte = facts.get(&lhs.id).copied().unwrap_or_default().is_byte();
+                let rhs_fact = facts.get(&rhs.id).copied().unwrap_or_default();
+                let dst_byte = facts.get(&dst.id).copied().unwrap_or_default().is_byte();
+                if lhs_byte && rhs_fact.is_byte() && rhs_fact.min > 0 && dst_byte {
+                    *width = Width::W8;
+                    changed = true;
+                }
+            }
+            IrOp::Eq { lhs, rhs, width, .. }
+            | IrOp::Ne { lhs, rhs, width, .. }
+            | IrOp::Lt {
+                lhs,
+                rhs,
+                width,
+                ..
+            }
+            | IrOp::Le {
+                lhs,
+                rhs,
+                width,
+                ..
+            }
+            | IrOp::Gt {
+                lhs,
+                rhs,
+                width,
+                ..
+            }
+            | IrOp::Ge {
+                lhs,
+                rhs,
+                width,
+                ..
+            } if *width == Width::W16 => {
+                let lhs_byte = facts.get(&lhs.id).copied().unwrap_or_default().is_byte();
+                let rhs_byte = facts.get(&rhs.id).copied().unwrap_or_default().is_byte();
+                if lhs_byte && rhs_byte {
+                    *width = Width::W8;
+                    changed = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    changed
+}
+
+fn compute_value_ranges(func: &IrFunction) -> HashMap<u32, ValueRangeFact> {
+    let mut facts: HashMap<u32, ValueRangeFact> = HashMap::new();
+
+    for instr in &func.body {
+        match &instr.op {
+            IrOp::Label { .. } => {
+                // Keep sparse facts but conservatively reset at merge points.
+                facts.clear();
+            }
+            IrOp::LoadImm { dst, value } => {
+                facts.insert(dst.id, ValueRangeFact::exact(*value));
+            }
+            IrOp::Copy { dst, src } => {
+                let src_fact = facts.get(&src.id).copied().unwrap_or_else(ValueRangeFact::unknown);
+                facts.insert(dst.id, src_fact);
+            }
+            IrOp::Cast { dst, src, .. } => {
+                let src_fact = facts.get(&src.id).copied().unwrap_or_else(ValueRangeFact::unknown);
+                let cast_fact = match (src.width, dst.width) {
+                    (Width::W8, Width::W16) | (Width::W8, Width::W32) => {
+                        if src_fact.valid {
+                            ValueRangeFact::interval(src_fact.min.max(0), src_fact.max.min(0xFF))
+                        } else {
+                            ValueRangeFact::interval(0, 0xFF)
+                        }
+                    }
+                    (Width::W16, Width::W8) | (Width::W32, Width::W8) => {
+                        ValueRangeFact::interval(0, 0xFF)
+                    }
+                    _ => src_fact,
+                };
+                facts.insert(dst.id, cast_fact);
+            }
+            IrOp::Eq { dst, .. }
+            | IrOp::Ne { dst, .. }
+            | IrOp::Lt { dst, .. }
+            | IrOp::Le { dst, .. }
+            | IrOp::Gt { dst, .. }
+            | IrOp::Ge { dst, .. }
+            | IrOp::LogicalNot { dst, .. } => {
+                facts.insert(dst.id, ValueRangeFact::interval(0, 1));
+            }
+            IrOp::And { dst, lhs, rhs, .. } => {
+                let l = facts.get(&lhs.id).copied().unwrap_or_else(ValueRangeFact::unknown);
+                let r = facts.get(&rhs.id).copied().unwrap_or_else(ValueRangeFact::unknown);
+                if l.is_byte() && r.is_byte() {
+                    facts.insert(dst.id, ValueRangeFact::interval(0, 0xFF));
+                } else if r.known.is_some_and(|v| (v & !0xFF) == 0)
+                    || l.known.is_some_and(|v| (v & !0xFF) == 0)
+                {
+                    facts.insert(dst.id, ValueRangeFact::interval(0, 0xFF));
+                } else {
+                    facts.remove(&dst.id);
+                }
+            }
+            IrOp::Or { dst, lhs, rhs, .. }
+            | IrOp::Xor { dst, lhs, rhs, .. }
+            | IrOp::Shl { dst, lhs, rhs, .. }
+            | IrOp::Add { dst, lhs, rhs, .. }
+            | IrOp::Sub { dst, lhs, rhs, .. } => {
+                let l = facts.get(&lhs.id).copied().unwrap_or_else(ValueRangeFact::unknown);
+                let r = facts.get(&rhs.id).copied().unwrap_or_else(ValueRangeFact::unknown);
+                if l.is_byte() && r.is_byte() {
+                    facts.insert(dst.id, ValueRangeFact::interval(0, 0xFF));
+                } else {
+                    facts.remove(&dst.id);
+                }
+            }
+            IrOp::Shr {
+                dst,
+                lhs,
+                rhs,
+                arithmetic,
+                ..
+            } => {
+                let l = facts.get(&lhs.id).copied().unwrap_or_else(ValueRangeFact::unknown);
+                let r = facts.get(&rhs.id).copied().unwrap_or_else(ValueRangeFact::unknown);
+                if !*arithmetic && l.is_byte() && r.is_byte() {
+                    facts.insert(dst.id, ValueRangeFact::interval(0, 0xFF));
+                } else {
+                    facts.remove(&dst.id);
+                }
+            }
+            IrOp::Div {
+                dst,
+                lhs,
+                rhs,
+                signed,
+                ..
+            }
+            | IrOp::Mod {
+                dst,
+                lhs,
+                rhs,
+                signed,
+                ..
+            } => {
+                let l = facts.get(&lhs.id).copied().unwrap_or_else(ValueRangeFact::unknown);
+                let r = facts.get(&rhs.id).copied().unwrap_or_else(ValueRangeFact::unknown);
+                if !*signed && l.is_byte() && r.is_byte() && r.min > 0 {
+                    facts.insert(dst.id, ValueRangeFact::interval(0, 0xFF));
+                } else {
+                    facts.remove(&dst.id);
+                }
+            }
+            IrOp::LoadGlobal { dst, .. }
+            | IrOp::LoadLocal { dst, .. }
+            | IrOp::LoadPtr { dst, .. }
+            | IrOp::AddrOfGlobal { dst, .. }
+            | IrOp::PtrAdd { dst, .. }
+            | IrOp::Neg { dst, .. }
+            | IrOp::Not { dst, .. }
+            | IrOp::Mul { dst, .. } => {
+                facts.remove(&dst.id);
+            }
+            IrOp::StoreGlobal { .. }
+            | IrOp::StoreLocal { .. }
+            | IrOp::StorePtr { .. }
+            | IrOp::Jump { .. }
+            | IrOp::JumpIfTrue { .. }
+            | IrOp::JumpIfFalse { .. }
+            | IrOp::Return { .. } => {}
+            IrOp::Call { dst, .. } => {
+                if let Some(d) = dst {
+                    facts.remove(&d.id);
+                }
+            }
+        }
+    }
+
+    facts
 }
 
 // ---------------------------------------------------------------------------
@@ -2946,5 +3291,97 @@ mod tests {
             .iter()
             .any(|i| matches!(&i.op, IrOp::Jump { target } if target.0 == 0));
         assert!(has_jump_to_l0, "Loop should not be unrolled without hint");
+    }
+
+    // -- Phase 2: forwarding and narrowing -------------------------------
+
+    #[test]
+    fn forwarding_replaces_load_after_store_global() {
+        let body = vec![
+            load_imm(0, Width::W16, 42),
+            IrInstr::bare(IrOp::StoreGlobal {
+                addr_label: "_g_x".into(),
+                src: VReg::new(0, Width::W16),
+            }),
+            IrInstr::bare(IrOp::LoadGlobal {
+                dst: VReg::new(1, Width::W16),
+                addr_label: "_g_x".into(),
+            }),
+            IrInstr::bare(IrOp::ret(Some(VReg::new(1, Width::W16)))),
+        ];
+
+        let result = opt_body(body);
+        assert!(result.iter().any(|i| {
+            matches!(
+                &i.op,
+                IrOp::Copy { dst, src } if dst.id == 1 && src.id == 0
+            ) || matches!(
+                &i.op,
+                IrOp::LoadImm { dst, value: 42 } if dst.id == 1
+            )
+        }));
+    }
+
+    #[test]
+    fn forwarding_invalidated_by_call() {
+        let body = vec![
+            load_imm(0, Width::W16, 42),
+            IrInstr::bare(IrOp::StoreGlobal {
+                addr_label: "_g_x".into(),
+                src: VReg::new(0, Width::W16),
+            }),
+            IrInstr::bare(IrOp::call("ext", vec![], None)),
+            IrInstr::bare(IrOp::LoadGlobal {
+                dst: VReg::new(1, Width::W16),
+                addr_label: "_g_x".into(),
+            }),
+            IrInstr::bare(IrOp::ret(Some(VReg::new(1, Width::W16)))),
+        ];
+
+        let result = opt_body(body);
+        assert!(result.iter().any(|i| matches!(&i.op, IrOp::LoadGlobal { dst, .. } if dst.id == 1)));
+    }
+
+    #[test]
+    fn narrow_compare_to_w8_when_operands_are_byte_range() {
+        let body = vec![
+            IrInstr::bare(IrOp::LoadGlobal {
+                dst: VReg::new(0, Width::W16),
+                addr_label: "_g_a".into(),
+            }),
+            IrInstr::bare(IrOp::LoadGlobal {
+                dst: VReg::new(1, Width::W16),
+                addr_label: "_g_b".into(),
+            }),
+            IrInstr::bare(IrOp::And {
+                dst: VReg::new(3, Width::W16),
+                lhs: VReg::new(0, Width::W16),
+                rhs: VReg::new(1, Width::W16),
+                width: Width::W16,
+            }),
+            load_imm(4, Width::W16, 255),
+            IrInstr::bare(IrOp::And {
+                dst: VReg::new(5, Width::W16),
+                lhs: VReg::new(3, Width::W16),
+                rhs: VReg::new(4, Width::W16),
+                width: Width::W16,
+            }),
+            IrInstr::bare(IrOp::Lt {
+                dst: VReg::new(2, Width::W16),
+                lhs: VReg::new(5, Width::W16),
+                rhs: VReg::new(4, Width::W16),
+                width: Width::W16,
+                signed: false,
+            }),
+            IrInstr::bare(IrOp::ret(Some(VReg::new(2, Width::W16)))),
+        ];
+
+        let result = opt_body(body);
+        assert!(result.iter().any(|i| {
+            matches!(
+                &i.op,
+                IrOp::Lt { width: Width::W8, .. }
+            )
+        }));
     }
 }

@@ -462,7 +462,12 @@ mod tests {
             }
         "#;
         let out = compile_source(src, "test.c", &[]).expect("compilation failed");
-        assert!(has_line(&out, "CALL __mul16"), "multiply must call __mul16");
+        let calls_runtime = has_line(&out, "CALL __mul16");
+        let folded_to_imm = out.iter().any(|l| l.contains("LXI H,42") || l.contains("MVI A,42"));
+        assert!(
+            calls_runtime || folded_to_imm,
+            "multiply should either call __mul16 or be folded to an immediate"
+        );
     }
 
     #[test]
@@ -521,6 +526,99 @@ mod tests {
             .iter()
             .filter(|l| l.starts_with('\t') && !l.trim().starts_with(';'))
             .count()
+    }
+
+    fn count_helper_calls(output: &[String]) -> usize {
+        output
+            .iter()
+            .filter(|line| line.trim_start().starts_with("CALL __"))
+            .count()
+    }
+
+    fn estimate_cycles(output: &[String]) -> usize {
+        output
+            .iter()
+            .filter_map(|line| line.trim().split_whitespace().next())
+            .map(|opcode| match opcode {
+                "CALL" => 17,
+                "RET" => 10,
+                "JMP" => 10,
+                "JZ" | "JNZ" | "JC" | "JNC" | "JM" | "JP" | "JPE" | "JPO" => 10,
+                "LHLD" | "SHLD" => 16,
+                "LDA" | "STA" => 13,
+                "PUSH" => 11,
+                "POP" => 10,
+                "LXI" | "DAD" => 10,
+                "MOV" => 5,
+                "MVI" => 7,
+                "INX" | "DCX" | "INR" | "DCR" | "XCHG" => 5,
+                "ADD" | "ADC" | "SUB" | "SBB" | "ANA" | "ORA" | "XRA" | "CMP" | "CMA" => 4,
+                "RAL" | "RAR" => 4,
+                _ => 7,
+            })
+            .sum()
+    }
+
+    fn compile_repo_benchmark(path: &str) -> Vec<String> {
+        let full_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
+        let source = std::fs::read_to_string(&full_path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {}", full_path.display(), err));
+        let sanitized = source.replace('`', "");
+        compile_source(&sanitized, full_path.to_str().unwrap(), &[])
+            .unwrap_or_else(|err| panic!("failed to compile {}: {}", full_path.display(), err))
+    }
+
+    fn assert_benchmark_gate(
+        path: &str,
+        max_instructions: usize,
+        max_helper_calls: usize,
+        max_cycles: usize,
+    ) {
+        let out = compile_repo_benchmark(path);
+        let inst_count = count_instructions(&out);
+        let helper_calls = count_helper_calls(&out);
+        let est_cycles = estimate_cycles(&out);
+
+        assert!(inst_count > 0, "{} must generate instructions", path);
+        assert!(
+            inst_count <= max_instructions,
+            "{} exceeded instruction budget: {} > {}",
+            path,
+            inst_count,
+            max_instructions
+        );
+        assert!(
+            helper_calls <= max_helper_calls,
+            "{} exceeded helper-call budget: {} > {}",
+            path,
+            helper_calls,
+            max_helper_calls
+        );
+        assert!(
+            est_cycles <= max_cycles,
+            "{} exceeded estimated-cycle budget: {} > {}",
+            path,
+            est_cycles,
+            max_cycles
+        );
+    }
+
+    #[test]
+    #[ignore = "long-running benchmark gate"]
+    fn benchmark_gate_sieve_repo_source() {
+        assert_benchmark_gate("tests/sieve.c", 12000, 64, 120000);
+    }
+
+    #[test]
+    #[ignore = "long-running benchmark gate"]
+    fn benchmark_gate_dhrystone_repo_source() {
+        assert_benchmark_gate("tests/dhrystone.c", 16000, 96, 160000);
+    }
+
+    #[test]
+    #[ignore = "long-running benchmark gate"]
+    fn benchmark_gate_fannkuch_repo_source() {
+        assert_benchmark_gate("tests/fannkuch.c", 24000, 192, 260000);
     }
 
     #[test]

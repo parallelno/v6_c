@@ -76,6 +76,8 @@ pub enum Location {
     Reg(PhysReg),
     /// Spilled to a named memory location (label in the assembly output).
     Memory(String),
+    /// Value can be rematerialized as an immediate, avoiding spill reloads.
+    RematImm(i64),
 }
 
 // ---------------------------------------------------------------------------
@@ -90,6 +92,8 @@ pub enum MoveOp {
     Spill { src: PhysReg, label: String },
     /// Load from the named memory location into `dst`.
     Reload { dst: PhysReg, label: String },
+    /// Materialize an immediate constant directly in `dst`.
+    LoadImm { dst: PhysReg, value: i64, width: Width },
     /// Register-to-register move.
     RegToReg { src: PhysReg, dst: PhysReg },
 }
@@ -111,6 +115,8 @@ pub struct RegAllocator {
     reg_contents: HashMap<PhysReg, Option<u32>>,
     /// Monotonically increasing counter for spill-slot names.
     spill_counter: u32,
+    /// Vregs that can be regenerated cheaply as immediates.
+    remat_imm: HashMap<u32, i64>,
 }
 
 impl RegAllocator {
@@ -125,6 +131,7 @@ impl RegAllocator {
             vreg_map: HashMap::new(),
             reg_contents,
             spill_counter: 0,
+            remat_imm: HashMap::new(),
         }
     }
 
@@ -160,6 +167,11 @@ impl RegAllocator {
     /// returns `None`.
     pub fn spill(&mut self, reg: PhysReg) -> Option<MoveOp> {
         if let Some(vreg_id) = self.occupant(reg) {
+            if let Some(&value) = self.remat_imm.get(&vreg_id) {
+                self.vreg_map.insert(vreg_id, Location::RematImm(value));
+                self.reg_contents.insert(reg, None);
+                return None;
+            }
             let label = self.fresh_spill_label();
             self.vreg_map.insert(vreg_id, Location::Memory(label.clone()));
             self.reg_contents.insert(reg, None);
@@ -174,6 +186,7 @@ impl RegAllocator {
     /// the variable's home location (e.g. a global or stack slot name).
     pub fn spill_to_label(&mut self, reg: PhysReg, label: &str) -> Option<MoveOp> {
         if let Some(vreg_id) = self.occupant(reg) {
+            self.remat_imm.remove(&vreg_id);
             self.vreg_map
                 .insert(vreg_id, Location::Memory(label.to_string()));
             self.reg_contents.insert(reg, None);
@@ -251,6 +264,12 @@ impl RegAllocator {
                 dst: target,
                 label,
             });
+        } else if let Some(Location::RematImm(value)) = self.vreg_map.get(&vreg.id).cloned() {
+            ops.push(MoveOp::LoadImm {
+                dst: target,
+                value,
+                width: vreg.width,
+            });
         }
         // (If vreg is completely new, the code gen will emit a load itself;
         // we just mark the register occupied.)
@@ -268,6 +287,7 @@ impl RegAllocator {
         } else {
             self.vreg_map.remove(&vreg.id);
         }
+        self.remat_imm.remove(&vreg.id);
     }
 
     /// Mark a physical register as directly occupied by `vreg` (e.g. after
@@ -284,6 +304,14 @@ impl RegAllocator {
         }
         self.reg_contents.insert(reg, Some(vreg.id));
         self.vreg_map.insert(vreg.id, Location::Reg(reg));
+        self.remat_imm.remove(&vreg.id);
+        ops
+    }
+
+    /// Mark a register allocation that is rematerializable as an immediate.
+    pub fn mark_immediate(&mut self, vreg: VReg, reg: PhysReg, value: i64) -> Vec<MoveOp> {
+        let ops = self.mark_allocated(vreg, reg);
+        self.remat_imm.insert(vreg.id, value);
         ops
     }
 
@@ -302,8 +330,27 @@ impl RegAllocator {
     /// Reset the allocator — all registers free, all vreg mappings cleared.
     pub fn reset(&mut self) {
         self.vreg_map.clear();
+        self.remat_imm.clear();
         for val in self.reg_contents.values_mut() {
             *val = None;
+        }
+    }
+
+    /// Forget any values currently believed to live in `reg`.
+    ///
+    /// This is used after instructions such as `CALL` that clobber machine
+    /// registers without preserving the previous contents.
+    pub fn clobber(&mut self, reg: PhysReg) {
+        if let Some(vreg_id) = self.occupant(reg) {
+            self.vreg_map.remove(&vreg_id);
+        }
+        self.reg_contents.insert(reg, None);
+    }
+
+    /// Forget any values currently believed to live in the given registers.
+    pub fn clobber_regs(&mut self, regs: &[PhysReg]) {
+        for &reg in regs {
+            self.clobber(reg);
         }
     }
 
@@ -322,6 +369,12 @@ impl RegAllocator {
             ops.push(MoveOp::Reload {
                 dst: reg,
                 label: label.clone(),
+            });
+        } else if let Some(Location::RematImm(value)) = self.vreg_map.get(&vreg.id) {
+            ops.push(MoveOp::LoadImm {
+                dst: reg,
+                value: *value,
+                width: vreg.width,
             });
         }
         self.reg_contents.insert(reg, Some(vreg.id));

@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::callgraph::CallGraphAnalysis;
+use crate::callgraph::{CallGraphAnalysis, FunctionEffects};
 use crate::ir::{IrFunction, IrInstr, IrOp, IrProgram, Label, VReg, Width};
 use crate::regalloc::{Location, MoveOp, PhysReg, RegAllocator};
 use crate::types::CType;
@@ -75,7 +75,108 @@ pub fn generate(program: &IrProgram, analysis: &CallGraphAnalysis) -> Vec<String
     cg.emit_comment("--- data section ---");
     cg.gen_data_section(program);
 
-    cg.output
+    compact_cfg_layout(cg.output)
+}
+
+fn compact_cfg_layout(lines: Vec<String>) -> Vec<String> {
+    fn parse_inst(line: &str) -> Option<(String, String)> {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with(';') || trimmed.ends_with(':') {
+            return None;
+        }
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let opcode = parts.next()?.to_uppercase();
+        let operands = parts.next().unwrap_or("").trim().to_string();
+        Some((opcode, operands))
+    }
+
+    fn next_significant(lines: &[String], mut idx: usize) -> Option<usize> {
+        while idx < lines.len() {
+            let t = lines[idx].trim();
+            if t.is_empty() || t.starts_with(';') {
+                idx += 1;
+                continue;
+            }
+            return Some(idx);
+        }
+        None
+    }
+
+    let mut out = lines;
+    let mut labels: HashMap<String, usize> = HashMap::new();
+    for (i, line) in out.iter().enumerate() {
+        let t = line.trim();
+        if t.ends_with(':') && !t.starts_with(';') {
+            labels.insert(t.trim_end_matches(':').to_string(), i);
+        }
+    }
+
+    let mut forward: HashMap<String, String> = HashMap::new();
+    for (label, &idx) in &labels {
+        if let Some(next_idx) = next_significant(&out, idx + 1) {
+            if let Some((op, operands)) = parse_inst(&out[next_idx]) {
+                if op == "JMP" {
+                    forward.insert(label.clone(), operands);
+                }
+            }
+        }
+    }
+
+    for _ in 0..16 {
+        let snapshot: Vec<(String, String)> = forward.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let mut changed = false;
+        for (src, dst) in snapshot {
+            if let Some(next) = forward.get(&dst) {
+                if next != &src {
+                    forward.insert(src, next.clone());
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    for line in &mut out {
+        if let Some((op, operands)) = parse_inst(line) {
+            let is_jump = matches!(
+                op.as_str(),
+                "JMP" | "JZ" | "JNZ" | "JC" | "JNC" | "JM" | "JP" | "JPE" | "JPO"
+            );
+            if is_jump {
+                if let Some(final_target) = forward.get(operands.trim()) {
+                    *line = format!("\t{} {}", op, final_target);
+                }
+            }
+        }
+    }
+
+    let mut compact = Vec::with_capacity(out.len());
+    let mut i = 0;
+    while i < out.len() {
+        let remove = if let Some((op, operands)) = parse_inst(&out[i]) {
+            if op == "JMP" {
+                if let Some(next_idx) = next_significant(&out, i + 1) {
+                    let next_trim = out[next_idx].trim();
+                    next_trim.ends_with(':') && next_trim.trim_end_matches(':') == operands.trim()
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if !remove {
+            compact.push(out[i].clone());
+        }
+        i += 1;
+    }
+
+    compact
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +261,67 @@ impl CodeGenerator {
         self.emit_inst("LHLD __op1+2");
         self.emit_inst(&format!("SHLD {}+2", dst_label));
     }
+
+    fn call_effects(&self, func_name: &str) -> FunctionEffects {
+        self.analysis.effects_for(func_name)
+    }
+
+    fn spill_live_before_call(&mut self, func_name: &str) {
+        let effects = self.call_effects(func_name);
+        for reg in [PhysReg::HL, PhysReg::DE, PhysReg::BC, PhysReg::A] {
+            if !effects.clobbers.contains(&reg) {
+                continue;
+            }
+            let Some(vreg_id) = self.regalloc.occupant(reg) else {
+                continue;
+            };
+            let live_after_call = self
+                .last_use
+                .get(&vreg_id)
+                .is_some_and(|&last_idx| last_idx > self.instr_index);
+            if live_after_call {
+                if let Some(op) = self.regalloc.spill(reg) {
+                    self.emit_moves(&[op]);
+                }
+            }
+        }
+    }
+
+    fn clobber_after_call(&mut self, func_name: &str) {
+        let effects = self.call_effects(func_name);
+        let regs: Vec<PhysReg> = effects.clobbers.iter().copied().collect();
+        self.regalloc.clobber_regs(&regs);
+    }
+
+    fn emit_call_with_effects(&mut self, func_name: &str) {
+        self.emit_inst(&format!("CALL {}", func_name));
+        self.clobber_after_call(func_name);
+    }
+
+    fn arg_place_cost(&self, arg: VReg, target: PhysReg) -> u32 {
+        match self.regalloc.get_location(arg) {
+            Some(Location::Reg(r)) if *r == target => 0,
+            Some(Location::Reg(_)) => 1,
+            Some(Location::Memory(_)) => 2,
+            Some(Location::RematImm(_)) => 1,
+            None => 3,
+        }
+    }
+
+    fn load_stack_arg_for_push(&mut self, arg: VReg) {
+        match arg.width {
+            Width::W8 => {
+                self.ensure_a(arg);
+                self.emit_inst("MOV L,A");
+                self.emit_inst("MVI H,0");
+                self.emit_inst("PUSH H");
+            }
+            Width::W16 | Width::W32 => {
+                self.ensure_hl(arg);
+                self.emit_inst("PUSH H");
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -202,6 +364,24 @@ impl CodeGenerator {
                             self.emit_inst("MOV B,H");
                             self.emit_inst("MOV C,L");
                         }
+                    }
+                }
+                MoveOp::LoadImm { dst, value, width } => {
+                    let imm8 = (*value & 0xFF) as u8;
+                    let imm16 = (*value & 0xFFFF) as u16;
+                    match (dst, width) {
+                        (PhysReg::A, _) => self.emit_inst(&format!("MVI A,{}", imm8)),
+                        (PhysReg::HL, _) => self.emit_inst(&format!("LXI H,{}", imm16)),
+                        (PhysReg::DE, Width::W8) => {
+                            self.emit_inst(&format!("MVI E,{}", imm8));
+                            self.emit_inst("MVI D,0");
+                        }
+                        (PhysReg::BC, Width::W8) => {
+                            self.emit_inst(&format!("MVI C,{}", imm8));
+                            self.emit_inst("MVI B,0");
+                        }
+                        (PhysReg::DE, _) => self.emit_inst(&format!("LXI D,{}", imm16)),
+                        (PhysReg::BC, _) => self.emit_inst(&format!("LXI B,{}", imm16)),
                     }
                 }
                 MoveOp::RegToReg { src, dst } => {
@@ -481,12 +661,14 @@ impl CodeGenerator {
             Width::W8 => {
                 let v = (value & 0xFF) as u8;
                 self.emit_inst(&format!("MVI A,{}", v));
-                self.mark(dst, PhysReg::A);
+                let ops = self.regalloc.mark_immediate(dst, PhysReg::A, value);
+                self.emit_moves(&ops);
             }
             Width::W16 => {
                 let v = (value & 0xFFFF) as u16;
                 self.emit_inst(&format!("LXI H,{}", v));
-                self.mark(dst, PhysReg::HL);
+                let ops = self.regalloc.mark_immediate(dst, PhysReg::HL, value);
+                self.emit_moves(&ops);
             }
             Width::W32 => {
                 let lo = (value & 0xFFFF) as u16;
@@ -658,23 +840,26 @@ impl CodeGenerator {
         match width {
             Width::W8 => {
                 // Widen to 16-bit and use runtime
+                self.spill_live_before_call("__mul16");
                 self.ensure_hl(lhs);
                 self.ensure_de(rhs);
-                self.emit_inst("CALL __mul16");
+                self.emit_call_with_effects("__mul16");
                 self.mark(dst, PhysReg::HL);
             }
             Width::W16 => {
+                self.spill_live_before_call("__mul16");
                 self.ensure_de(rhs);
                 self.ensure_hl(lhs);
-                self.emit_inst("CALL __mul16");
+                self.emit_call_with_effects("__mul16");
                 self.mark(dst, PhysReg::HL);
             }
             Width::W32 => {
+                self.spill_live_before_call("__mul32");
                 let lhs_label = self.w32_mem_label(lhs);
                 let rhs_label = self.w32_mem_label(rhs);
                 self.emit_w32_to_op1(&lhs_label);
                 self.emit_w32_to_op2(&rhs_label);
-                self.emit_inst("CALL __mul32");
+                self.emit_call_with_effects("__mul32");
                 // Result is in __op1; copy to dst's location.
                 let save_ops = self.regalloc.save_all();
                 self.emit_moves(&save_ops);
@@ -688,26 +873,29 @@ impl CodeGenerator {
         match width {
             Width::W8 => {
                 let helper = if signed { "__div16s" } else { "__div16u" };
+                self.spill_live_before_call(helper);
                 self.ensure_de(rhs);
                 self.ensure_hl(lhs);
-                self.emit_inst(&format!("CALL {}", helper));
+                self.emit_call_with_effects(helper);
                 self.emit_inst("MOV A,L");
                 self.mark(dst, PhysReg::A);
             }
             Width::W16 => {
                 let helper = if signed { "__div16s" } else { "__div16u" };
+                self.spill_live_before_call(helper);
                 self.ensure_de(rhs);
                 self.ensure_hl(lhs);
-                self.emit_inst(&format!("CALL {}", helper));
+                self.emit_call_with_effects(helper);
                 self.mark(dst, PhysReg::HL);
             }
             Width::W32 => {
                 let helper = if signed { "__div32s" } else { "__div32u" };
+                self.spill_live_before_call(helper);
                 let lhs_label = self.w32_mem_label(lhs);
                 let rhs_label = self.w32_mem_label(rhs);
                 self.emit_w32_to_op1(&lhs_label);
                 self.emit_w32_to_op2(&rhs_label);
-                self.emit_inst(&format!("CALL {}", helper));
+                self.emit_call_with_effects(helper);
                 let save_ops = self.regalloc.save_all();
                 self.emit_moves(&save_ops);
                 self.emit_inst("LHLD __op1");
@@ -720,26 +908,29 @@ impl CodeGenerator {
         match width {
             Width::W8 => {
                 let helper = if signed { "__mod16s" } else { "__mod16u" };
+                self.spill_live_before_call(helper);
                 self.ensure_de(rhs);
                 self.ensure_hl(lhs);
-                self.emit_inst(&format!("CALL {}", helper));
+                self.emit_call_with_effects(helper);
                 self.emit_inst("MOV A,L");
                 self.mark(dst, PhysReg::A);
             }
             Width::W16 => {
                 let helper = if signed { "__mod16s" } else { "__mod16u" };
+                self.spill_live_before_call(helper);
                 self.ensure_de(rhs);
                 self.ensure_hl(lhs);
-                self.emit_inst(&format!("CALL {}", helper));
+                self.emit_call_with_effects(helper);
                 self.mark(dst, PhysReg::HL);
             }
             Width::W32 => {
                 let helper = if signed { "__mod32s" } else { "__mod32u" };
+                self.spill_live_before_call(helper);
                 let lhs_label = self.w32_mem_label(lhs);
                 let rhs_label = self.w32_mem_label(rhs);
                 self.emit_w32_to_op1(&lhs_label);
                 self.emit_w32_to_op2(&rhs_label);
-                self.emit_inst(&format!("CALL {}", helper));
+                self.emit_call_with_effects(helper);
                 let save_ops = self.regalloc.save_all();
                 self.emit_moves(&save_ops);
                 self.emit_inst("LHLD __op1");
@@ -819,9 +1010,6 @@ impl CodeGenerator {
             }
             Width::W16 => {
                 // Use runtime helpers: shift count in B, value in HL
-                self.ensure(rhs, PhysReg::BC);
-                self.ensure_hl(lhs);
-                self.emit_inst("MOV B,C"); // count from C→B
                 let helper = if is_right {
                     if arithmetic {
                         "__shr16s"
@@ -831,20 +1019,17 @@ impl CodeGenerator {
                 } else {
                     "__shl16"
                 };
-                self.emit_inst(&format!("CALL {}", helper));
+                self.spill_live_before_call(helper);
+                self.ensure(rhs, PhysReg::BC);
+                self.ensure_hl(lhs);
+                self.emit_inst("MOV B,C"); // count from C→B
+                self.emit_call_with_effects(helper);
                 self.mark(dst, PhysReg::HL);
             }
             Width::W32 => {
                 // Use 32-bit runtime helpers: shift count in B, value in __op1.
                 // The shift count is a small integer (0..31); only the low byte
                 // is meaningful even though the vreg may be W32.
-                self.ensure(rhs, PhysReg::BC);
-                let shift_count_label = self.w32_mem_label(rhs);
-                let lhs_label = self.w32_mem_label(lhs);
-                self.emit_w32_to_op1(&lhs_label);
-                // Reload shift count (low byte only) into B
-                self.emit_inst(&format!("LDA {}", shift_count_label));
-                self.emit_inst("MOV B,A");
                 let helper = if is_right {
                     if arithmetic {
                         "__shr32s"
@@ -854,7 +1039,15 @@ impl CodeGenerator {
                 } else {
                     "__shl32"
                 };
-                self.emit_inst(&format!("CALL {}", helper));
+                self.spill_live_before_call(helper);
+                self.ensure(rhs, PhysReg::BC);
+                let shift_count_label = self.w32_mem_label(rhs);
+                let lhs_label = self.w32_mem_label(lhs);
+                self.emit_w32_to_op1(&lhs_label);
+                // Reload shift count (low byte only) into B
+                self.emit_inst(&format!("LDA {}", shift_count_label));
+                self.emit_inst("MOV B,A");
+                self.emit_call_with_effects(helper);
                 let save_ops = self.regalloc.save_all();
                 self.emit_moves(&save_ops);
                 self.emit_inst("LHLD __op1");
@@ -1168,50 +1361,48 @@ impl CodeGenerator {
             return;
         }
 
-        // Save all live registers before the call.
-        let save_ops = self.regalloc.save_all();
-        self.emit_moves(&save_ops);
+        self.spill_live_before_call(func_name);
 
         // Push stack arguments (index >= 2) right-to-left (C convention).
         let stack_arg_count = if args.len() > 2 { args.len() - 2 } else { 0 };
         for &arg in args.iter().skip(2).rev() {
-            if let Some(Location::Memory(label)) = self.regalloc.get_location(arg).cloned() {
-                self.emit_inst(&format!("LHLD {}", label));
-                self.emit_inst("PUSH H");
-            }
+            self.load_stack_arg_for_push(arg);
         }
 
         // Place register arguments:
         //   arg0 (16-bit) → HL, arg1 (16-bit) → DE, 8-bit arg0 → A
-        // Load arg1 first (into DE) so arg0 can freely use HL.
-        if args.len() > 1 {
-            let arg = args[1];
-            if let Some(Location::Memory(label)) = self.regalloc.get_location(arg).cloned() {
-                self.emit_inst(&format!("LHLD {}", label));
-                self.emit_inst("XCHG");
-            }
-        }
+        // Choose load order using a simple cost model to minimize moves/spills.
         if !args.is_empty() {
-            let arg = args[0];
-            match arg.width {
-                Width::W8 => {
-                    if let Some(Location::Memory(label)) =
-                        self.regalloc.get_location(arg).cloned()
-                    {
-                        self.emit_inst(&format!("LDA {}", label));
-                    }
+            let arg0 = args[0];
+            let arg0_target = if arg0.width == Width::W8 { PhysReg::A } else { PhysReg::HL };
+            let arg0_first_cost = self.arg_place_cost(arg0, arg0_target)
+                + if args.len() > 1 { self.arg_place_cost(args[1], PhysReg::DE) } else { 0 };
+            let arg1_first_cost = if args.len() > 1 {
+                self.arg_place_cost(args[1], PhysReg::DE) + self.arg_place_cost(arg0, arg0_target)
+            } else {
+                arg0_first_cost
+            };
+
+            if args.len() > 1 && arg1_first_cost <= arg0_first_cost {
+                self.ensure_de(args[1]);
+                if arg0.width == Width::W8 {
+                    self.ensure_a(arg0);
+                } else {
+                    self.ensure_hl(arg0);
                 }
-                Width::W16 | Width::W32 => {
-                    if let Some(Location::Memory(label)) =
-                        self.regalloc.get_location(arg).cloned()
-                    {
-                        self.emit_inst(&format!("LHLD {}", label));
-                    }
+            } else {
+                if arg0.width == Width::W8 {
+                    self.ensure_a(arg0);
+                } else {
+                    self.ensure_hl(arg0);
+                }
+                if args.len() > 1 {
+                    self.ensure_de(args[1]);
                 }
             }
         }
 
-        self.emit_inst(&format!("CALL {}", func_name));
+        self.emit_call_with_effects(func_name);
 
         // Clean up stack arguments.
         for _ in 0..stack_arg_count {
@@ -1229,8 +1420,7 @@ impl CodeGenerator {
 
     /// Generate a call to a soft-float runtime function using __op1/__op2.
     fn gen_float_call(&mut self, func_name: &str, args: &[VReg], dst: Option<VReg>) {
-        let save_ops = self.regalloc.save_all();
-        self.emit_moves(&save_ops);
+        self.spill_live_before_call(func_name);
 
         match func_name {
             // 2-arg: both W32 via __op1/__op2
@@ -1242,14 +1432,14 @@ impl CodeGenerator {
                     self.emit_w32_to_op1(&lhs_label);
                     self.emit_w32_to_op2(&rhs_label);
                 }
-                self.emit_inst(&format!("CALL {}", func_name));
+                self.emit_call_with_effects(func_name);
             }
             // __itof: int16 in HL → float in __op1
             "__itof" => {
                 if !args.is_empty() {
                     self.ensure_hl(args[0]);
                 }
-                self.emit_inst(&format!("CALL {}", func_name));
+                self.emit_call_with_effects(func_name);
             }
             // __ftoi: float in __op1 → int16 in HL
             "__ftoi" => {
@@ -1257,7 +1447,7 @@ impl CodeGenerator {
                     let src_label = self.w32_mem_label(args[0]);
                     self.emit_w32_to_op1(&src_label);
                 }
-                self.emit_inst(&format!("CALL {}", func_name));
+                self.emit_call_with_effects(func_name);
             }
             _ => unreachable!(),
         }
@@ -1302,9 +1492,10 @@ impl CodeGenerator {
             self.emit_inst("DAD D");
         } else {
             // offset * element_size, then add to ptr
+            self.spill_live_before_call("__mul16");
             self.ensure_hl(offset);
             self.emit_inst(&format!("LXI D,{}", element_size));
-            self.emit_inst("CALL __mul16");
+            self.emit_call_with_effects("__mul16");
             // HL = scaled offset, now add ptr
             self.emit_inst("XCHG"); // DE = scaled offset
             self.ensure_hl(ptr);
@@ -1321,6 +1512,18 @@ impl CodeGenerator {
 impl CodeGenerator {
     fn gen_data_section(&mut self, program: &IrProgram) {
         let mut emitted_labels: HashSet<String> = HashSet::new();
+        let local_size_map: HashMap<String, usize> = program
+            .globals
+            .iter()
+            .map(|gvar| {
+                let label = if gvar.name.starts_with('_') {
+                    gvar.name.clone()
+                } else {
+                    format!("_g_{}", gvar.name)
+                };
+                (label, gvar.ty.size_of().unwrap_or(2))
+            })
+            .collect();
 
         // Global variables
         for gvar in &program.globals {
@@ -1330,6 +1533,9 @@ impl CodeGenerator {
             } else {
                 format!("_g_{}", gvar.name)
             };
+            if self.analysis.local_allocs.contains_key(&label) {
+                continue;
+            }
             if !emitted_labels.insert(label.clone()) {
                 continue;
             }
@@ -1382,14 +1588,30 @@ impl CodeGenerator {
             self.emit_inst(".storage 2");
         }
 
-        // Static local/param allocations from the analysis
-        let local_labels: Vec<String> = self.analysis.local_allocs.keys().cloned().collect();
-        for label in &local_labels {
-            if !emitted_labels.insert(label.clone()) {
-                continue;
+        // Static local/param allocations from the analysis.
+        // Labels that share the same address are emitted as aliases to the
+        // same storage block, which is how call-tree frame reuse becomes a
+        // real space saving in the output assembly.
+        let mut slot_groups: HashMap<u16, Vec<String>> = HashMap::new();
+        for (label, &addr) in &self.analysis.local_allocs {
+            slot_groups.entry(addr).or_default().push(label.clone());
+        }
+        let mut ordered_slots: Vec<(u16, Vec<String>)> = slot_groups.into_iter().collect();
+        ordered_slots.sort_by_key(|(addr, _)| *addr);
+        for (_addr, mut labels) in ordered_slots {
+            labels.sort();
+            let storage_size = labels
+                .iter()
+                .map(|label| local_size_map.get(label).copied().unwrap_or(2))
+                .max()
+                .unwrap_or(2);
+            for label in labels {
+                if !emitted_labels.insert(label.clone()) {
+                    continue;
+                }
+                self.emit_label(&label);
             }
-            self.emit_label(label);
-            self.emit_inst(".storage 2");
+            self.emit_inst(&format!(".storage {}", storage_size));
         }
 
         // va_base labels for variadic functions

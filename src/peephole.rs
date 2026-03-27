@@ -84,6 +84,11 @@ fn is_unconditional_jump(opcode: &str) -> bool {
     opcode == "JMP"
 }
 
+/// Return `true` if the opcode is a conditional jump.
+fn is_conditional_jump(opcode: &str) -> bool {
+    matches!(opcode, "JZ" | "JNZ" | "JC" | "JNC" | "JM" | "JP" | "JPE" | "JPO")
+}
+
 /// Return `true` if the line is a label definition.
 fn is_label(line: &Line) -> bool {
     matches!(line, Line::Label(_))
@@ -130,6 +135,12 @@ fn apply_rules(lines: &mut Vec<Line>) -> bool {
 
     // --- Rule 18: Remove jump to next label ------------------------------
     changed |= rule_jump_to_next(lines);
+
+    // --- Rule 33: Remove conditional jump to next label ------------------
+    changed |= rule_conditional_jump_to_next(lines);
+
+    // --- Rule 34: Jump to RET folding ------------------------------------
+    changed |= rule_jump_to_ret(lines);
 
     // --- Rule 10: Remove dead code after unconditional jump --------------
     changed |= rule_dead_code_after_jump(lines);
@@ -442,36 +453,103 @@ fn rule_jump_to_next(lines: &mut Vec<Line>) -> bool {
 fn rule_branch_inversion(lines: &mut Vec<Line>) -> bool {
     let mut changed = false;
     let mut i = 0;
-    while i + 2 < lines.len() {
-        let is_match = if let (
-            Line::Instruction { opcode: op_cond, operands: lbl_cond },
-            Line::Instruction { opcode: op_jmp, operands: lbl_jmp },
-            Line::Label(next_label),
-        ) = (&lines[i], &lines[i + 1], &lines[i + 2])
-        {
-            if op_jmp == "JMP" && lbl_cond.trim() == next_label {
-                // Check if op_cond is a conditional jump we can invert.
-                if let Some(inverted) = invert_condition(op_cond) {
-                    Some((inverted, lbl_jmp.clone()))
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
+    while i < lines.len() {
+        let Some(jmp_idx) = next_significant_line(lines, i + 1) else {
+            break;
+        };
+        let Some(label_idx) = next_significant_line(lines, jmp_idx + 1) else {
+            break;
         };
 
-        if let Some((inverted_opcode, target)) = is_match {
+        let is_match = match (&lines[i], &lines[jmp_idx], &lines[label_idx]) {
+            (
+                Line::Instruction { opcode: op_cond, operands: lbl_cond },
+                Line::Instruction { opcode: op_jmp, operands: lbl_jmp },
+                Line::Label(next_label),
+            ) if op_jmp == "JMP" && lbl_cond.trim() == next_label => {
+                invert_condition(op_cond).map(|inverted| (inverted, lbl_jmp.clone(), jmp_idx))
+            }
+            _ => None,
+        };
+
+        if let Some((inverted_opcode, target, jmp_idx)) = is_match {
             lines[i] = Line::Instruction {
                 opcode: inverted_opcode,
                 operands: target,
             };
-            lines.remove(i + 1);
+            lines.remove(jmp_idx);
             changed = true;
         }
         i += 1;
+    }
+    changed
+}
+
+/// Rule 33 - Remove conditional jumps to the immediately following label.
+fn rule_conditional_jump_to_next(lines: &mut Vec<Line>) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+    while i + 1 < lines.len() {
+        if let Line::Instruction { opcode, operands } = &lines[i] {
+            if is_conditional_jump(opcode) {
+                let mut j = i + 1;
+                while j < lines.len() && matches!(lines[j], Line::Comment(_) | Line::Empty) {
+                    j += 1;
+                }
+                if let Some(Line::Label(name)) = lines.get(j) {
+                    if operands.trim() == name {
+                        lines.remove(i);
+                        changed = true;
+                        continue;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    changed
+}
+
+/// Rule 34 - Replace a jump to a label whose first instruction is RET.
+fn rule_jump_to_ret(lines: &mut Vec<Line>) -> bool {
+    let mut label_index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (idx, line) in lines.iter().enumerate() {
+        if let Line::Label(name) = line {
+            label_index.insert(name.clone(), idx);
+        }
+    }
+
+    let mut changed = false;
+    let mut replacements: Vec<(usize, Line)> = Vec::new();
+    for i in 0..lines.len() {
+        let replacement = match &lines[i] {
+            Line::Instruction { opcode, operands } if opcode == "JMP" => {
+                let target = operands.trim();
+                let Some(&label_idx) = label_index.get(target) else {
+                    continue;
+                };
+                let Some(next_idx) = next_significant_line(lines, label_idx + 1) else {
+                    continue;
+                };
+                match &lines[next_idx] {
+                    Line::Instruction { opcode, .. } if opcode == "RET" => Some(Line::Instruction {
+                        opcode: "RET".to_string(),
+                        operands: String::new(),
+                    }),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+
+        if let Some(new_line) = replacement {
+            replacements.push((i, new_line));
+            changed = true;
+        }
+    }
+
+    for (idx, line) in replacements {
+        lines[idx] = line;
     }
     changed
 }
@@ -687,6 +765,16 @@ fn invert_condition(opcode: &str) -> Option<String> {
     }
 }
 
+fn next_significant_line(lines: &[Line], mut start: usize) -> Option<usize> {
+    while start < lines.len() {
+        match lines[start] {
+            Line::Comment(_) | Line::Empty => start += 1,
+            _ => return Some(start),
+        }
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -857,6 +945,27 @@ mod tests {
         let input = asm(&["\tJMP L1", "L2:", "\tMOV A,B", "L1:"]);
         let out = peephole_optimize(input);
         assert_eq!(out, asm(&["\tJMP L1", "L2:", "\tMOV A,B", "L1:"]));
+    }
+
+    #[test]
+    fn rule18_conditional_jump_to_next_label_removed() {
+        let input = asm(&["\tJZ L1", "; note", "L1:", "\tRET"]);
+        let out = peephole_optimize(input);
+        assert_eq!(out, asm(&["; note", "L1:", "\tRET"]));
+    }
+
+    #[test]
+    fn rule19_branch_inversion_skips_comments() {
+        let input = asm(&["\tJZ L1", "; mid", "\tJMP L2", "L1:"]);
+        let out = peephole_optimize(input);
+        assert_eq!(out, asm(&["\tJNZ L2", "; mid", "L1:"]));
+    }
+
+    #[test]
+    fn rule34_jump_to_ret_becomes_ret() {
+        let input = asm(&["\tJMP done", "done:", "\tRET"]);
+        let out = peephole_optimize(input);
+        assert_eq!(out, asm(&["done:", "\tRET"]));
     }
 
     // -- Rule 11: LXI H,0 / DAD SP kept as-is ----------------------------

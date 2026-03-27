@@ -24,6 +24,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ir::{IrFunction, IrOp, IrProgram};
+use crate::regalloc::PhysReg;
 use crate::types::CType;
 
 /// Default base address for variable allocation (upper RAM on Вектор-06Ц).
@@ -74,6 +75,53 @@ pub struct CallGraphAnalysis {
     /// Leaf functions (functions that make no calls).
     /// These can skip register save/restore.
     pub leaf_functions: HashSet<String>,
+
+    /// Interprocedural effect summaries for known and user-defined functions.
+    pub effects: HashMap<String, FunctionEffects>,
+}
+
+/// A conservative interprocedural summary for one function.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionEffects {
+    /// The function does not call any other function.
+    pub leaf: bool,
+    /// The function has no externally visible side effects and does not read
+    /// mutable non-local memory.
+    pub pure: bool,
+    /// The function does not write externally visible memory.
+    pub readonly: bool,
+    /// The function never returns to its caller.
+    pub noreturn: bool,
+    /// Registers whose contents are not preserved across the call.
+    pub clobbers: HashSet<PhysReg>,
+}
+
+impl FunctionEffects {
+    fn conservative() -> Self {
+        Self {
+            leaf: false,
+            pure: false,
+            readonly: false,
+            noreturn: false,
+            clobbers: all_call_clobbers(),
+        }
+    }
+
+    fn runtime_helper() -> Self {
+        Self {
+            leaf: true,
+            pure: true,
+            readonly: true,
+            noreturn: false,
+            clobbers: all_call_clobbers(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DirectEffects {
+    reads_nonlocal_memory: bool,
+    writes_nonlocal_memory: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -113,6 +161,7 @@ pub fn analyze(program: &IrProgram, base_addr: Option<u16>) -> CallGraphAnalysis
     let (global_allocs, addr_after_globals) = allocate_globals(program, base);
     let (local_allocs, next_addr) =
         allocate_locals(program, &graph, addr_after_globals);
+    let effects = summarize_functions(program, &graph, &leaf_functions);
 
     CallGraphAnalysis {
         graph,
@@ -120,6 +169,7 @@ pub fn analyze(program: &IrProgram, base_addr: Option<u16>) -> CallGraphAnalysis
         global_allocs,
         next_addr,
         leaf_functions,
+        effects,
     }
 }
 
@@ -272,36 +322,40 @@ fn allocate_locals(
     start_addr: u16,
 ) -> (HashMap<String, u16>, u16) {
     let mut allocs = HashMap::new();
-    let mut addr = start_addr;
+    let frame_layouts = build_frame_layouts(program, graph);
+    let reachability = compute_reachability(graph);
+    let frame_bases = allocate_frame_bases(&frame_layouts, &reachability, start_addr);
 
     for func in &program.functions {
-        // Skip recursive (stack-mode) functions.
-        if graph.stack_mode.contains(&func.name) {
+        let Some(layout) = frame_layouts.get(&func.name) else {
             continue;
-        }
+        };
+        let Some(&frame_base) = frame_bases.get(&func.name) else {
+            continue;
+        };
 
-        // Allocate space for each parameter.
         for param in &func.params {
             let label = format!("_l_{}_{}", func.name, param.name);
-            allocs.insert(label, addr);
-            let size = param_size(&param.ty);
-            addr = addr.wrapping_add(size);
+            if let Some(&offset) = layout.offsets.get(&label) {
+                allocs.insert(label, frame_base.wrapping_add(offset));
+            }
         }
 
-        // Allocate space for each local variable.
-        for (name, ty, _offset) in &func.locals {
+        for (name, _ty, _offset) in &func.locals {
             let label = format!("_l_{}_{}", func.name, name);
-            // Avoid double-allocation if a local shadows a parameter name.
-            if allocs.contains_key(&label) {
-                continue;
+            if let Some(&offset) = layout.offsets.get(&label) {
+                allocs.insert(label, frame_base.wrapping_add(offset));
             }
-            allocs.insert(label, addr);
-            let size = var_size(ty);
-            addr = addr.wrapping_add(size);
         }
     }
 
-    (allocs, addr)
+    let next_addr = frame_bases
+        .iter()
+        .filter_map(|(name, &base)| frame_layouts.get(name).map(|layout| base + layout.size))
+        .max()
+        .unwrap_or(start_addr);
+
+    (allocs, next_addr)
 }
 
 /// Byte size used for a parameter in static allocation.
@@ -312,6 +366,277 @@ fn param_size(ty: &CType) -> u16 {
 /// Byte size used for a local variable in static allocation.
 fn var_size(ty: &CType) -> u16 {
     ty.size_of().unwrap_or(2) as u16
+}
+
+#[derive(Debug, Clone, Default)]
+struct FunctionFrameLayout {
+    size: u16,
+    offsets: HashMap<String, u16>,
+}
+
+fn build_frame_layouts(
+    program: &IrProgram,
+    graph: &CallGraph,
+) -> HashMap<String, FunctionFrameLayout> {
+    let mut layouts = HashMap::new();
+
+    for func in &program.functions {
+        if graph.stack_mode.contains(&func.name) {
+            continue;
+        }
+
+        let mut offsets = HashMap::new();
+        let mut next_offset = 0u16;
+
+        for param in &func.params {
+            let label = format!("_l_{}_{}", func.name, param.name);
+            offsets.insert(label, next_offset);
+            next_offset = next_offset.wrapping_add(param_size(&param.ty));
+        }
+
+        for (name, ty, _offset) in &func.locals {
+            let label = format!("_l_{}_{}", func.name, name);
+            if offsets.contains_key(&label) {
+                continue;
+            }
+            offsets.insert(label, next_offset);
+            next_offset = next_offset.wrapping_add(var_size(ty));
+        }
+
+        layouts.insert(
+            func.name.clone(),
+            FunctionFrameLayout {
+                size: next_offset,
+                offsets,
+            },
+        );
+    }
+
+    layouts
+}
+
+fn compute_reachability(graph: &CallGraph) -> HashMap<String, HashSet<String>> {
+    let defined: HashSet<String> = graph.callees.keys().cloned().collect();
+    let mut reachability = HashMap::new();
+
+    for func in graph.callees.keys() {
+        let mut seen = HashSet::new();
+        let mut stack: Vec<String> = graph
+            .callees
+            .get(func)
+            .into_iter()
+            .flat_map(|callees| callees.iter().cloned())
+            .filter(|callee| defined.contains(callee))
+            .collect();
+
+        while let Some(node) = stack.pop() {
+            if !seen.insert(node.clone()) {
+                continue;
+            }
+            if let Some(next) = graph.callees.get(&node) {
+                for callee in next {
+                    if defined.contains(callee) {
+                        stack.push(callee.clone());
+                    }
+                }
+            }
+        }
+
+        reachability.insert(func.clone(), seen);
+    }
+
+    reachability
+}
+
+fn allocate_frame_bases(
+    layouts: &HashMap<String, FunctionFrameLayout>,
+    reachability: &HashMap<String, HashSet<String>>,
+    start_addr: u16,
+) -> HashMap<String, u16> {
+    let mut ordered: Vec<(&String, &FunctionFrameLayout)> = layouts.iter().collect();
+    ordered.sort_by(|(name_a, layout_a), (name_b, layout_b)| {
+        layout_b
+            .size
+            .cmp(&layout_a.size)
+            .then_with(|| name_a.cmp(name_b))
+    });
+
+    let mut frame_bases = HashMap::new();
+    let mut placed: Vec<(String, u16, u16)> = Vec::new();
+
+    for (name, layout) in ordered {
+        if layout.size == 0 {
+            frame_bases.insert(name.clone(), start_addr);
+            continue;
+        }
+
+        let mut candidate_bases = vec![start_addr];
+        for (other_name, other_base, other_size) in &placed {
+            if functions_overlap_lifetime(name, other_name, reachability) {
+                candidate_bases.push(other_base.wrapping_add(*other_size));
+            }
+        }
+        candidate_bases.sort_unstable();
+        candidate_bases.dedup();
+
+        let base = candidate_bases
+            .into_iter()
+            .find(|candidate| {
+                placed.iter().all(|(other_name, other_base, other_size)| {
+                    if !functions_overlap_lifetime(name, other_name, reachability) {
+                        return true;
+                    }
+                    let candidate_end = candidate.wrapping_add(layout.size);
+                    let other_end = other_base.wrapping_add(*other_size);
+                    candidate_end <= *other_base || other_end <= *candidate
+                })
+            })
+            .unwrap_or(start_addr);
+
+        frame_bases.insert(name.clone(), base);
+        placed.push((name.clone(), base, layout.size));
+    }
+
+    frame_bases
+}
+
+fn functions_overlap_lifetime(
+    left: &str,
+    right: &str,
+    reachability: &HashMap<String, HashSet<String>>,
+) -> bool {
+    reachability
+        .get(left)
+        .is_some_and(|seen| seen.contains(right))
+        || reachability
+            .get(right)
+            .is_some_and(|seen| seen.contains(left))
+        || left == right
+}
+
+fn summarize_functions(
+    program: &IrProgram,
+    graph: &CallGraph,
+    leaf_functions: &HashSet<String>,
+) -> HashMap<String, FunctionEffects> {
+    let direct_effects: HashMap<String, DirectEffects> = program
+        .functions
+        .iter()
+        .map(|func| (func.name.clone(), scan_direct_effects(func)))
+        .collect();
+
+    let mut summaries = known_function_effects();
+
+    for func in &program.functions {
+        summaries.insert(
+            func.name.clone(),
+            FunctionEffects {
+                leaf: leaf_functions.contains(&func.name),
+                pure: true,
+                readonly: true,
+                noreturn: false,
+                clobbers: all_call_clobbers(),
+            },
+        );
+    }
+
+    for _ in 0..program.functions.len().max(1) {
+        let mut changed = false;
+        for func in &program.functions {
+            let direct = direct_effects.get(&func.name).copied().unwrap_or_default();
+            let mut summary = summaries
+                .get(&func.name)
+                .cloned()
+                .unwrap_or_else(FunctionEffects::conservative);
+
+            summary.leaf = leaf_functions.contains(&func.name);
+            summary.readonly = !direct.writes_nonlocal_memory;
+            summary.pure = !direct.writes_nonlocal_memory && !direct.reads_nonlocal_memory;
+
+            if let Some(callees) = graph.callees.get(&func.name) {
+                for callee in callees {
+                    let callee_summary = summaries
+                        .get(callee)
+                        .cloned()
+                        .unwrap_or_else(FunctionEffects::conservative);
+                    if !callee_summary.readonly {
+                        summary.readonly = false;
+                    }
+                    if !callee_summary.pure {
+                        summary.pure = false;
+                    }
+                    if callee_summary.noreturn {
+                        summary.noreturn = true;
+                    }
+                }
+            }
+
+            let current = summaries.get(&func.name).cloned();
+            if current.as_ref() != Some(&summary) {
+                summaries.insert(func.name.clone(), summary);
+                changed = true;
+            }
+        }
+
+        if !changed {
+            break;
+        }
+    }
+
+    summaries
+}
+
+fn scan_direct_effects(func: &IrFunction) -> DirectEffects {
+    let mut effects = DirectEffects::default();
+    let local_prefix = format!("_l_{}", func.name);
+
+    for instr in &func.body {
+        match &instr.op {
+            IrOp::LoadGlobal { addr_label, .. } => {
+                if !addr_label.starts_with(&local_prefix) {
+                    effects.reads_nonlocal_memory = true;
+                }
+            }
+            IrOp::StoreGlobal { addr_label, .. } => {
+                if !addr_label.starts_with(&local_prefix) {
+                    effects.writes_nonlocal_memory = true;
+                }
+            }
+            IrOp::LoadPtr { .. } => {
+                effects.reads_nonlocal_memory = true;
+            }
+            IrOp::StorePtr { .. } | IrOp::StoreLocal { .. } => {
+                effects.writes_nonlocal_memory = true;
+            }
+            IrOp::LoadLocal { .. } => {}
+            IrOp::Call { .. } => {}
+            _ => {}
+        }
+    }
+
+    effects
+}
+
+fn all_call_clobbers() -> HashSet<PhysReg> {
+    HashSet::from([PhysReg::A, PhysReg::BC, PhysReg::DE, PhysReg::HL])
+}
+
+fn known_function_effects() -> HashMap<String, FunctionEffects> {
+    let mut effects = HashMap::new();
+    for name in [
+        "__mul16", "__mul32",
+        "__div16u", "__div16s", "__mod16u", "__mod16s", "__divmod16u",
+        "__div32u", "__div32s", "__mod32u", "__mod32s", "__divmod32u",
+        "__shl16", "__shr16u", "__shr16s", "__shl32", "__shr32u", "__shr32s",
+        "__cmp16u", "__cmp16s",
+        "__fadd", "__fsub", "__fmul", "__fdiv",
+        "__feq", "__fne", "__flt", "__fle", "__fgt", "__fge",
+        "__itof", "__ftoi",
+        "__builtin_va_start",
+    ] {
+        effects.insert(name.to_string(), FunctionEffects::runtime_helper());
+    }
+    effects
 }
 
 // ---------------------------------------------------------------------------
@@ -347,6 +672,14 @@ impl CallGraphAnalysis {
     pub fn is_leaf(&self, func_name: &str) -> bool {
         self.leaf_functions.contains(func_name)
     }
+
+    /// Return the effect summary for a function or a conservative fallback.
+    pub fn effects_for(&self, func_name: &str) -> FunctionEffects {
+        self.effects
+            .get(func_name)
+            .cloned()
+            .unwrap_or_else(FunctionEffects::conservative)
+    }
 }
 
 impl CallGraph {
@@ -363,7 +696,7 @@ impl CallGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{IrFunction, IrInstr, IrOp, IrParam, IrProgram, GlobalVar, VReg, Width};
+    use crate::ir::{IrFunction, IrOp, IrParam, IrProgram, GlobalVar, VReg, Width};
     use crate::types::CType;
 
     // -- helpers ----------------------------------------------------------
@@ -625,6 +958,64 @@ mod tests {
         assert!(result.is_stack_mode("rec"));
         assert_eq!(result.local_addr("rec", "n"), None);
         assert_eq!(result.local_addr("rec", "tmp"), None);
+    }
+
+    #[test]
+    fn sibling_functions_share_static_frame_space() {
+        let prog = make_program(vec![
+            make_func_with_vars("main", &[], &[("x", CType::int_signed())], &["left", "right"]),
+            make_func_with_vars("left", &[], &[("tmp", CType::int_signed())], &[]),
+            make_func_with_vars("right", &[], &[("tmp", CType::int_signed())], &[]),
+        ]);
+
+        let result = analyze(&prog, Some(0x8000));
+
+        assert_ne!(result.local_addr("main", "x"), result.local_addr("left", "tmp"));
+        assert_eq!(result.local_addr("left", "tmp"), result.local_addr("right", "tmp"));
+        assert_eq!(result.next_addr, 0x8004);
+    }
+
+    #[test]
+    fn descendant_function_does_not_share_frame_space() {
+        let prog = make_program(vec![
+            make_func_with_vars("main", &[], &[("x", CType::int_signed())], &["child"]),
+            make_func_with_vars("child", &[], &[("tmp", CType::int_signed())], &[]),
+        ]);
+
+        let result = analyze(&prog, Some(0x8000));
+
+        assert_ne!(result.local_addr("main", "x"), result.local_addr("child", "tmp"));
+        assert_eq!(result.next_addr, 0x8004);
+    }
+
+    #[test]
+    fn local_only_function_is_pure_and_readonly() {
+        let prog = make_program(vec![make_func_with_vars(
+            "helper",
+            &[("a", CType::int_signed())],
+            &[("tmp", CType::int_signed())],
+            &[],
+        )]);
+
+        let result = analyze(&prog, Some(0x8000));
+        let effects = result.effects_for("helper");
+
+        assert!(effects.leaf);
+        assert!(effects.pure);
+        assert!(effects.readonly);
+        assert!(!effects.noreturn);
+    }
+
+    #[test]
+    fn runtime_helper_summary_is_available() {
+        let prog = make_program(vec![]);
+        let result = analyze(&prog, Some(0x8000));
+        let effects = result.effects_for("__mul16");
+
+        assert!(effects.leaf);
+        assert!(effects.pure);
+        assert!(effects.readonly);
+        assert!(effects.clobbers.contains(&PhysReg::HL));
     }
 
     #[test]
