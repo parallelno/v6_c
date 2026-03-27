@@ -259,13 +259,13 @@ Each routine is hand‑optimized for the 8080 instruction set. The multiply/divi
 
 **Goal:** Match or exceed c8080 performance on integer benchmarks.
 
-- [ ] **2.1 IR constant folding & propagation** — Evaluate constant expressions at compile time; propagate known values.
-- [ ] **2.2 Dead‑code elimination** — Remove unreachable code and unused variables/functions.
-- [ ] **2.3 Strength reduction** — Multiply‑to‑shift, divide‑to‑shift, modulo‑to‑mask for powers of two.
-- [ ] **2.4 Common sub‑expression elimination** — Within basic blocks initially.
-- [ ] **2.5 32‑bit integer support** — `long` / `unsigned long` with assembly runtime (`__mul32`, `__div32`, etc.).
-- [ ] **2.6 Expanded peephole** — 30+ rules; tail‑call optimization; conditional‑branch inversion.
-- [ ] **2.7 Benchmarking** — Run Dhrystone, Sieve, Fannkuch; compare cycle counts and code size against c8080 and SDCC (Z80‑mode, 8080‑subset only).
+- [x] **2.1 IR constant folding & propagation** — Evaluate constant expressions at compile time; propagate known values.
+- [x] **2.2 Dead‑code elimination** — Remove unreachable code and unused variables/functions.
+- [x] **2.3 Strength reduction** — Multiply‑to‑shift, divide‑to‑shift, modulo‑to‑mask for powers of two.
+- [x] **2.4 Common sub‑expression elimination** — Within basic blocks initially.
+- [x] **2.5 32‑bit integer support** — `long` / `unsigned long` with assembly runtime (`__mul32`, `__div32`, etc.).
+- [x] **2.6 Expanded peephole** — 30+ rules; tail‑call optimization; conditional‑branch inversion.
+- [x] **2.7 Benchmarking** — Run Dhrystone, Sieve, Fannkuch; compare cycle counts and code size against c8080 and SDCC (Z80‑mode, 8080‑subset only).
 
 ### Phase 3 — Structs, Enums, Switch, Arrays
 
