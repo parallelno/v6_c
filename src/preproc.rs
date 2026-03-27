@@ -265,6 +265,12 @@ impl Preprocessor {
                     "define" => self.handle_define(rest, filename, line),
                     "undef" => self.handle_undef(rest, filename, line),
                     "include" => self.handle_include(rest, output, filename, line, depth),
+                    "pragma" => {
+                        // Preserve pragma lines for later compiler stages.
+                        output.push('#');
+                        output.push_str(directive.trim_end());
+                        Ok(())
+                    }
                     "error" => self.handle_error(rest, filename, line),
                     "" => Ok(()), // lone `#` on a line is a null directive
                     _ => Err(PreprocError::new(
@@ -2191,9 +2197,17 @@ mod tests {
     // -- Unknown directive ----------------------------------------------
 
     #[test]
-    fn unknown_directive_is_error() {
+    fn pragma_is_preserved() {
         let mut p = pp();
         let src = "#pragma once";
+        let result = run(&mut p, src).unwrap();
+        assert_eq!(result, "#pragma once");
+    }
+
+    #[test]
+    fn unknown_directive_is_error() {
+        let mut p = pp();
+        let src = "#unknown stuff";
         let result = run(&mut p, src);
         assert!(result.is_err());
         assert!(result.unwrap_err().message.contains("unknown"));

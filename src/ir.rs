@@ -327,6 +327,9 @@ pub struct IrFunction {
     /// The linear sequence of IR instructions comprising the function body.
     pub body: Vec<IrInstr>,
 
+    /// Loop header labels that are explicitly marked with `#pragma unroll`.
+    pub unroll_loop_headers: Vec<Label>,
+
     /// Return type.
     pub return_type: CType,
 
@@ -346,6 +349,7 @@ impl IrFunction {
             params: Vec::new(),
             locals: Vec::new(),
             body: Vec::new(),
+            unroll_loop_headers: Vec::new(),
             return_type,
             is_stack_mode: false,
             is_variadic: false,

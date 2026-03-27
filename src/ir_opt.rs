@@ -40,6 +40,18 @@ pub fn optimize(program: &mut IrProgram) {
     for func in &mut program.functions {
         optimize_function(func);
     }
+
+    // Run loop-specific passes once (outside the fixed-point loop to avoid
+    // interaction between passes causing unbounded IR growth).
+    for func in &mut program.functions {
+        let mut loop_changed = false;
+        loop_changed |= induction_variable_optimization(func);
+        loop_changed |= loop_unrolling(func);
+        if loop_changed {
+            // Clean up after loop transformations.
+            optimize_function(func);
+        }
+    }
 }
 
 /// Run all optimization passes on a single function.
@@ -1433,6 +1445,592 @@ fn collect_src_vregs(op: &IrOp) -> Vec<u32> {
 }
 
 // ---------------------------------------------------------------------------
+// Induction variable optimization
+// ---------------------------------------------------------------------------
+
+/// Maximum number of loop body instructions we consider for unrolling.
+const UNROLL_MAX_BODY: usize = 30;
+
+/// Maximum static trip count for full unrolling.
+const UNROLL_MAX_TRIPS: u64 = 16;
+
+/// Detect basic induction variables of the form `iv = iv + C` (or
+/// `iv = iv - C`) and replace loop-body multiply expressions that depend
+/// on the IV with a derived induction variable incremented by `C * K` each
+/// iteration.
+///
+/// Example:
+/// ```text
+///   // before                   // after
+///   iv = iv + 1                 iv = iv + 1
+///   t = iv * 10                 div = div + 10   // derived IV
+///                               t = copy div
+/// ```
+///
+/// This eliminates expensive multiplications inside tight loops.
+fn induction_variable_optimization(func: &mut IrFunction) -> bool {
+    // --- Detect natural loops (same algorithm as LICM) ---
+    let mut label_index: HashMap<u32, usize> = HashMap::new();
+    for (i, instr) in func.body.iter().enumerate() {
+        if let IrOp::Label { label } = &instr.op {
+            label_index.insert(label.0, i);
+        }
+    }
+
+    struct LoopRange {
+        header_idx: usize,
+        back_edge_idx: usize,
+    }
+
+    let mut loops: Vec<LoopRange> = Vec::new();
+    for (i, instr) in func.body.iter().enumerate() {
+        let target_id = match &instr.op {
+            IrOp::Jump { target } => Some(target.0),
+            IrOp::JumpIfTrue { target, .. } => Some(target.0),
+            _ => None,
+        };
+        if let Some(tid) = target_id {
+            if let Some(&header_idx) = label_index.get(&tid) {
+                if header_idx < i {
+                    loops.push(LoopRange { header_idx, back_edge_idx: i });
+                }
+            }
+        }
+    }
+
+    if loops.is_empty() {
+        return false;
+    }
+
+    // Sort innermost first.
+    loops.sort_by_key(|l| l.back_edge_idx - l.header_idx);
+
+    let mut changed = false;
+
+    for lp in &loops {
+        // Collect known constants defined *before* the loop.
+        let mut constants: HashMap<u32, i64> = HashMap::new();
+        for idx in 0..lp.header_idx {
+            if let IrOp::LoadImm { dst, value } = &func.body[idx].op {
+                constants.insert(dst.id, *value);
+            }
+        }
+
+        // --- Detect basic induction variables ---
+        // An IV is a vreg `iv` such that there is exactly one definition of
+        // `iv` inside the loop, and that definition is `iv = iv + C` or
+        // `iv = iv - C` where C is a loop-invariant constant.
+        struct BasicIV {
+            vreg_id: u32,
+            stride: i64,    // +C or -C
+            width: Width,
+            def_idx: usize, // index of the Add/Sub instruction
+        }
+
+        let mut basic_ivs: Vec<BasicIV> = Vec::new();
+
+        // Count definitions of each vreg inside the loop.
+        let mut def_counts: HashMap<u32, usize> = HashMap::new();
+        for idx in lp.header_idx..=lp.back_edge_idx {
+            if let Some(dst) = get_dst_vreg(&func.body[idx].op) {
+                *def_counts.entry(dst.id).or_insert(0) += 1;
+            }
+        }
+
+        for idx in lp.header_idx..=lp.back_edge_idx {
+            match &func.body[idx].op {
+                IrOp::Add { dst, lhs, rhs, width } => {
+                    // iv = iv + C  or  iv = C + iv
+                    if dst.id == lhs.id && def_counts.get(&dst.id) == Some(&1) {
+                        if let Some(&c) = constants.get(&rhs.id) {
+                            basic_ivs.push(BasicIV {
+                                vreg_id: dst.id,
+                                stride: c,
+                                width: *width,
+                                def_idx: idx,
+                            });
+                        }
+                    } else if dst.id == rhs.id && def_counts.get(&dst.id) == Some(&1) {
+                        if let Some(&c) = constants.get(&lhs.id) {
+                            basic_ivs.push(BasicIV {
+                                vreg_id: dst.id,
+                                stride: c,
+                                width: *width,
+                                def_idx: idx,
+                            });
+                        }
+                    }
+                }
+                IrOp::Sub { dst, lhs, rhs, width } => {
+                    // iv = iv - C
+                    if dst.id == lhs.id && def_counts.get(&dst.id) == Some(&1) {
+                        if let Some(&c) = constants.get(&rhs.id) {
+                            basic_ivs.push(BasicIV {
+                                vreg_id: dst.id,
+                                stride: -c,
+                                width: *width,
+                                def_idx: idx,
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if basic_ivs.is_empty() {
+            continue;
+        }
+
+        // --- Find multiply expressions using the IV and replace them ---
+        // Look for `t = iv * K` or `t = K * iv` where K is a loop constant.
+        // Replace with a derived IV: `div += stride * K` each iteration,
+        // plus an initialisation `div = iv_init * K` before the loop.
+
+        // We need to know the maximum vreg id so we can allocate fresh ones.
+        let mut max_vreg_id: u32 = 0;
+        for instr in &func.body {
+            if let Some(dst) = get_dst_vreg(&instr.op) {
+                if dst.id >= max_vreg_id {
+                    max_vreg_id = dst.id + 1;
+                }
+            }
+            for s in collect_src_vregs(&instr.op) {
+                if s >= max_vreg_id {
+                    max_vreg_id = s + 1;
+                }
+            }
+        }
+
+        struct DerivedIV {
+            mul_idx: usize,     // index of the Mul instruction inside the loop
+            mul_dst: VReg,      // original destination of the Mul
+            iv_vreg_id: u32,    // the basic IV vreg id
+            factor: i64,        // the constant K
+            derived_vreg: VReg, // new vreg for the derived IV
+            stride_vreg: VReg,  // new vreg for `stride * K` constant
+            init_vreg: VReg,    // vreg for initial value of derived IV
+            width: Width,
+        }
+
+        let mut derived_ivs: Vec<DerivedIV> = Vec::new();
+
+        for idx in lp.header_idx..=lp.back_edge_idx {
+            if let IrOp::Mul { dst, lhs, rhs, width, .. } = &func.body[idx].op {
+                for biv in &basic_ivs {
+                    let factor = if lhs.id == biv.vreg_id {
+                        constants.get(&rhs.id).copied()
+                    } else if rhs.id == biv.vreg_id {
+                        constants.get(&lhs.id).copied()
+                    } else {
+                        None
+                    };
+                    if let Some(k) = factor {
+                        let derived_vreg = VReg::new(max_vreg_id, *width);
+                        max_vreg_id += 1;
+                        let stride_vreg = VReg::new(max_vreg_id, *width);
+                        max_vreg_id += 1;
+                        let init_vreg = VReg::new(max_vreg_id, *width);
+                        max_vreg_id += 1;
+
+                        derived_ivs.push(DerivedIV {
+                            mul_idx: idx,
+                            mul_dst: *dst,
+                            iv_vreg_id: biv.vreg_id,
+                            factor: k,
+                            derived_vreg,
+                            stride_vreg,
+                            init_vreg,
+                            width: *width,
+                        });
+                        break;
+                    }
+                }
+            }
+        }
+
+        if derived_ivs.is_empty() {
+            continue;
+        }
+
+        // Now build the transformed body.
+        let mut new_body: Vec<IrInstr> = Vec::with_capacity(func.body.len() + derived_ivs.len() * 4);
+
+        let mul_indices: HashSet<usize> = derived_ivs.iter().map(|d| d.mul_idx).collect();
+
+        for (i, instr) in func.body.iter().enumerate() {
+            // Before the header label, insert the derived IV initialisations.
+            if i == lp.header_idx {
+                for div in &derived_ivs {
+                    // Load the stride constant: stride * factor
+                    let biv = basic_ivs.iter().find(|b| b.vreg_id == div.iv_vreg_id).unwrap();
+                    let stride_val = wrap_result(biv.stride * div.factor, div.width);
+                    new_body.push(IrInstr::bare(IrOp::LoadImm {
+                        dst: div.stride_vreg,
+                        value: stride_val,
+                    }));
+                    // Initialise derived IV: div_vreg = iv_init * K.
+                    // The initial value of the IV is whatever was loaded into
+                    // iv_vreg before the loop.  We express this as a Mul that
+                    // constant-folding will handle in a subsequent pass.
+                    // For simplicity, we emit Copy of the init_vreg which
+                    // we'll set by computing iv * K.
+                    // Actually, let's just emit a Mul here — it executes once
+                    // (before the loop), so it's fine.  Constant folding will
+                    // clean it up if the init value is known.
+                    // We need a vreg holding K.
+                    let k_vreg = VReg::new(max_vreg_id, div.width);
+                    max_vreg_id += 1;
+                    new_body.push(IrInstr::bare(IrOp::LoadImm {
+                        dst: k_vreg,
+                        value: wrap_result(div.factor, div.width),
+                    }));
+                    new_body.push(IrInstr::bare(IrOp::Mul {
+                        dst: div.derived_vreg,
+                        lhs: VReg::new(div.iv_vreg_id, div.width),
+                        rhs: k_vreg,
+                        width: div.width,
+                        signed: true,
+                    }));
+                }
+            }
+
+            // Replace Mul with Copy from derived IV, then add the increment.
+            if mul_indices.contains(&i) {
+                let div = derived_ivs.iter().find(|d| d.mul_idx == i).unwrap();
+                // t = copy derived_vreg
+                new_body.push(IrInstr::bare(IrOp::Copy {
+                    dst: div.mul_dst,
+                    src: div.derived_vreg,
+                }));
+                continue;
+            }
+
+            new_body.push(instr.clone());
+
+            // After the IV increment instruction, add the derived IV increment.
+            for div in &derived_ivs {
+                let biv = basic_ivs.iter().find(|b| b.vreg_id == div.iv_vreg_id).unwrap();
+                if i == biv.def_idx {
+                    new_body.push(IrInstr::bare(IrOp::Add {
+                        dst: div.derived_vreg,
+                        lhs: div.derived_vreg,
+                        rhs: div.stride_vreg,
+                        width: div.width,
+                    }));
+                }
+            }
+        }
+
+        func.body = new_body;
+        changed = true;
+        break; // Indices invalidated; re-enter via fixed-point loop.
+    }
+
+    changed
+}
+
+// ---------------------------------------------------------------------------
+// Loop unrolling
+// ---------------------------------------------------------------------------
+
+/// Unroll small loops whose trip count is statically known and small.
+///
+/// Recognises the canonical pattern emitted by the IR generator for
+/// counted loops:
+///
+/// ```text
+///   iv = LoadImm init
+///   ...
+/// L_header:
+///   cond = Lt/Le/Gt/Ge iv, limit
+///   JumpIfFalse cond, L_exit
+///   <loop body>
+///   iv = Add iv, stride
+///   Jump L_header
+/// L_exit:
+/// ```
+///
+/// If the trip count is ≤ [`UNROLL_MAX_TRIPS`] and the body size is
+/// ≤ [`UNROLL_MAX_BODY`] instructions, the loop is fully unrolled into
+/// straight-line code.
+fn loop_unrolling(func: &mut IrFunction) -> bool {
+    if func.unroll_loop_headers.is_empty() {
+        return false;
+    }
+
+    let unroll_headers: HashSet<u32> = func
+        .unroll_loop_headers
+        .iter()
+        .map(|l| l.0)
+        .collect();
+
+    // --- Detect natural loops ---
+    let mut label_index: HashMap<u32, usize> = HashMap::new();
+    for (i, instr) in func.body.iter().enumerate() {
+        if let IrOp::Label { label } = &instr.op {
+            label_index.insert(label.0, i);
+        }
+    }
+
+    struct LoopCandidate {
+        header_idx: usize,     // index of the Label instruction
+        back_edge_idx: usize,  // index of the Jump back to header
+    }
+
+    let mut loops: Vec<LoopCandidate> = Vec::new();
+    for (i, instr) in func.body.iter().enumerate() {
+        // Only unconditional back-edges form canonical counted loops.
+        if let IrOp::Jump { target } = &instr.op {
+            if let Some(&header_idx) = label_index.get(&target.0) {
+                if header_idx < i {
+                    loops.push(LoopCandidate { header_idx, back_edge_idx: i });
+                }
+            }
+        }
+    }
+
+    if loops.is_empty() {
+        return false;
+    }
+
+    // Sort innermost first.
+    loops.sort_by_key(|l| l.back_edge_idx - l.header_idx);
+
+    // Collect all known constants.
+    let constants: HashMap<u32, i64> = func
+        .body
+        .iter()
+        .filter_map(|instr| {
+            if let IrOp::LoadImm { dst, value } = &instr.op {
+                Some((dst.id, *value))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let mut changed = false;
+
+    for lp in &loops {
+        let header_label_id = match &func.body[lp.header_idx].op {
+            IrOp::Label { label } => label.0,
+            _ => continue,
+        };
+        if !unroll_headers.contains(&header_label_id) {
+            continue;
+        }
+
+        let span = lp.back_edge_idx - lp.header_idx;
+        if span < 3 {
+            continue; // Too small to be a real loop.
+        }
+
+        // Expect the first instruction after the header label to be a
+        // comparison, and the next to be a JumpIfFalse (exit).
+        let cmp_idx = lp.header_idx + 1;
+        let exit_idx = lp.header_idx + 2;
+        if exit_idx >= lp.back_edge_idx {
+            continue;
+        }
+
+        // Parse the comparison.
+        let (cmp_dst_id, iv_id, limit_val, is_lt, is_signed) =
+            match &func.body[cmp_idx].op {
+                IrOp::Lt { dst, lhs, rhs, width: _, signed } => {
+                    if let Some(&lim) = constants.get(&rhs.id) {
+                        (dst.id, lhs.id, lim, true, *signed)
+                    } else {
+                        continue;
+                    }
+                }
+                IrOp::Le { dst, lhs, rhs, width: _, signed } => {
+                    // `iv <= limit` is equivalent to `iv < limit + 1`
+                    if let Some(&lim) = constants.get(&rhs.id) {
+                        (dst.id, lhs.id, lim + 1, true, *signed)
+                    } else {
+                        continue;
+                    }
+                }
+                IrOp::Gt { dst, lhs, rhs, width: _, signed } => {
+                    // `iv > limit` ⇒ iterate while > limit, i.e. count down
+                    if let Some(&lim) = constants.get(&rhs.id) {
+                        (dst.id, lhs.id, lim, false, *signed)
+                    } else {
+                        continue;
+                    }
+                }
+                IrOp::Ge { dst, lhs, rhs, width: _, signed } => {
+                    if let Some(&lim) = constants.get(&rhs.id) {
+                        (dst.id, lhs.id, lim - 1, false, *signed)
+                    } else {
+                        continue;
+                    }
+                }
+                _ => continue,
+            };
+
+        // Verify the JumpIfFalse uses this comparison result.
+        let exit_label = match &func.body[exit_idx].op {
+            IrOp::JumpIfFalse { cond, target } if cond.id == cmp_dst_id => target.0,
+            _ => continue,
+        };
+
+        // Find the IV increment: `iv = iv + stride` just before the back-edge.
+        let inc_idx = lp.back_edge_idx - 1;
+        let stride = match &func.body[inc_idx].op {
+            IrOp::Add { dst, lhs, rhs, .. } if dst.id == iv_id && lhs.id == iv_id => {
+                if let Some(&c) = constants.get(&rhs.id) { c } else { continue }
+            }
+            IrOp::Sub { dst, lhs, rhs, .. } if dst.id == iv_id && lhs.id == iv_id => {
+                if let Some(&c) = constants.get(&rhs.id) { -c } else { continue }
+            }
+            _ => continue,
+        };
+
+        if stride == 0 {
+            continue; // Infinite loop, don't touch.
+        }
+
+        // Find the initial value of the IV (must be a known constant defined
+        // before the loop).
+        let init_val = match constants.get(&iv_id) {
+            Some(&v) => v,
+            None => continue,
+        };
+        // Make sure the IV is initialised before the header, not inside.
+        let iv_init_before = func.body[..lp.header_idx]
+            .iter()
+            .any(|instr| matches!(&instr.op, IrOp::LoadImm { dst, .. } if dst.id == iv_id));
+        if !iv_init_before {
+            continue;
+        }
+
+        // Compute trip count.
+        let trip_count: u64 = if is_lt {
+            // Counting up: trips = ceil((limit - init) / stride)
+            if stride <= 0 { continue; }
+            let diff = if is_signed {
+                sign_extend(limit_val, Width::W16) - sign_extend(init_val, Width::W16)
+            } else {
+                (to_unsigned(limit_val, Width::W16) as i64)
+                    - (to_unsigned(init_val, Width::W16) as i64)
+            };
+            if diff <= 0 { 0 } else { ((diff + stride - 1) / stride) as u64 }
+        } else {
+            // Counting down: trips = ceil((init - limit) / (-stride))
+            if stride >= 0 { continue; }
+            let neg_stride = -stride;
+            let diff = if is_signed {
+                sign_extend(init_val, Width::W16) - sign_extend(limit_val, Width::W16)
+            } else {
+                (to_unsigned(init_val, Width::W16) as i64)
+                    - (to_unsigned(limit_val, Width::W16) as i64)
+            };
+            if diff <= 0 { 0 } else { ((diff + neg_stride - 1) / neg_stride) as u64 }
+        };
+
+        if trip_count == 0 || trip_count > UNROLL_MAX_TRIPS {
+            continue;
+        }
+
+        // Check body size (from after exit_idx to before inc_idx).
+        let body_start = exit_idx + 1;
+        let body_end = inc_idx; // exclusive
+        if body_end <= body_start {
+            continue;
+        }
+        let body_len = body_end - body_start;
+        if body_len > UNROLL_MAX_BODY {
+            continue;
+        }
+
+        // --- Perform full unrolling ---
+        //
+        // Replace the loop with `trip_count` copies of the body.  We
+        // need to allocate fresh vregs/labels for each unrolled copy
+        // to avoid definition conflicts.
+
+        let mut max_vreg_id: u32 = 0;
+        let mut max_label_id: u32 = 0;
+        for instr in &func.body {
+            if let Some(dst) = get_dst_vreg(&instr.op) {
+                if dst.id >= max_vreg_id { max_vreg_id = dst.id + 1; }
+            }
+            for s in collect_src_vregs(&instr.op) {
+                if s >= max_vreg_id { max_vreg_id = s + 1; }
+            }
+            if let IrOp::Label { label } = &instr.op {
+                if label.0 >= max_label_id { max_label_id = label.0 + 1; }
+            }
+        }
+
+        // Collect the body instructions to replicate.
+        let body_instrs: Vec<IrInstr> = func.body[body_start..body_end].to_vec();
+
+        let mut new_body: Vec<IrInstr> = Vec::with_capacity(func.body.len());
+
+        // Emit everything before the loop (excluding the header label).
+        for idx in 0..lp.header_idx {
+            new_body.push(func.body[idx].clone());
+        }
+
+        // Emit the unrolled copies.
+        for iter_no in 0..trip_count {
+            if iter_no == 0 {
+                // First iteration uses the original vregs.
+                for instr in &body_instrs {
+                    new_body.push(instr.clone());
+                }
+            } else {
+                // Subsequent iterations get remapped vregs/labels.
+                let mut vreg_map: HashMap<u32, u32> = HashMap::new();
+                let mut label_map: HashMap<u32, u32> = HashMap::new();
+
+                // Map the IV to itself (it is threaded across iterations
+                // via the emitted increment).
+                vreg_map.insert(iv_id, iv_id);
+
+                for instr in &body_instrs {
+                    let new_op = remap_op(
+                        &instr.op,
+                        &mut vreg_map,
+                        &mut label_map,
+                        &mut max_vreg_id,
+                        &mut max_label_id,
+                    );
+                    new_body.push(IrInstr { op: new_op, line: instr.line });
+                }
+            }
+
+            // Emit the IV increment (use original vreg — it accumulates).
+            let inc_instr = &func.body[inc_idx];
+            new_body.push(inc_instr.clone());
+        }
+
+        // Emit the exit label and everything after it.
+        // Find the exit label position.
+        let exit_label_idx = label_index.get(&exit_label).copied();
+        if let Some(eidx) = exit_label_idx {
+            for idx in eidx..func.body.len() {
+                new_body.push(func.body[idx].clone());
+            }
+        } else {
+            // No exit label found; emit everything after back edge.
+            for idx in (lp.back_edge_idx + 1)..func.body.len() {
+                new_body.push(func.body[idx].clone());
+            }
+        }
+
+        func.body = new_body;
+        changed = true;
+        break; // Indices invalidated; re-enter via fixed-point loop.
+    }
+
+    changed
+}
+
+// ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
 
@@ -1496,8 +2094,20 @@ mod tests {
     fn opt_body(body: Vec<IrInstr>) -> Vec<IrInstr> {
         let mut func = IrFunction::new("test", CType::Void);
         func.body = body;
-        optimize_function(&mut func);
-        func.body
+        let mut program = IrProgram::new();
+        program.functions.push(func);
+        optimize(&mut program);
+        program.functions.pop().unwrap().body
+    }
+
+    fn opt_body_with_unroll_headers(body: Vec<IrInstr>, headers: &[u32]) -> Vec<IrInstr> {
+        let mut func = IrFunction::new("test", CType::Void);
+        func.body = body;
+        func.unroll_loop_headers = headers.iter().copied().map(Label::new).collect();
+        let mut program = IrProgram::new();
+        program.functions.push(func);
+        optimize(&mut program);
+        program.functions.pop().unwrap().body
     }
 
     /// Helper to build a LoadImm instruction.
@@ -1542,7 +2152,7 @@ mod tests {
             }),
             IrInstr::bare(IrOp::ret(Some(VReg::new(2, Width::W16)))),
         ];
-        let result = opt_body(body);
+        let result = opt_body_with_unroll_headers(body, &[0]);
         assert!(result.iter().any(|i| matches!(&i.op,
             IrOp::LoadImm { dst, value: 70 } if dst.id == 2)));
     }
@@ -1561,7 +2171,7 @@ mod tests {
             }),
             IrInstr::bare(IrOp::ret(Some(VReg::new(2, Width::W16)))),
         ];
-        let result = opt_body(body);
+        let result = opt_body_with_unroll_headers(body, &[0]);
         assert!(result.iter().any(|i| matches!(&i.op,
             IrOp::LoadImm { dst, value: 42 } if dst.id == 2)));
     }
@@ -1580,7 +2190,7 @@ mod tests {
             }),
             IrInstr::bare(IrOp::ret(Some(VReg::new(2, Width::W16)))),
         ];
-        let result = opt_body(body);
+        let result = opt_body_with_unroll_headers(body, &[0]);
         // Division by zero should NOT be folded
         assert!(result.iter().any(|i| matches!(&i.op, IrOp::Div { .. })));
     }
@@ -2107,5 +2717,234 @@ mod tests {
             "loop-dependent Add should NOT be hoisted (add at {}, label at {})",
             add_pos, label_pos,
         );
+    }
+
+    // -- Induction variable optimization ----------------------------------
+
+    #[test]
+    fn iv_opt_replaces_mul_with_derived_iv() {
+        // Simulate:
+        //   iv (v0) = 0               // init
+        //   stride (v1) = 1           // constant stride
+        //   factor (v3) = 10          // constant factor
+        // L0: (loop header)
+        //   t (v2) = iv * factor      // should be replaced
+        //   store_global "_g_x", t
+        //   iv = iv + stride          // IV increment
+        //   jump_if_true iv, L0       // back edge
+        //
+        // After IV opt: the Mul should be gone, replaced by a Copy from
+        // a derived IV that is incremented by stride * factor = 10.
+        let body = vec![
+            load_imm(0, Width::W16, 0),           // iv = 0
+            load_imm(1, Width::W16, 1),           // stride = 1
+            load_imm(3, Width::W16, 10),          // factor = 10
+            IrInstr::bare(IrOp::Label { label: Label::new(0) }),
+            IrInstr::bare(IrOp::Mul {
+                dst: VReg::new(2, Width::W16),
+                lhs: VReg::new(0, Width::W16),
+                rhs: VReg::new(3, Width::W16),
+                width: Width::W16,
+                signed: true,
+            }),
+            IrInstr::bare(IrOp::StoreGlobal {
+                addr_label: "_g_x".into(),
+                src: VReg::new(2, Width::W16),
+            }),
+            IrInstr::bare(IrOp::Add {
+                dst: VReg::new(0, Width::W16),
+                lhs: VReg::new(0, Width::W16),
+                rhs: VReg::new(1, Width::W16),
+                width: Width::W16,
+            }),
+            IrInstr::bare(IrOp::JumpIfTrue {
+                cond: VReg::new(0, Width::W16),
+                target: Label::new(0),
+            }),
+            IrInstr::bare(IrOp::ret(None)),
+        ];
+
+        let result = opt_body(body);
+
+        // The loop body should no longer contain a Mul instruction.
+        let label_pos = result
+            .iter()
+            .position(|i| matches!(&i.op, IrOp::Label { label } if label.0 == 0))
+            .expect("label L0 must exist");
+        let has_mul_in_loop = result[label_pos..]
+            .iter()
+            .any(|i| matches!(&i.op, IrOp::Mul { .. }));
+        assert!(
+            !has_mul_in_loop,
+            "Mul inside the loop should be replaced by IV opt"
+        );
+
+        // Should have a Copy for the replaced Mul destination.
+        let has_copy = result[label_pos..]
+            .iter()
+            .any(|i| matches!(&i.op, IrOp::Copy { dst, .. } if dst.id == 2));
+        assert!(
+            has_copy,
+            "Mul should be replaced with a Copy from the derived IV"
+        );
+    }
+
+    // -- Loop unrolling ---------------------------------------------------
+
+    #[test]
+    fn loop_unrolling_fully_unrolls_small_loop() {
+        // Simulate:
+        //   iv (v0) = 0
+        //   limit (v1) = 4
+        //   stride (v2) = 1
+        // L0: (header)
+        //   cond (v3) = Lt iv, limit
+        //   JumpIfFalse cond, L1
+        //   store_global "_g_x", iv   // body
+        //   iv = Add iv, stride       // increment
+        //   Jump L0                   // back edge
+        // L1: (exit)
+        //   Return
+        //
+        // Trip count = 4, should fully unroll.
+        let body = vec![
+            load_imm(0, Width::W16, 0),
+            load_imm(1, Width::W16, 4),
+            load_imm(2, Width::W16, 1),
+            IrInstr::bare(IrOp::Label { label: Label::new(0) }),
+            IrInstr::bare(IrOp::Lt {
+                dst: VReg::new(3, Width::W16),
+                lhs: VReg::new(0, Width::W16),
+                rhs: VReg::new(1, Width::W16),
+                width: Width::W16,
+                signed: true,
+            }),
+            IrInstr::bare(IrOp::JumpIfFalse {
+                cond: VReg::new(3, Width::W16),
+                target: Label::new(1),
+            }),
+            IrInstr::bare(IrOp::StoreGlobal {
+                addr_label: "_g_x".into(),
+                src: VReg::new(0, Width::W16),
+            }),
+            IrInstr::bare(IrOp::Add {
+                dst: VReg::new(0, Width::W16),
+                lhs: VReg::new(0, Width::W16),
+                rhs: VReg::new(2, Width::W16),
+                width: Width::W16,
+            }),
+            IrInstr::bare(IrOp::Jump { target: Label::new(0) }),
+            IrInstr::bare(IrOp::Label { label: Label::new(1) }),
+            IrInstr::bare(IrOp::ret(None)),
+        ];
+
+        let result = opt_body_with_unroll_headers(body, &[0]);
+
+        // After full unrolling, there should be no Jump back to L0
+        // (the loop is eliminated).
+        let has_jump_to_l0 = result
+            .iter()
+            .any(|i| matches!(&i.op, IrOp::Jump { target } if target.0 == 0));
+        assert!(
+            !has_jump_to_l0,
+            "Fully unrolled loop should not have a back-edge jump"
+        );
+
+        // Should have 4 StoreGlobal instructions (one per unrolled iteration).
+        let store_count = result
+            .iter()
+            .filter(|i| matches!(&i.op, IrOp::StoreGlobal { addr_label, .. } if addr_label == "_g_x"))
+            .count();
+        assert_eq!(
+            store_count, 4,
+            "Expected 4 unrolled stores, got {}", store_count
+        );
+    }
+
+    #[test]
+    fn loop_unrolling_skips_large_trip_count() {
+        // Trip count = 100, exceeds UNROLL_MAX_TRIPS → should NOT unroll.
+        let body = vec![
+            load_imm(0, Width::W16, 0),
+            load_imm(1, Width::W16, 100),
+            load_imm(2, Width::W16, 1),
+            IrInstr::bare(IrOp::Label { label: Label::new(0) }),
+            IrInstr::bare(IrOp::Lt {
+                dst: VReg::new(3, Width::W16),
+                lhs: VReg::new(0, Width::W16),
+                rhs: VReg::new(1, Width::W16),
+                width: Width::W16,
+                signed: true,
+            }),
+            IrInstr::bare(IrOp::JumpIfFalse {
+                cond: VReg::new(3, Width::W16),
+                target: Label::new(1),
+            }),
+            IrInstr::bare(IrOp::StoreGlobal {
+                addr_label: "_g_x".into(),
+                src: VReg::new(0, Width::W16),
+            }),
+            IrInstr::bare(IrOp::Add {
+                dst: VReg::new(0, Width::W16),
+                lhs: VReg::new(0, Width::W16),
+                rhs: VReg::new(2, Width::W16),
+                width: Width::W16,
+            }),
+            IrInstr::bare(IrOp::Jump { target: Label::new(0) }),
+            IrInstr::bare(IrOp::Label { label: Label::new(1) }),
+            IrInstr::bare(IrOp::ret(None)),
+        ];
+
+        let result = opt_body(body);
+
+        // Loop should still exist (not unrolled).
+        let has_jump_to_l0 = result
+            .iter()
+            .any(|i| matches!(&i.op, IrOp::Jump { target } if target.0 == 0));
+        assert!(
+            has_jump_to_l0,
+            "Loop with trip count > UNROLL_MAX_TRIPS should NOT be unrolled"
+        );
+    }
+
+    #[test]
+    fn loop_unrolling_requires_hint() {
+        // Canonical 4-iteration loop, but without unroll hint metadata.
+        let body = vec![
+            load_imm(0, Width::W16, 0),
+            load_imm(1, Width::W16, 4),
+            load_imm(2, Width::W16, 1),
+            IrInstr::bare(IrOp::Label { label: Label::new(0) }),
+            IrInstr::bare(IrOp::Lt {
+                dst: VReg::new(3, Width::W16),
+                lhs: VReg::new(0, Width::W16),
+                rhs: VReg::new(1, Width::W16),
+                width: Width::W16,
+                signed: true,
+            }),
+            IrInstr::bare(IrOp::JumpIfFalse {
+                cond: VReg::new(3, Width::W16),
+                target: Label::new(1),
+            }),
+            IrInstr::bare(IrOp::StoreGlobal {
+                addr_label: "_g_x".into(),
+                src: VReg::new(0, Width::W16),
+            }),
+            IrInstr::bare(IrOp::Add {
+                dst: VReg::new(0, Width::W16),
+                lhs: VReg::new(0, Width::W16),
+                rhs: VReg::new(2, Width::W16),
+                width: Width::W16,
+            }),
+            IrInstr::bare(IrOp::Jump { target: Label::new(0) }),
+            IrInstr::bare(IrOp::Label { label: Label::new(1) }),
+            IrInstr::bare(IrOp::ret(None)),
+        ];
+
+        let result = opt_body(body);
+        let has_jump_to_l0 = result
+            .iter()
+            .any(|i| matches!(&i.op, IrOp::Jump { target } if target.0 == 0));
+        assert!(has_jump_to_l0, "Loop should not be unrolled without hint");
     }
 }

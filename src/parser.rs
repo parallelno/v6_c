@@ -61,6 +61,8 @@ pub struct Parser<'t> {
     enum_tags: HashMap<String, CType>,
     /// Enum constant values: `enumerator_name → integer_value`.
     enum_constants: HashMap<String, i64>,
+    /// Set when a `#pragma unroll` was seen and should apply to the next loop.
+    pending_unroll_hint: bool,
 }
 
 impl<'t> Parser<'t> {
@@ -75,6 +77,7 @@ impl<'t> Parser<'t> {
             union_tags: HashMap::new(),
             enum_tags: HashMap::new(),
             enum_constants: HashMap::new(),
+            pending_unroll_hint: false,
         }
     }
 
@@ -673,7 +676,17 @@ impl<'t> Parser<'t> {
     // -----------------------------------------------------------------------
 
     fn parse_stmt(&mut self) -> Option<Stmt> {
-        match self.peek().kind {
+        while self.check(&TokenKind::PreprocDirective) {
+            let text = self.advance().value.clone();
+            self.handle_statement_pragma(&text);
+        }
+
+        let apply_unroll_hint = self.pending_unroll_hint;
+        if apply_unroll_hint {
+            self.pending_unroll_hint = false;
+        }
+
+        let mut stmt = match self.peek().kind {
             TokenKind::LBrace => self.parse_compound_stmt(),
             TokenKind::If => self.parse_if_stmt(),
             TokenKind::While => self.parse_while_stmt(),
@@ -691,6 +704,32 @@ impl<'t> Parser<'t> {
                 self.parse_label_stmt()
             }
             _ => self.parse_expr_stmt(),
+        }?;
+
+        if apply_unroll_hint {
+            match &mut stmt.kind {
+                StmtKind::While { unroll_hint, .. }
+                | StmtKind::DoWhile { unroll_hint, .. }
+                | StmtKind::For { unroll_hint, .. } => {
+                    *unroll_hint = true;
+                }
+                _ => {
+                    // `#pragma unroll` only applies to loop statements.
+                }
+            }
+        }
+
+        Some(stmt)
+    }
+
+    fn handle_statement_pragma(&mut self, directive_text: &str) {
+        let trimmed = directive_text.trim();
+        let Some(rest) = trimmed.strip_prefix("pragma") else {
+            return;
+        };
+        let pragma_body = rest.trim();
+        if pragma_body.eq_ignore_ascii_case("unroll") {
+            self.pending_unroll_hint = true;
         }
     }
 
@@ -790,7 +829,14 @@ impl<'t> Parser<'t> {
         self.expect(&TokenKind::RParen);
         let body = Box::new(self.parse_stmt()?);
 
-        Some(Stmt::new(StmtKind::While { cond, body }, loc))
+        Some(Stmt::new(
+            StmtKind::While {
+                cond,
+                body,
+                unroll_hint: false,
+            },
+            loc,
+        ))
     }
 
     fn parse_do_while_stmt(&mut self) -> Option<Stmt> {
@@ -803,7 +849,14 @@ impl<'t> Parser<'t> {
         self.expect(&TokenKind::RParen);
         self.expect(&TokenKind::Semicolon);
 
-        Some(Stmt::new(StmtKind::DoWhile { body, cond }, loc))
+        Some(Stmt::new(
+            StmtKind::DoWhile {
+                body,
+                cond,
+                unroll_hint: false,
+            },
+            loc,
+        ))
     }
 
     fn parse_for_stmt(&mut self) -> Option<Stmt> {
@@ -849,6 +902,7 @@ impl<'t> Parser<'t> {
                 cond,
                 step,
                 body,
+                unroll_hint: false,
             },
             loc,
         ))
@@ -2377,6 +2431,42 @@ mod tests {
             TopLevelKind::FuncDef { body, .. } => {
                 if let StmtKind::Compound(ref stmts) = body.kind {
                     assert!(matches!(stmts[0].kind, StmtKind::While { .. }));
+                } else {
+                    panic!("expected Compound");
+                }
+            }
+            _ => panic!("expected FuncDef"),
+        }
+    }
+
+    #[test]
+    fn parse_pragma_unroll_before_for() {
+        // void f() { #pragma unroll for (;;) { } }
+        let tokens = vec![
+            tok(TokenKind::Void, "void", 1, 1),
+            tok(TokenKind::Ident, "f", 1, 6),
+            tok(TokenKind::LParen, "(", 1, 7),
+            tok(TokenKind::RParen, ")", 1, 8),
+            tok(TokenKind::LBrace, "{", 1, 10),
+            tok(TokenKind::PreprocDirective, "pragma unroll", 2, 5),
+            tok(TokenKind::For, "for", 3, 5),
+            tok(TokenKind::LParen, "(", 3, 9),
+            tok(TokenKind::Semicolon, ";", 3, 10),
+            tok(TokenKind::Semicolon, ";", 3, 11),
+            tok(TokenKind::RParen, ")", 3, 12),
+            tok(TokenKind::LBrace, "{", 3, 14),
+            tok(TokenKind::RBrace, "}", 3, 16),
+            tok(TokenKind::RBrace, "}", 4, 1),
+            eof(4),
+        ];
+        let prog = parse_ok(tokens);
+        match &prog.decls[0].kind {
+            TopLevelKind::FuncDef { body, .. } => {
+                if let StmtKind::Compound(ref stmts) = body.kind {
+                    match &stmts[0].kind {
+                        StmtKind::For { unroll_hint, .. } => assert!(*unroll_hint),
+                        _ => panic!("expected For"),
+                    }
                 } else {
                     panic!("expected Compound");
                 }

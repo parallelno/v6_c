@@ -83,6 +83,8 @@ pub struct IrGenerator {
     local_syms: HashMap<String, (String, CType)>,
     /// Instructions accumulated for the current function body.
     body: Vec<IrInstr>,
+    /// Loop header labels marked with `#pragma unroll` in the source.
+    unroll_loop_headers: Vec<Label>,
     current_line: u32,
 
     // ---- loop stacks ----
@@ -147,6 +149,7 @@ impl IrGenerator {
             current_return_type: CType::Void,
             local_syms: HashMap::new(),
             body: Vec::new(),
+            unroll_loop_headers: Vec::new(),
             current_line: 0,
             break_stack: Vec::new(),
             continue_stack: Vec::new(),
@@ -473,6 +476,7 @@ impl IrGenerator {
         self.current_return_type = return_type.clone();
         self.local_syms.clear();
         self.body.clear();
+        self.unroll_loop_headers.clear();
         self.user_labels.clear();
         self.break_stack.clear();
         self.continue_stack.clear();
@@ -526,6 +530,7 @@ impl IrGenerator {
             params: ir_params,
             locals: Vec::new(),
             body: std::mem::take(&mut self.body),
+            unroll_loop_headers: std::mem::take(&mut self.unroll_loop_headers),
             return_type: return_type.clone(),
             is_stack_mode: false,
             is_variadic,
@@ -555,16 +560,31 @@ impl IrGenerator {
                 else_body,
             } => self.gen_if(cond, then_body, else_body.as_deref()),
 
-            StmtKind::While { cond, body } => self.gen_while(cond, body),
+            StmtKind::While {
+                cond,
+                body,
+                unroll_hint,
+            } => self.gen_while(cond, body, *unroll_hint),
 
-            StmtKind::DoWhile { body, cond } => self.gen_do_while(body, cond),
+            StmtKind::DoWhile {
+                body,
+                cond,
+                unroll_hint,
+            } => self.gen_do_while(body, cond, *unroll_hint),
 
             StmtKind::For {
                 init,
                 cond,
                 step,
                 body,
-            } => self.gen_for(init.as_deref(), cond.as_ref(), step.as_ref(), body),
+                unroll_hint,
+            } => self.gen_for(
+                init.as_deref(),
+                cond.as_ref(),
+                step.as_ref(),
+                body,
+                *unroll_hint,
+            ),
 
             StmtKind::Return(val) => {
                 if let Some(expr) = val {
@@ -653,11 +673,14 @@ impl IrGenerator {
         }
     }
 
-    fn gen_while(&mut self, cond: &Expr, body: &Stmt) {
+    fn gen_while(&mut self, cond: &Expr, body: &Stmt, unroll_hint: bool) {
         let start = self.label_alloc.alloc();
         let end = self.label_alloc.alloc();
         self.break_stack.push(end);
         self.continue_stack.push(start);
+        if unroll_hint {
+            self.unroll_loop_headers.push(start);
+        }
 
         self.emit(IrOp::label(start));
         let (cond_reg, _) = self.gen_expr(cond);
@@ -670,12 +693,15 @@ impl IrGenerator {
         self.continue_stack.pop();
     }
 
-    fn gen_do_while(&mut self, body: &Stmt, cond: &Expr) {
+    fn gen_do_while(&mut self, body: &Stmt, cond: &Expr, unroll_hint: bool) {
         let start = self.label_alloc.alloc();
         let cont = self.label_alloc.alloc();
         let end = self.label_alloc.alloc();
         self.break_stack.push(end);
         self.continue_stack.push(cont);
+        if unroll_hint {
+            self.unroll_loop_headers.push(start);
+        }
 
         self.emit(IrOp::label(start));
         self.gen_stmt(body);
@@ -694,6 +720,7 @@ impl IrGenerator {
         cond: Option<&Expr>,
         step: Option<&Expr>,
         body: &Stmt,
+        unroll_hint: bool,
     ) {
         if let Some(init) = init {
             self.gen_stmt(init);
@@ -704,6 +731,9 @@ impl IrGenerator {
         let end = self.label_alloc.alloc();
         self.break_stack.push(end);
         self.continue_stack.push(cont);
+        if unroll_hint {
+            self.unroll_loop_headers.push(start);
+        }
 
         self.emit(IrOp::label(start));
         if let Some(cond) = cond {
@@ -2015,6 +2045,7 @@ mod tests {
                             ident("i"),
                             int_lit(1),
                         ))),
+                        unroll_hint: false,
                     },
                     loc(2),
                 ),
@@ -2056,6 +2087,7 @@ mod tests {
                     cond: Some(cond),
                     step: Some(step),
                     body: Box::new(body),
+                    unroll_hint: false,
                 },
                 loc(1),
             )]),
@@ -2064,6 +2096,29 @@ mod tests {
         let f = &ir.functions[0];
         // Three labels: start, continue, end.
         assert!(count_ops(f, |op| matches!(op, IrOp::Label { .. })) >= 3);
+    }
+
+    #[test]
+    fn for_loop_unroll_hint_recorded() {
+        let body = compound(vec![]);
+        let prog = one_func(
+            "f",
+            CType::Void,
+            vec![],
+            compound(vec![Stmt::new(
+                StmtKind::For {
+                    init: None,
+                    cond: None,
+                    step: None,
+                    body: Box::new(body),
+                    unroll_hint: true,
+                },
+                loc(1),
+            )]),
+        );
+        let ir = generate(&prog).unwrap();
+        let f = &ir.functions[0];
+        assert!(!f.unroll_loop_headers.is_empty());
     }
 
     // =====================================================================
@@ -2094,6 +2149,7 @@ mod tests {
                             int_lit(1),
                         ))),
                         cond: binop(BinOp::Lt, ident("i"), int_lit(10)),
+                        unroll_hint: false,
                     },
                     loc(2),
                 ),
@@ -2118,6 +2174,7 @@ mod tests {
                 StmtKind::While {
                     cond: int_lit(1),
                     body: Box::new(Stmt::new(StmtKind::Break, loc(1))),
+                    unroll_hint: false,
                 },
                 loc(1),
             )]),
@@ -2139,6 +2196,7 @@ mod tests {
                 StmtKind::While {
                     cond: int_lit(1),
                     body: Box::new(Stmt::new(StmtKind::Continue, loc(1))),
+                    unroll_hint: false,
                 },
                 loc(1),
             )]),

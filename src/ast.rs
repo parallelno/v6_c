@@ -259,12 +259,16 @@ pub enum StmtKind {
     While {
         cond: Expr,
         body: Box<Stmt>,
+        /// `true` when `#pragma unroll` was applied to this loop.
+        unroll_hint: bool,
     },
 
     /// `do body while (cond);`.
     DoWhile {
         body: Box<Stmt>,
         cond: Expr,
+        /// `true` when `#pragma unroll` was applied to this loop.
+        unroll_hint: bool,
     },
 
     /// `for (init; cond; step) body`.
@@ -273,6 +277,8 @@ pub enum StmtKind {
         cond: Option<Expr>,
         step: Option<Expr>,
         body: Box<Stmt>,
+        /// `true` when `#pragma unroll` was applied to this loop.
+        unroll_hint: bool,
     },
 
     /// `return [expr];`.
@@ -528,6 +534,7 @@ mod tests {
                 cond: Some(cond),
                 step: Some(step),
                 body: Box::new(body),
+                unroll_hint: false,
             },
             loc(30),
         );
