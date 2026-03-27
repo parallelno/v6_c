@@ -16,8 +16,10 @@ _start:
 ; --- code section ---
 ; function mix
 mix:
+; C_LINE 5
 	SHLD _l_mix_x
 	SHLD _l_mix_y
+; C_LINE 9
 	LHLD _l_mix_x
 	LHLD _l_mix_y
 	SHLD __spill_0
@@ -26,19 +28,25 @@ mix:
 	DAD D
 	SHLD __spill_1
 	SHLD _l_mix_s
+; C_LINE 10
 	LXI H,0
 	SHLD _l_mix_i
+; C_LINE 11
 	LXI H,16
+; C_LINE 12
 	LXI H,_g_g_arr
 	SHLD __spill_2
 	LXI H,255
 	SHLD __spill_3
+; C_LINE 13
 	LXI H,1
 	SHLD __spill_4
 	LXI H,0
 	SHLD __spill_5
+; C_LINE 18
 	LXI H,1
 	SHLD __spill_6
+; C_LINE 11
 L0:
 	LHLD _l_mix_i
 	SHLD __spill_7
@@ -60,6 +68,7 @@ __cg_1:
 	MOV A,H
 	ORA L
 	JZ L1
+; C_LINE 12
 	LHLD _l_mix_s
 	LHLD _l_mix_i
 	SHLD __spill_9
@@ -95,6 +104,8 @@ __cg_1:
 	DAD D
 	SHLD __spill_16
 	SHLD _l_mix_s
+; C_LINE 13
+	LHLD _l_mix_s
 	LHLD __spill_5
 	XCHG
 	MOV A,L
@@ -121,6 +132,7 @@ __cg_3:
 	MOV A,H
 	ORA L
 	JZ L2
+; C_LINE 14
 	LHLD _l_mix_s
 	LHLD _g_g_a
 	SHLD __spill_19
@@ -131,6 +143,7 @@ __cg_3:
 	SHLD _l_mix_s
 	JMP L3
 L2:
+; C_LINE 16
 	LHLD _l_mix_s
 	LHLD _g_g_b
 	SHLD __spill_21
@@ -147,6 +160,7 @@ L2:
 	SHLD __spill_22
 	SHLD _l_mix_s
 L3:
+; C_LINE 18
 	LHLD _l_mix_i
 	LHLD __spill_7
 	XCHG
@@ -155,25 +169,34 @@ L3:
 	SHLD _l_mix_i
 	JMP L0
 L1:
+; C_LINE 20
 	LHLD _l_mix_s
 	RET
 ; function main
 main:
+; C_LINE 23
 	SHLD _l_main_argc
 	SHLD _l_main_argv
+; C_LINE 27
 	LHLD _l_main_argc
+; C_LINE 28
 	LHLD _l_main_argv
+; C_LINE 30
 	LXI H,0
 	SHLD _l_main_i
+; C_LINE 31
 	LXI H,16
+; C_LINE 32
 	LXI H,_g_g_arr
 	SHLD __spill_24
 	LXI H,3
 	SHLD __spill_25
 	LXI H,1
 	SHLD __spill_26
+; C_LINE 33
 	LXI H,1
 	SHLD __spill_27
+; C_LINE 31
 L4:
 	LHLD _l_main_i
 	SHLD __spill_28
@@ -195,6 +218,7 @@ __cg_5:
 	MOV A,H
 	ORA L
 	JZ L5
+; C_LINE 32
 	LHLD _l_main_i
 	LXI D,2
 	CALL __mul16
@@ -218,6 +242,7 @@ __cg_5:
 	MOV M,E
 	INX H
 	MOV M,D
+; C_LINE 33
 	LHLD _l_main_i
 	LHLD __spill_28
 	XCHG
@@ -226,6 +251,7 @@ __cg_5:
 	SHLD _l_main_i
 	JMP L4
 L5:
+; C_LINE 36
 	LXI H,11
 	LXI H,7
 	SHLD __spill_36
@@ -234,6 +260,8 @@ L5:
 	LHLD __spill_36
 	CALL mix
 	SHLD _l_main_z
+; C_LINE 37
+	LHLD _l_main_z
 	RET
 ; --- data section ---
 _g_g_a:

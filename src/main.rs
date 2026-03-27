@@ -39,6 +39,8 @@ struct CompilerOpts {
     inputs: Vec<String>,
     /// Output assembly file.
     output: String,
+    /// Optional listing (`.lst`) output file.
+    lst_output: Option<String>,
     /// Additional include search paths (`-I`).
     include_paths: Vec<String>,
 }
@@ -48,10 +50,12 @@ struct CompilerOpts {
 // ---------------------------------------------------------------------------
 
 fn print_usage() {
-    eprintln!("Usage: v6c <input.c> [input2.c ...] [-o <output.asm>] [-I <path>]");
+    eprintln!("Usage: v6c <input.c> [input2.c ...] [-o <output.asm>] [--lst <output.lst>] [--no-lst] [-I <path>]");
     eprintln!();
     eprintln!("Options:");
     eprintln!("  -o <file>   Output file path (default: first input with .asm extension)");
+    eprintln!("  --lst <file>  Listing output path (default: output path with .lst extension)");
+    eprintln!("  --no-lst      Disable listing output generation");
     eprintln!("  -I <path>   Add include search path");
     eprintln!("  -h, --help  Show this help message");
 }
@@ -59,6 +63,8 @@ fn print_usage() {
 fn parse_args(args: &[String]) -> Result<CompilerOpts, String> {
     let mut inputs: Vec<String> = Vec::new();
     let mut output: Option<String> = None;
+    let mut lst_output: Option<String> = None;
+    let mut emit_lst = true;
     let mut include_paths: Vec<String> = Vec::new();
 
     let mut i = 1; // skip program name
@@ -81,6 +87,16 @@ fn parse_args(args: &[String]) -> Result<CompilerOpts, String> {
                     return Err("-I requires an argument".into());
                 }
                 include_paths.push(args[i].clone());
+            }
+            "--lst" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--lst requires an argument".into());
+                }
+                lst_output = Some(args[i].clone());
+            }
+            "--no-lst" => {
+                emit_lst = false;
             }
             arg if arg.starts_with("-I") => {
                 // Support -Ipath (no space)
@@ -109,9 +125,22 @@ fn parse_args(args: &[String]) -> Result<CompilerOpts, String> {
         }
     });
 
+    let final_lst_output = if emit_lst {
+        Some(lst_output.unwrap_or_else(|| {
+            if let Some(stem) = output_path.strip_suffix(".asm") {
+                format!("{}.lst", stem)
+            } else {
+                format!("{}.lst", output_path)
+            }
+        }))
+    } else {
+        None
+    };
+
     Ok(CompilerOpts {
         inputs,
         output: output_path,
+        lst_output: final_lst_output,
         include_paths,
     })
 }
@@ -154,20 +183,28 @@ fn find_system_include_dir() -> Option<String> {
 }
 
 fn compile(opts: &CompilerOpts) -> Result<(), String> {
-    if opts.inputs.len() == 1 {
+    let mut source_lines_for_lst: Option<Vec<String>> = None;
+
+    let optimized = if opts.inputs.len() == 1 {
         // Single-file mode (most common)
         let source = std::fs::read_to_string(&opts.inputs[0])
             .map_err(|e| format!("{}: {}", opts.inputs[0], e))?;
-        let optimized = compile_source(&source, &opts.inputs[0], &opts.include_paths)?;
-        emit::emit_asm(&optimized, &opts.output)
-            .map_err(|e| format!("{}: {}", opts.output, e))?;
+        source_lines_for_lst = Some(source.lines().map(|l| l.to_string()).collect());
+        compile_source(&source, &opts.inputs[0], &opts.include_paths)?
     } else {
         // Multi-file mode: parse each file into IR separately, merge, then
         // run optimization and codegen on the merged program.
-        let optimized = compile_multi(&opts.inputs, &opts.include_paths)?;
-        emit::emit_asm(&optimized, &opts.output)
-            .map_err(|e| format!("{}: {}", opts.output, e))?;
+        compile_multi(&opts.inputs, &opts.include_paths)?
+    };
+
+    emit::emit_asm(&optimized, &opts.output)
+        .map_err(|e| format!("{}: {}", opts.output, e))?;
+
+    if let Some(lst_path) = &opts.lst_output {
+        emit::emit_lst(&optimized, lst_path, source_lines_for_lst.as_deref())
+            .map_err(|e| format!("{}: {}", lst_path, e))?;
     }
+
     Ok(())
 }
 

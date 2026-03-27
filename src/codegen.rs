@@ -42,6 +42,8 @@ pub struct CodeGenerator {
     last_use: HashMap<u32, usize>,
     /// Current instruction index within the function being generated.
     instr_index: usize,
+    /// Last emitted source C line marker for current function.
+    current_c_line: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -61,6 +63,7 @@ pub fn generate(program: &IrProgram, analysis: &CallGraphAnalysis) -> Vec<String
         is_leaf_func: false,
         last_use: HashMap::new(),
         instr_index: 0,
+        current_c_line: 0,
     };
 
     cg.emit_comment("--- code section ---");
@@ -303,6 +306,7 @@ impl CodeGenerator {
         self.is_leaf_func = self.analysis.is_leaf(&func.name);
         self.regalloc.reset();
         self.last_use = compute_last_use(&func.body);
+        self.current_c_line = 0;
         self.emit_comment(&format!("function {}", func.name));
         self.emit_label(&func.name);
 
@@ -316,6 +320,10 @@ impl CodeGenerator {
 
         for (idx, instr) in func.body.iter().enumerate() {
             self.instr_index = idx;
+            if instr.line != 0 && instr.line != self.current_c_line {
+                self.emit_comment(&format!("C_LINE {}", instr.line));
+                self.current_c_line = instr.line;
+            }
             self.gen_op(&instr.op);
             // Free registers holding vregs that are dead after this instruction.
             self.free_dead_vregs(&instr.op);

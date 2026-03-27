@@ -1,0 +1,196 @@
+001   0000                 device zxspectrum48 ; There is no ZX Spectrum, it is needed for the sjasmplus assembler.
+002   0000                 org 100h
+003   0100             __begin: 
+004   0100             __entry: 
+005   0100             __init: 
+006   0100             ; 26 void __init() {
+007   0100             ; 27     /* Zeroing uninitialized variables */
+008   0100             ; 28     asm {
+009   0100             
+010   0100 11 8E 01            ld   de, __bss
+011   0103 AF                  xor  a
+012   0104             __init_loop: 
+013   0104 12                  ld   (de), a
+014   0105 13                  inc  de
+015   0106 21 6B FE            ld   hl, 10000h - __end
+016   0109 19                  add  hl, de
+017   010A D2 04 01            jp   nc, __init_loop
+018   010D             
+019   010D             ; 29         ld   de, __bss
+020   010D             ; 30         xor  a
+021   010D             ; 31 __init_loop:
+022   010D             ; 32         ld   (de), a
+023   010D             ; 33         inc  de
+024   010D             ; 34         ld   hl, 10000h - __end
+025   010D             ; 35         add  hl, de
+026   010D             ; 36         jp   nc, __init_loop
+027   010D             ; 37     }
+028   010D             ; 38 
+029   010D             ; 39     /* Init stack */
+030   010D             ; 40 #if __has_include(<c8080/initstack.inc>) && !defined(ARCH_CPM_CCP) && !defined(ARCH_CPM_BDOS) && !defined(ARCH_CPM_BIOS)
+031   010D             ; 41 #include <c8080/initstack.inc>
+032   010D             ; 42 #endif
+033   010D             ; 43 
+034   010D             ; 44 #ifdef ARCH_CPM_CCP /* CCP remains in memory */
+035   010D             ; 45     // clang-format off
+036   010D             ; 46     asm {
+037   010D             ; 47         pop  de
+038   010D             ; 48         ld   a, (7)
+039   010D             ; 49         sub  8
+040   010D             ; 50         ld   h, a
+041   010D             ; 51         ld   l, 0
+042   010D             ; 52         ld   sp, hl
+043   010D             ; 53         push de
+044   010D             ; 54     }
+045   010D             ; 55     // clang-format on
+046   010D             ; 56 #endif
+047   010D             ; 57 
+048   010D             ; 58 #ifdef ARCH_CPM_BDOS /* BDOS remains in memory */
+049   010D             ; 59     asm {
+050   010D             ; 60         ld   a, (7)
+051   010D             ; 61         ld   h, a
+052   010D             ; 62         ld   l, 0
+053   010D             ; 63         ld   sp, hl
+054   010D             ; 64         ld   hl, 0
+055   010D             ; 65         push hl
+056   010D             ; 66     }
+057   010D             ; 67 #endif
+058   010D             ; 68 
+059   010D             ; 69 #ifdef ARCH_CPM_BIOS /* BIOS remains in memory */
+060   010D             ; 70 #error TODO
+061   010D             ; 71 #endif
+062   010D             ; 72 
+063   010D             ; 73     main(0, NULL);
+064   010D 21 00 00    	ld hl, 0
+065   0110 22 91 01    	ld (__a_1_main), hl
+066   0113             main: 
+067   0113             ; 1 int main(int argc, char** argv) {
+068   0113 22 93 01    	ld (__a_2_main), hl
+069   0116             ; 2     char i;
+070   0116             ; 3     int z;
+071   0116             ; 4 
+072   0116             ; 5     argc = argc;
+073   0116 2A 91 01    	ld hl, (__a_1_main)
+074   0119 22 91 01    	ld (__a_1_main), hl
+075   011C             ; 6     argv = argv;
+076   011C 2A 93 01    	ld hl, (__a_2_main)
+077   011F 22 93 01    	ld (__a_2_main), hl
+078   0122             ; 7 
+079   0122             ; 8     i = 0;
+080   0122 AF          	xor a
+081   0123 32 8E 01    	ld (main_i), a
+082   0126             ; 9     while (i < 16) {
+083   0126             l_0: 
+084   0126 FE 10       	cp 16
+085   0128 D2 42 01    	jp nc, l_1
+086   012B             ; 10         z = i * 3 + 1;
+087   012B CD 46 01    	call __o_i8_to_i16
+088   012E 11 03 00    	ld de, 3
+089   0131 CD 4B 01    	call __o_mul_i16
+090   0134 23          	inc hl
+091   0135 22 8F 01    	ld (main_z), hl
+092   0138             ; 11         i = i + 1;
+093   0138 3A 8E 01    	ld a, (main_i)
+094   013B 3C          	inc a
+095   013C 32 8E 01    	ld (main_i), a
+096   013F C3 26 01    	jp l_0
+097   0142             l_1: 
+098   0142             ; 12     }
+099   0142             ; 13 
+100   0142             ; 14     return z;
+101   0142 2A 8F 01    	ld hl, (main_z)
+102   0145 C9          	ret
+103   0146             __o_i8_to_i16: 
+104   0146             ; 222 void __o_i8_to_i16() {
+105   0146             ; 223     asm {
+106   0146             
+107   0146 6F                  ld   l, a
+108   0147 17                  rla
+109   0148 9F                  sbc  a
+110   0149 67                  ld   h, a
+111   014A             
+112   014A C9          	ret
+113   014B             __o_mul_i16: 
+114   014B             ; 349 void __o_mul_i16() {
+115   014B             ; 350     (void)__o_minus_16;
+116   014B             ; 351     (void)__o_mul_u16;
+117   014B             ; 352     asm {
+118   014B             
+119   014B 7C                  ld   a, h
+120   014C 87                  add  a
+121   014D D2 60 01            jp   nc, __o_mul_i16_1  ; hl - positive
+122   0150             
+123   0150 CD 71 01            call __o_minus_16
+124   0153             
+125   0153 7A                  ld   a, d
+126   0154 87                  add  a
+127   0155 D2 6A 01            jp   nc, __o_mul_i16_2  ; hl - negative, de - positive
+128   0158             
+129   0158 EB                  ex   hl, de
+130   0159 CD 71 01            call __o_minus_16
+131   015C EB                  ex   hl, de
+132   015D             
+133   015D C3 79 01            jp   __o_mul_u16 ; hl & de - negative
+134   0160             
+135   0160             __o_mul_i16_1: 
+136   0160 7A                  ld   a, d
+137   0161 87                  add  a
+138   0162 D2 79 01            jp   nc, __o_mul_u16  ; hl & de - positive
+139   0165             
+140   0165 EB                  ex   hl, de
+141   0166 CD 71 01            call __o_minus_16
+142   0169 EB                  ex   hl, de
+143   016A             
+144   016A             __o_mul_i16_2: 
+145   016A CD 79 01            call __o_mul_u16
+146   016D C3 71 01            jp   __o_minus_16
+147   0170             
+148   0170 C9          	ret
+149   0171             __o_minus_16: 
+150   0171             ; 235 void __o_minus_16() {
+151   0171             ; 236     asm {
+152   0171             
+153   0171 AF                  xor  a
+154   0172 95                  sub  l
+155   0173 6F                  ld   l, a
+156   0174 3E 00               ld   a, 0
+157   0176 9C                  sbc  h
+158   0177 67                  ld  h, a
+159   0178             
+160   0178 C9          	ret
+161   0179             __o_mul_u16: 
+162   0179             ; 326 void __o_mul_u16() {
+163   0179             ; 327     asm {
+164   0179             
+165   0179 44                  ld   b, h
+166   017A 4D                  ld   c, l
+167   017B 21 00 00            ld   hl, 0
+168   017E 3E 11               ld   a, 17
+169   0180             __o_mul_u16_l1: 
+170   0180 3D                  dec  a
+171   0181 C8                  ret  z
+172   0182 29                  add  hl, hl
+173   0183 EB                  ex   hl, de
+174   0184 29                  add  hl, hl
+175   0185 EB                  ex   hl, de
+176   0186 D2 80 01            jp   nc, __o_mul_u16_l1
+177   0189 09                  add  hl, bc
+178   018A C3 80 01            jp   __o_mul_u16_l1
+179   018D             
+180   018D C9          	ret
+181   018E             __bss: 
+182   018E             __static_stack: 
+183   018E 00          	ds 7
+184   0195             __end: 
+185   0195             __s___init equ __static_stack + 7
+186   0195             __s_main equ __static_stack + 0
+187   0195             __a_1_main equ __s_main + 3
+188   0195             __a_2_main equ __s_main + 5
+189   0195             main_i equ __s_main + 0
+190   0195             main_z equ __s_main + 1
+191   0195             __s___o_i8_to_i16 equ __static_stack + 0
+192   0195             __s___o_mul_i16 equ __static_stack + 0
+193   0195             __s___o_minus_16 equ __static_stack + 0
+194   0195             __s___o_mul_u16 equ __static_stack + 0
+195   0195                 savebin "tests/compare/s1_c8080.bin", __begin, __bss - __begin
+196   0195             
