@@ -70,6 +70,10 @@ pub struct CallGraphAnalysis {
     /// First address past all allocations — useful for placing the heap or
     /// stack pointer.
     pub next_addr: u16,
+
+    /// Leaf functions (functions that make no calls).
+    /// These can skip register save/restore.
+    pub leaf_functions: HashSet<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -92,13 +96,20 @@ pub fn analyze(program: &IrProgram, base_addr: Option<u16>) -> CallGraphAnalysis
     // 3. Stack-mode = recursive functions.
     let stack_mode: HashSet<String> = recursive.clone();
 
+    // 4. Identify leaf functions (those that call nothing).
+    let leaf_functions: HashSet<String> = callees
+        .iter()
+        .filter(|(_, targets)| targets.is_empty())
+        .map(|(name, _)| name.clone())
+        .collect();
+
     let graph = CallGraph {
         callees,
         recursive,
         stack_mode,
     };
 
-    // 4. Allocate addresses.
+    // 5. Allocate addresses.
     let (global_allocs, addr_after_globals) = allocate_globals(program, base);
     let (local_allocs, next_addr) =
         allocate_locals(program, &graph, addr_after_globals);
@@ -108,6 +119,7 @@ pub fn analyze(program: &IrProgram, base_addr: Option<u16>) -> CallGraphAnalysis
         local_allocs,
         global_allocs,
         next_addr,
+        leaf_functions,
     }
 }
 
@@ -325,6 +337,11 @@ impl CallGraphAnalysis {
     pub fn global_addr(&self, var: &str) -> Option<u16> {
         let label = format!("_g_{}", var);
         self.global_allocs.get(&label).copied()
+    }
+
+    /// Returns `true` if the function is a leaf (makes no calls).
+    pub fn is_leaf(&self, func_name: &str) -> bool {
+        self.leaf_functions.contains(func_name)
     }
 }
 

@@ -132,6 +132,9 @@ pub enum ExprKind {
     /// Integer literal (e.g. `42`, `0xFF`).
     IntLiteral(i64),
 
+    /// Floating-point literal (e.g. `3.14`, `1.0e-2`).
+    FloatLiteral(f64),
+
     /// Character literal (e.g. `'a'`).
     CharLiteral(u8),
 
@@ -360,6 +363,7 @@ pub enum TopLevelKind {
         params: Vec<Param>,
         storage: Option<StorageClass>,
         body: Stmt,
+        is_variadic: bool,
     },
 
     /// Function prototype / forward declaration (no body).
@@ -372,6 +376,7 @@ pub enum TopLevelKind {
         return_type: CType,
         params: Vec<Param>,
         storage: Option<StorageClass>,
+        is_variadic: bool,
     },
 
     /// Global variable declaration.
@@ -552,6 +557,7 @@ mod tests {
                     Param { name: Some("b".into()), ty: CType::int_signed() },
                 ],
                 storage: None,
+                is_variadic: false,
                 body,
             },
             loc(1),

@@ -22,6 +22,7 @@ const MEMCPY_ASM: &str = include_str!("../runtime/memcpy.asm");
 const STRING_ASM: &str = include_str!("../runtime/string.asm");
 const STDIO_ASM: &str = include_str!("../runtime/stdio.asm");
 const STDLIB_ASM: &str = include_str!("../runtime/stdlib.asm");
+const FLOAT_ASM: &str = include_str!("../runtime/float.asm");
 
 // ---------------------------------------------------------------------------
 // Runtime module descriptors
@@ -106,6 +107,15 @@ static MODULES: &[RuntimeModule] = &[
         symbols: &["abs", "atoi", "rand", "srand", "malloc", "free"],
         asm: STDLIB_ASM,
         deps: &["__mul16"], // rand depends on __mul16
+    },
+    RuntimeModule {
+        symbols: &[
+            "__fadd", "__fsub", "__fmul", "__fdiv",
+            "__feq", "__fne", "__flt", "__fle", "__fgt", "__fge",
+            "__itof", "__ftoi",
+        ],
+        asm: FLOAT_ASM,
+        deps: &[],
     },
 ];
 

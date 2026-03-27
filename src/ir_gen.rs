@@ -195,6 +195,30 @@ impl IrGenerator {
         if from == to {
             return reg;
         }
+
+        // int → float conversion via runtime call.
+        if from.is_integer() && to.is_float() {
+            let dst = self.vreg_alloc.alloc(Width::W32);
+            self.emit(IrOp::Call {
+                func_name: "__itof".to_string(),
+                args: vec![reg],
+                dst: Some(dst),
+            });
+            return dst;
+        }
+
+        // float → int conversion via runtime call.
+        if from.is_float() && to.is_integer() {
+            let to_w = Width::from_ctype(to).unwrap_or(Width::W16);
+            let dst = self.vreg_alloc.alloc(to_w);
+            self.emit(IrOp::Call {
+                func_name: "__ftoi".to_string(),
+                args: vec![reg],
+                dst: Some(dst),
+            });
+            return dst;
+        }
+
         let from_w = Width::from_ctype(from);
         let to_w = Width::from_ctype(to);
         if from_w == to_w {
@@ -210,6 +234,7 @@ impl IrGenerator {
     fn expr_type(&self, expr: &Expr) -> CType {
         match &expr.kind {
             ExprKind::IntLiteral(_) => CType::int_signed(),
+            ExprKind::FloatLiteral(_) => CType::Float,
             ExprKind::CharLiteral(_) => CType::char_signed(),
             ExprKind::StringLiteral(_) => CType::ptr(CType::char_signed()),
             ExprKind::Ident(name) => {
@@ -324,13 +349,15 @@ impl IrGenerator {
                 params,
                 storage: _,
                 body,
-            } => self.gen_func_def(name, return_type, params, body, decl.loc),
+                is_variadic,
+            } => self.gen_func_def(name, return_type, params, body, *is_variadic, decl.loc),
 
             TopLevelKind::FuncDecl {
                 name,
                 return_type,
                 params: _,
                 storage: _,
+                is_variadic: _,
             } => {
                 self.func_return_types
                     .insert(name.clone(), return_type.clone());
@@ -438,6 +465,7 @@ impl IrGenerator {
         return_type: &CType,
         params: &[Param],
         body_stmt: &Stmt,
+        is_variadic: bool,
         loc: SourceLocation,
     ) {
         // Reset per-function state.
@@ -500,6 +528,7 @@ impl IrGenerator {
             body: std::mem::take(&mut self.body),
             return_type: return_type.clone(),
             is_stack_mode: false,
+            is_variadic,
         });
     }
 
@@ -840,6 +869,14 @@ impl IrGenerator {
                 (dst, CType::int_signed())
             }
 
+            ExprKind::FloatLiteral(val) => {
+                // Store IEEE 754 bits as a 32-bit integer in a W32 vreg.
+                let bits = (*val as f32).to_bits() as i64;
+                let dst = self.vreg_alloc.alloc(Width::W32);
+                self.emit(IrOp::load_imm(dst, bits));
+                (dst, CType::Float)
+            }
+
             ExprKind::CharLiteral(val) => {
                 let dst = self.vreg_alloc.alloc(Width::W8);
                 self.emit(IrOp::load_imm(dst, *val as i64));
@@ -1001,16 +1038,17 @@ impl IrGenerator {
         }
 
         // Usual arithmetic conversions.
-        let result_ty = if lhs_ty.is_integer() && rhs_ty.is_integer() {
-            common_type(&lhs_ty, &rhs_ty).unwrap_or(CType::int_signed())
-        } else {
-            CType::int_signed()
-        };
+        let result_ty = common_type(&lhs_ty, &rhs_ty).unwrap_or(CType::int_signed());
         let width = Width::from_ctype(&result_ty).unwrap_or(Width::W16);
         let signed = result_ty.is_signed();
 
         let l = self.maybe_cast(lhs_reg, &lhs_ty, &result_ty);
         let r = self.maybe_cast(rhs_reg, &rhs_ty, &result_ty);
+
+        // Float operations → emit calls to soft-float runtime library.
+        if result_ty.is_float() {
+            return self.gen_float_binop(op, l, r, &result_ty);
+        }
 
         match op {
             // --- arithmetic ---
@@ -1248,7 +1286,8 @@ impl IrGenerator {
             // Simple assignment.
             let lv = self.gen_lvalue(target);
             let ty = self.lvalue_type(&lv);
-            let (val, _) = self.gen_expr(value);
+            let (val, val_ty) = self.gen_expr(value);
+            let val = self.maybe_cast(val, &val_ty, &ty);
             self.store_lvalue(&lv, val);
             return (val, ty);
         }
@@ -1456,6 +1495,48 @@ impl IrGenerator {
             self.emit(IrOp::ptr_add(dst, ptr_reg, neg, elem_size));
             (dst, ptr_ty.clone())
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Float binary operations (via software library calls)
+    // -----------------------------------------------------------------------
+
+    fn gen_float_binop(
+        &mut self,
+        op: BinOp,
+        lhs: VReg,
+        rhs: VReg,
+        _result_ty: &CType,
+    ) -> (VReg, CType) {
+        let func_name = match op {
+            BinOp::Add => "__fadd",
+            BinOp::Sub => "__fsub",
+            BinOp::Mul => "__fmul",
+            BinOp::Div => "__fdiv",
+            BinOp::Eq => "__feq",
+            BinOp::Ne => "__fne",
+            BinOp::Lt => "__flt",
+            BinOp::Le => "__fle",
+            BinOp::Gt => "__fgt",
+            BinOp::Ge => "__fge",
+            _ => {
+                self.error(&format!("unsupported float operation: {:?}", op));
+                "__fadd"
+            }
+        };
+
+        // Comparison operations return an int (0 or 1).
+        let is_cmp = matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge);
+        let ret_width = if is_cmp { Width::W16 } else { Width::W32 };
+        let ret_type = if is_cmp { CType::int_signed() } else { CType::Float };
+
+        let dst = self.vreg_alloc.alloc(ret_width);
+        self.emit(IrOp::Call {
+            func_name: func_name.to_string(),
+            args: vec![lhs, rhs],
+            dst: Some(dst),
+        });
+        (dst, ret_type)
     }
 
     // -----------------------------------------------------------------------
@@ -1716,6 +1797,7 @@ mod tests {
                 return_type: ret,
                 params,
                 storage: None,
+                is_variadic: false,
                 body,
             },
             loc(1),
@@ -2104,6 +2186,7 @@ mod tests {
                         Param { name: Some("b".into()), ty: CType::int_signed() },
                     ],
                     storage: None,
+                    is_variadic: false,
                 },
                 loc(1),
             ),
@@ -2113,6 +2196,7 @@ mod tests {
                     return_type: CType::int_signed(),
                     params: vec![],
                     storage: None,
+                    is_variadic: false,
                     body: compound(vec![return_stmt(Some(call(
                         "add",
                         vec![int_lit(1), int_lit(2)],
@@ -2158,6 +2242,7 @@ mod tests {
                     return_type: CType::Void,
                     params: vec![],
                     storage: None,
+                    is_variadic: false,
                     body: compound(vec![expr_stmt(assign(
                         AssignOp::Assign,
                         ident("x"),
@@ -2197,6 +2282,7 @@ mod tests {
                     return_type: CType::Void,
                     params: vec![],
                     storage: None,
+                    is_variadic: false,
                     body: compound(vec![expr_stmt(assign(
                         AssignOp::AddAssign,
                         ident("x"),
@@ -2236,6 +2322,7 @@ mod tests {
                     return_type: CType::int_signed(),
                     params: vec![],
                     storage: None,
+                    is_variadic: false,
                     body: compound(vec![return_stmt(Some(unaryop(
                         UnaryOp::PreInc,
                         ident("x"),
@@ -2273,6 +2360,7 @@ mod tests {
                     return_type: CType::int_signed(),
                     params: vec![],
                     storage: None,
+                    is_variadic: false,
                     body: compound(vec![return_stmt(Some(unaryop(
                         UnaryOp::PostInc,
                         ident("x"),
@@ -2391,6 +2479,7 @@ mod tests {
                     return_type: CType::ptr(CType::int_signed()),
                     params: vec![],
                     storage: None,
+                    is_variadic: false,
                     body: compound(vec![return_stmt(Some(unaryop(
                         UnaryOp::AddrOf,
                         ident("x"),
@@ -2448,6 +2537,7 @@ mod tests {
                     return_type: CType::int_signed(),
                     params: vec![],
                     storage: None,
+                    is_variadic: false,
                     body: compound(vec![return_stmt(Some(Expr::new(
                         ExprKind::Subscript {
                             array: Box::new(ident("arr")),
@@ -2699,6 +2789,7 @@ mod tests {
                     return_type: CType::long_signed(),
                     params: vec![],
                     storage: None,
+                    is_variadic: false,
                 },
                 loc(1),
             ),
@@ -2708,6 +2799,7 @@ mod tests {
                     return_type: CType::long_signed(),
                     params: vec![],
                     storage: None,
+                    is_variadic: false,
                     body: compound(vec![return_stmt(Some(call("ext", vec![])))]),
                 },
                 loc(2),
@@ -2784,6 +2876,7 @@ mod tests {
                     return_type: CType::Void,
                     params: vec![],
                     storage: None,
+                    is_variadic: false,
                     body: compound(vec![expr_stmt(assign(
                         AssignOp::Assign,
                         Expr::new(
@@ -2819,6 +2912,7 @@ mod tests {
                     return_type: CType::Void,
                     params: vec![],
                     storage: None,
+                    is_variadic: false,
                 },
                 loc(1),
             ),
@@ -2828,6 +2922,7 @@ mod tests {
                     return_type: CType::Void,
                     params: vec![],
                     storage: None,
+                    is_variadic: false,
                     body: compound(vec![expr_stmt(call("noop", vec![]))]),
                 },
                 loc(2),

@@ -292,13 +292,13 @@ Each routine is hand‑optimized for the 8080 instruction set. The multiply/divi
 
 **Goal:** Approach the performance of hand‑written assembly.
 
-- [ ] **5.1 Global register allocation** — Whole‑function (or whole‑program) register assignment using linear scan or priority‑based heuristics.
-- [ ] **5.2 Loop optimizations** — Loop‑invariant code motion, induction‑variable optimization, loop unrolling for small loops.
-- [ ] **5.3 Inline expansion** — Automatic inlining of small functions (configurable threshold).
-- [ ] **5.4 Leaf‑function optimization** — Skip any frame setup for functions that make no calls.
-- [ ] **5.5 Jump threading & branch optimization** — Eliminate chains of unconditional jumps; invert branch conditions to remove extra jumps.
-- [ ] **5.6 Floating‑point support** — Software IEEE‑754 (32‑bit) library in assembly; `float` type in the compiler.
-- [ ] **5.7 Variadic functions** — `stdarg.h` support via stack mode.
+- [x] **5.1 Global register allocation** — Whole‑function (or whole‑program) register assignment using linear scan or priority‑based heuristics.
+- [x] **5.2 Loop optimizations** — Loop‑invariant code motion, induction‑variable optimization, loop unrolling for small loops.
+- [x] **5.3 Inline expansion** — Automatic inlining of small functions (configurable threshold).
+- [x] **5.4 Leaf‑function optimization** — Skip any frame setup for functions that make no calls.
+- [x] **5.5 Jump threading & branch optimization** — Eliminate chains of unconditional jumps; invert branch conditions to remove extra jumps.
+- [x] **5.6 Floating‑point support** — Software IEEE‑754 (32‑bit) library in assembly; `float` type in the compiler.
+- [x] **5.7 Variadic functions** — `stdarg.h` support via stack mode.
 
 ---
 

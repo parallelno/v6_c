@@ -334,13 +334,27 @@ mod tests {
 
     #[test]
     fn pipeline_function_call() {
+        // Use a function large enough to not be inlined.
         let src = r#"
-            int add(int a, int b) { return a + b; }
-            void main(void) { int r; r = add(3, 4); }
+            int compute(int a, int b) {
+                int x;
+                int y;
+                int z;
+                x = a + b;
+                y = a - b;
+                z = x + y;
+                if (z > 0) {
+                    z = z + x;
+                } else {
+                    z = z - y;
+                }
+                return z;
+            }
+            void main(void) { int r; r = compute(3, 4); }
         "#;
         let out = compile_source(src, "test.c", &[]).expect("compilation failed");
-        assert!(has_line(&out, "add:"), "must have add function");
-        assert!(has_line(&out, "CALL add"), "must call add");
+        assert!(has_line(&out, "compute:"), "must have compute function");
+        assert!(has_line(&out, "CALL compute"), "must call compute");
     }
 
     #[test]
@@ -588,14 +602,28 @@ mod tests {
     #[test]
     fn opt_peephole_tail_call() {
         // Function ending with a call followed by return should become JMP.
+        // Use a function too large to inline so the CALL remains.
         let src = r#"
-            void helper(void) { return; }
-            void main(void) { helper(); }
+            int heavy(int a, int b) {
+                int x;
+                int y;
+                int z;
+                x = a + b;
+                y = a - b;
+                z = x + y;
+                if (z > 0) {
+                    z = z + x;
+                } else {
+                    z = z - y;
+                }
+                return z;
+            }
+            int main(void) { return heavy(3, 4); }
         "#;
         let out = compile_source(src, "test.c", &[]).expect("compilation failed");
-        // Should have JMP helper instead of CALL helper / RET.
+        // Should have JMP heavy instead of CALL heavy / RET.
         assert!(
-            has_line(&out, "JMP helper"),
+            has_line(&out, "JMP heavy"),
             "tail call should be optimized to JMP"
         );
     }
@@ -953,5 +981,145 @@ mod tests {
         "#;
         let out = compile_source(src, "test.c", &[]).expect("switch with enum failed");
         assert!(has_line(&out, "main:"));
+    }
+
+    #[test]
+    fn pipeline_float_variable() {
+        let src = r#"
+            float x;
+            void main(void) {
+                x = 3.14f;
+            }
+        "#;
+        let out = compile_source(src, "test.c", &[]).expect("float variable failed");
+        assert!(has_line(&out, "main:"));
+        assert!(has_line(&out, "_g_x"));
+    }
+
+    #[test]
+    fn pipeline_float_add() {
+        let src = r#"
+            float a;
+            float b;
+            float c;
+            void main(void) {
+                a = 1.5f;
+                b = 2.5f;
+                c = a + b;
+            }
+        "#;
+        let out = compile_source(src, "test.c", &[]).expect("float add failed");
+        assert!(has_line(&out, "CALL __fadd"), "float add must call __fadd");
+    }
+
+    #[test]
+    fn pipeline_float_mul() {
+        let src = r#"
+            float a;
+            float b;
+            float c;
+            void main(void) {
+                a = 2.0f;
+                b = 3.0f;
+                c = a * b;
+            }
+        "#;
+        let out = compile_source(src, "test.c", &[]).expect("float mul failed");
+        assert!(has_line(&out, "CALL __fmul"), "float mul must call __fmul");
+    }
+
+    #[test]
+    fn pipeline_float_compare() {
+        let src = r#"
+            float a;
+            float b;
+            int result;
+            void main(void) {
+                a = 1.0f;
+                b = 2.0f;
+                if (a < b) {
+                    result = 1;
+                }
+            }
+        "#;
+        let out = compile_source(src, "test.c", &[]).expect("float compare failed");
+        assert!(has_line(&out, "CALL __flt"), "float compare must call __flt");
+    }
+
+    #[test]
+    fn pipeline_float_int_conversion() {
+        let src = r#"
+            float f;
+            int i;
+            void main(void) {
+                i = 42;
+                f = i;
+                i = f;
+            }
+        "#;
+        let out = compile_source(src, "test.c", &[]).expect("float conversion failed");
+        assert!(has_line(&out, "CALL __itof"), "int to float must call __itof");
+        assert!(has_line(&out, "CALL __ftoi"), "float to int must call __ftoi");
+    }
+
+    #[test]
+    fn pipeline_float_runtime_included() {
+        let src = r#"
+            float a;
+            float b;
+            float c;
+            void main(void) {
+                a = 1.0f;
+                b = 2.0f;
+                c = a + b;
+            }
+        "#;
+        let out = compile_source(src, "test.c", &[]).expect("float runtime failed");
+        // The code should reference __op1/__op2 for float calling convention
+        assert!(has_line(&out, "__op1"), "float ops should use __op1");
+        assert!(has_line(&out, "__op2"), "float ops should use __op2");
+    }
+
+    #[test]
+    fn pipeline_variadic_function() {
+        let src = r#"
+            #include <stdarg.h>
+            int sum(int count, ...) {
+                va_list ap;
+                int total;
+                int i;
+                va_start(ap, count);
+                total = 0;
+                i = 0;
+                while (i < count) {
+                    total = total + va_arg(ap, int);
+                    i = i + 1;
+                }
+                va_end(ap);
+                return total;
+            }
+            int result;
+            void main(void) {
+                result = sum(3, 10, 20, 30);
+            }
+        "#;
+        let out = compile_source(src, "test.c", &[]).expect("variadic function failed");
+        assert!(has_line(&out, "sum:"), "must have sum function label");
+        assert!(has_line(&out, "__va_base_sum"), "variadic func must have va_base");
+        assert!(has_line(&out, "DAD SP"), "must capture SP for va_start");
+    }
+
+    #[test]
+    fn pipeline_variadic_declaration() {
+        let src = r#"
+            int printf(char *fmt, ...);
+            void main(void) {
+                printf("hello %d", 42);
+            }
+        "#;
+        let out = compile_source(src, "test.c", &[]).expect("variadic declaration failed");
+        // printf call may be tail-call optimized to JMP
+        let has_ref = has_line(&out, "CALL printf") || has_line(&out, "JMP printf");
+        assert!(has_ref, "must call or jump to printf");
     }
 }

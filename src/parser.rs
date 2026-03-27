@@ -361,7 +361,7 @@ impl<'t> Parser<'t> {
         name: String,
     ) -> Option<TopLevel> {
         self.expect(&TokenKind::LParen);
-        let params = self.parse_param_list();
+        let (params, is_variadic) = self.parse_param_list();
         self.expect(&TokenKind::RParen);
 
         if self.check(&TokenKind::LBrace) {
@@ -374,6 +374,7 @@ impl<'t> Parser<'t> {
                     params,
                     storage,
                     body,
+                    is_variadic,
                 },
                 loc,
             ))
@@ -386,6 +387,7 @@ impl<'t> Parser<'t> {
                     return_type,
                     params,
                     storage,
+                    is_variadic,
                 },
                 loc,
             ))
@@ -478,6 +480,11 @@ impl<'t> Parser<'t> {
                 }
                 TokenKind::Enum => {
                     base = Some(self.parse_enum_specifier()?);
+                    break;
+                }
+                TokenKind::Float => {
+                    self.advance();
+                    base = Some(CType::Float);
                     break;
                 }
                 TokenKind::Ident => {
@@ -595,22 +602,24 @@ impl<'t> Parser<'t> {
     // Parameters
     // -----------------------------------------------------------------------
 
-    fn parse_param_list(&mut self) -> Vec<Param> {
+    fn parse_param_list(&mut self) -> (Vec<Param>, bool) {
         let mut params = Vec::new();
+        let mut is_variadic = false;
 
         if self.check(&TokenKind::RParen) || self.at_eof() {
-            return params;
+            return (params, false);
         }
 
         // `void` as the sole parameter means no parameters.
         if self.check(&TokenKind::Void) && self.peek_ahead(1).kind == TokenKind::RParen {
             self.advance(); // consume `void`
-            return params;
+            return (params, false);
         }
 
         loop {
             // Accept `...` (variadic) at the end of the parameter list
             if self.eat(&TokenKind::Ellipsis) {
+                is_variadic = true;
                 break;
             }
             if let Some(param) = self.parse_param() {
@@ -622,10 +631,11 @@ impl<'t> Parser<'t> {
             // Check for `...` after the comma
             if self.check(&TokenKind::Ellipsis) {
                 self.advance();
+                is_variadic = true;
                 break;
             }
         }
-        params
+        (params, is_variadic)
     }
 
     fn parse_param(&mut self) -> Option<Param> {
@@ -1709,6 +1719,13 @@ impl<'t> Parser<'t> {
             TokenKind::IntLiteral => {
                 let val = self.parse_int_literal()?;
                 Some(Expr::new(ExprKind::IntLiteral(val), loc))
+            }
+            TokenKind::FloatLiteral => {
+                let tok = self.advance();
+                // Strip optional 'f'/'F' suffix before parsing.
+                let text = tok.value.trim_end_matches(|c| c == 'f' || c == 'F');
+                let val: f64 = text.parse().unwrap_or(0.0);
+                Some(Expr::new(ExprKind::FloatLiteral(val), loc))
             }
             TokenKind::CharLiteral => {
                 let tok = self.advance();

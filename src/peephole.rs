@@ -143,6 +143,9 @@ fn apply_rules(lines: &mut Vec<Line>) -> bool {
     // --- Rule 28/29: Remove redundant LDA/STA pairs ----------------------
     changed |= rule_lda_sta_pairs(lines);
 
+    // --- Rule 32: Jump threading (resolve JMP chains) --------------------
+    changed |= rule_jump_threading(lines);
+
     // --- Rule 31: Remove unreferenced labels (except function labels) ----
     changed |= rule_remove_unreferenced_labels(lines);
 
@@ -539,6 +542,93 @@ fn rule_lda_sta_pairs(lines: &mut Vec<Line>) -> bool {
         }
         i += 1;
     }
+    changed
+}
+
+/// Rule 32 – Jump threading.
+///
+/// When a jump (conditional or unconditional) targets a label that is
+/// immediately followed by an unconditional jump, rewrite the original jump
+/// to target the final destination directly.  This eliminates chains of
+/// jumps:
+///
+/// ```text
+/// JMP L1        JMP L2
+/// ...      →    ...
+/// L1:           L1:
+/// JMP L2        JMP L2
+/// ```
+///
+/// Also handles conditional jumps: `JZ L1` where `L1: JMP L2` → `JZ L2`.
+fn rule_jump_threading(lines: &mut Vec<Line>) -> bool {
+    // Build a map: label → index in `lines`.
+    let mut label_index: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (i, line) in lines.iter().enumerate() {
+        if let Line::Label(name) = line {
+            label_index.insert(name.as_str(), i);
+        }
+    }
+
+    // For each label, find the first non-label, non-comment, non-empty
+    // instruction after it.  If that instruction is `JMP target`, record
+    // the forwarding.
+    let mut forward: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for (name, &idx) in &label_index {
+        let mut j = idx + 1;
+        while j < lines.len() {
+            match &lines[j] {
+                Line::Label(_) | Line::Comment(_) | Line::Empty => { j += 1; }
+                Line::Instruction { opcode, operands } => {
+                    if opcode == "JMP" {
+                        forward.insert((*name).to_string(), operands.trim().to_string());
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    if forward.is_empty() {
+        return false;
+    }
+
+    // Resolve transitive chains: L1 → L2 → L3 becomes L1 → L3.
+    // Limit iteration to prevent infinite loops on cycles.
+    for _ in 0..16 {
+        let mut any = false;
+        let snapshot: Vec<(String, String)> = forward.iter().map(|(k,v)| (k.clone(), v.clone())).collect();
+        for (src, dst) in &snapshot {
+            if let Some(further) = forward.get(dst) {
+                if further != src {
+                    forward.insert(src.clone(), further.clone());
+                    any = true;
+                }
+            }
+        }
+        if !any { break; }
+    }
+
+    // Rewrite jump targets.
+    let mut changed = false;
+    for line in lines.iter_mut() {
+        if let Line::Instruction { opcode, operands } = line {
+            let is_jump = opcode == "JMP"
+                || opcode == "JZ" || opcode == "JNZ"
+                || opcode == "JC" || opcode == "JNC"
+                || opcode == "JM" || opcode == "JP"
+                || opcode == "JPE" || opcode == "JPO";
+            if is_jump {
+                let target = operands.trim();
+                if let Some(final_target) = forward.get(target) {
+                    if final_target != target {
+                        *operands = final_target.clone();
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
     changed
 }
 

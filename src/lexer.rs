@@ -67,6 +67,8 @@ pub enum TokenKind {
     Ident,
     /// Integer constant (decimal, hex, or octal) with optional suffix.
     IntLiteral,
+    /// Floating-point constant (e.g. `3.14`, `1.0e-2`, `2.5f`).
+    FloatLiteral,
     /// Character literal, e.g. `'a'` or `'\n'`.
     CharLiteral,
     /// String literal, e.g. `"hello\n"`.
@@ -176,6 +178,7 @@ impl fmt::Display for TokenKind {
             Self::Global => "__global",
             Self::Ident => "identifier",
             Self::IntLiteral => "integer literal",
+            Self::FloatLiteral => "float literal",
             Self::CharLiteral => "character literal",
             Self::StringLiteral => "string literal",
             Self::Plus => "+",
@@ -480,7 +483,7 @@ impl<'src> Lexer<'src> {
                 Some(b'x' | b'X') => return self.lex_hex(start_line, start_col),
                 Some(b'0'..=b'9') => return self.lex_octal(start_line, start_col),
                 _ => {
-                    // Could be just `0` or `0` followed by suffix.
+                    // Could be just `0` or `0` followed by suffix or `.` for float.
                 }
             }
         }
@@ -490,11 +493,54 @@ impl<'src> Lexer<'src> {
             self.advance();
         }
 
+        // Check for float: decimal point or exponent.
+        if matches!(self.peek(), Some(b'.')) || matches!(self.peek(), Some(b'e' | b'E')) {
+            return self.lex_float_rest(start, start_line, start_col);
+        }
+
         // Optional suffix.
         self.eat_int_suffix();
 
         let text = std::str::from_utf8(&self.src[start..self.pos]).unwrap();
         Ok(Token::new(TokenKind::IntLiteral, text, start_line, start_col))
+    }
+
+    /// Continue lexing a float literal after the integer part has been consumed.
+    /// `start` is the byte offset where the number began.
+    fn lex_float_rest(&mut self, start: usize, start_line: u32, start_col: u32) -> Result<Token, LexError> {
+        // Fractional part.
+        if self.peek() == Some(b'.') {
+            self.advance(); // consume '.'
+            while let Some(b'0'..=b'9') = self.peek() {
+                self.advance();
+            }
+        }
+
+        // Exponent part.
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            self.advance(); // consume 'e'/'E'
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.advance(); // consume sign
+            }
+            if !matches!(self.peek(), Some(b'0'..=b'9')) {
+                return Err(self.error(
+                    "expected digit in float exponent",
+                    self.line,
+                    self.column,
+                ));
+            }
+            while let Some(b'0'..=b'9') = self.peek() {
+                self.advance();
+            }
+        }
+
+        // Optional 'f'/'F' suffix.
+        if matches!(self.peek(), Some(b'f' | b'F')) {
+            self.advance();
+        }
+
+        let text = std::str::from_utf8(&self.src[start..self.pos]).unwrap();
+        Ok(Token::new(TokenKind::FloatLiteral, text, start_line, start_col))
     }
 
     fn lex_hex(&mut self, start_line: u32, start_col: u32) -> Result<Token, LexError> {

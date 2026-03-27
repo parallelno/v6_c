@@ -63,6 +63,10 @@ pub enum CType {
         /// Tag name (empty string for anonymous enums).
         tag: String,
     },
+
+    /// `float` — 32-bit IEEE 754 single precision (4 bytes).
+    /// Implemented via software floating-point library on the 8080.
+    Float,
 }
 
 // ---------------------------------------------------------------------------
@@ -113,6 +117,7 @@ impl CType {
                 Some(max)
             }
             CType::Enum { .. } => Some(2), // enum is int-sized
+            CType::Float => Some(4),
         }
     }
 
@@ -137,9 +142,14 @@ impl CType {
         )
     }
 
-    /// `true` for any integer type (arithmetic on 8080 is integer-only).
+    /// `true` for `float`.
+    pub fn is_float(&self) -> bool {
+        matches!(self, CType::Float)
+    }
+
+    /// `true` for any arithmetic type (integer or floating-point).
     pub fn is_arithmetic(&self) -> bool {
-        self.is_integer()
+        self.is_integer() || self.is_float()
     }
 
     /// `true` for types that can appear in most value contexts.
@@ -279,6 +289,11 @@ impl CType {
             return from_rank <= to_rank;
         }
 
+        // Float ↔ integer conversions
+        if (from.is_float() && to.is_integer()) || (from.is_integer() && to.is_float()) {
+            return true;
+        }
+
         // 4. Pointer ↔ void*
         if let (CType::Pointer(_), CType::Pointer(ref to_inner)) = (&from, &to) {
             if **to_inner == CType::Void {
@@ -310,6 +325,11 @@ impl CType {
 ///
 /// Returns `None` if either operand is not an integer type.
 pub fn common_type(a: &CType, b: &CType) -> Option<CType> {
+    // If either operand is float, the result is float.
+    if a.is_float() || b.is_float() {
+        return Some(CType::Float);
+    }
+
     let a = integer_promote(a)?;
     let b = integer_promote(b)?;
 
@@ -384,6 +404,9 @@ impl CType {
     pub fn void_ptr() -> Self {
         CType::Pointer(Box::new(CType::Void))
     }
+    pub fn float() -> Self {
+        CType::Float
+    }
     pub fn array(element: CType, size: usize) -> Self {
         CType::Array {
             element: Box::new(element),
@@ -448,6 +471,7 @@ impl fmt::Display for CType {
                     write!(f, "enum {}", tag)
                 }
             }
+            CType::Float => write!(f, "float"),
         }
     }
 }

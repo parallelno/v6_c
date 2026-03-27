@@ -8,8 +8,10 @@
 //! tracks physical register assignments, and [`crate::callgraph::CallGraphAnalysis`]
 //! which provides the static memory addresses for non-recursive functions.
 
+use std::collections::HashMap;
+
 use crate::callgraph::CallGraphAnalysis;
-use crate::ir::{IrFunction, IrOp, IrProgram, Label, VReg, Width};
+use crate::ir::{IrFunction, IrInstr, IrOp, IrProgram, Label, VReg, Width};
 use crate::regalloc::{Location, MoveOp, PhysReg, RegAllocator};
 use crate::types::CType;
 
@@ -33,6 +35,13 @@ pub struct CodeGenerator {
     /// Monotonic counter for compiler-generated labels (comparison helpers,
     /// etc.).
     label_counter: u32,
+    /// Whether the current function is a leaf (makes no calls).
+    is_leaf_func: bool,
+    /// For each vreg id, the index of its last use in the current function.
+    /// Used to free registers as soon as their values become dead.
+    last_use: HashMap<u32, usize>,
+    /// Current instruction index within the function being generated.
+    instr_index: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -49,6 +58,9 @@ pub fn generate(program: &IrProgram, analysis: &CallGraphAnalysis) -> Vec<String
         analysis: analysis.clone(),
         current_func: String::new(),
         label_counter: 0,
+        is_leaf_func: false,
+        last_use: HashMap::new(),
+        instr_index: 0,
     };
 
     cg.emit_comment("--- code section ---");
@@ -288,12 +300,25 @@ impl CodeGenerator {
 impl CodeGenerator {
     fn gen_function(&mut self, func: &IrFunction) {
         self.current_func = func.name.clone();
+        self.is_leaf_func = self.analysis.is_leaf(&func.name);
         self.regalloc.reset();
+        self.last_use = compute_last_use(&func.body);
         self.emit_comment(&format!("function {}", func.name));
         self.emit_label(&func.name);
 
-        for instr in &func.body {
+        // For variadic functions, capture the address of the first variadic
+        // arg on the stack. At entry: SP → [ret_addr], stack args start at SP+2.
+        if func.is_variadic {
+            self.emit_inst("LXI H,2");
+            self.emit_inst("DAD SP");
+            self.emit_inst(&format!("SHLD __va_base_{}", func.name));
+        }
+
+        for (idx, instr) in func.body.iter().enumerate() {
+            self.instr_index = idx;
             self.gen_op(&instr.op);
+            // Free registers holding vregs that are dead after this instruction.
+            self.free_dead_vregs(&instr.op);
         }
 
         // Safety net: if the function body doesn't end with a Return, emit one.
@@ -303,6 +328,21 @@ impl CodeGenerator {
             .is_some_and(|i| matches!(i.op, IrOp::Return { .. }))
         {
             self.emit_inst("RET");
+        }
+    }
+
+    /// Free any source-operand vregs whose last use is the current instruction.
+    /// This makes registers available sooner, reducing unnecessary spills.
+    fn free_dead_vregs(&mut self, op: &IrOp) {
+        let src_ids = collect_op_src_ids(op);
+        for vreg_id in src_ids {
+            if let Some(&last_idx) = self.last_use.get(&vreg_id) {
+                if last_idx == self.instr_index {
+                    // This vreg is dead after this instruction — free it.
+                    // We use a dummy width (W16) since `free` only cares about the id.
+                    self.regalloc.free(VReg::new(vreg_id, Width::W16));
+                }
+            }
         }
     }
 }
@@ -1093,7 +1133,33 @@ impl CodeGenerator {
 
     // -- Call -------------------------------------------------------------
 
+    /// Returns true if `func_name` is one of our soft-float runtime helpers
+    /// that use the __op1/__op2 calling convention for 32-bit operands.
+    fn is_float_runtime_call(func_name: &str) -> bool {
+        matches!(
+            func_name,
+            "__fadd" | "__fsub" | "__fmul" | "__fdiv"
+                | "__feq" | "__fne" | "__flt" | "__fle" | "__fgt" | "__fge"
+                | "__itof" | "__ftoi"
+        )
+    }
+
     fn gen_call(&mut self, func_name: &str, args: &[VReg], dst: Option<VReg>) {
+        // Float runtime calls use the __op1/__op2 convention.
+        if Self::is_float_runtime_call(func_name) {
+            self.gen_float_call(func_name, args, dst);
+            return;
+        }
+
+        // __builtin_va_start: return the saved va_base pointer.
+        if func_name == "__builtin_va_start" {
+            self.emit_inst(&format!("LHLD __va_base_{}", self.current_func));
+            if let Some(d) = dst {
+                self.mark(d, PhysReg::HL);
+            }
+            return;
+        }
+
         // Save all live registers before the call.
         let save_ops = self.regalloc.save_all();
         self.emit_moves(&save_ops);
@@ -1149,6 +1215,52 @@ impl CodeGenerator {
             match d.width {
                 Width::W8 => self.mark(d, PhysReg::A),
                 Width::W16 | Width::W32 => self.mark(d, PhysReg::HL),
+            }
+        }
+    }
+
+    /// Generate a call to a soft-float runtime function using __op1/__op2.
+    fn gen_float_call(&mut self, func_name: &str, args: &[VReg], dst: Option<VReg>) {
+        let save_ops = self.regalloc.save_all();
+        self.emit_moves(&save_ops);
+
+        match func_name {
+            // 2-arg: both W32 via __op1/__op2
+            "__fadd" | "__fsub" | "__fmul" | "__fdiv"
+            | "__feq" | "__fne" | "__flt" | "__fle" | "__fgt" | "__fge" => {
+                if args.len() >= 2 {
+                    let lhs_label = self.w32_mem_label(args[0]);
+                    let rhs_label = self.w32_mem_label(args[1]);
+                    self.emit_w32_to_op1(&lhs_label);
+                    self.emit_w32_to_op2(&rhs_label);
+                }
+                self.emit_inst(&format!("CALL {}", func_name));
+            }
+            // __itof: int16 in HL → float in __op1
+            "__itof" => {
+                if !args.is_empty() {
+                    self.ensure_hl(args[0]);
+                }
+                self.emit_inst(&format!("CALL {}", func_name));
+            }
+            // __ftoi: float in __op1 → int16 in HL
+            "__ftoi" => {
+                if !args.is_empty() {
+                    let src_label = self.w32_mem_label(args[0]);
+                    self.emit_w32_to_op1(&src_label);
+                }
+                self.emit_inst(&format!("CALL {}", func_name));
+            }
+            _ => unreachable!(),
+        }
+
+        if let Some(d) = dst {
+            match d.width {
+                // Comparisons and __ftoi return W16 in HL.
+                Width::W16 => self.mark(d, PhysReg::HL),
+                // Arithmetic results: low 16 of __op1 in HL.
+                Width::W32 => self.mark(d, PhysReg::HL),
+                Width::W8 => self.mark(d, PhysReg::A),
             }
         }
     }
@@ -1252,6 +1364,14 @@ impl CodeGenerator {
             self.emit_label(label);
             self.emit_inst("DS 2");
         }
+
+        // va_base labels for variadic functions
+        for func in &program.functions {
+            if func.is_variadic {
+                self.emit_label(&format!("__va_base_{}", func.name));
+                self.emit_inst("DS 2");
+            }
+        }
     }
 }
 
@@ -1267,6 +1387,63 @@ fn low_byte_name(reg: PhysReg) -> &'static str {
         PhysReg::DE => "E",
         PhysReg::HL => "L",
     }
+}
+
+// ---------------------------------------------------------------------------
+// Liveness analysis for global register allocation
+// ---------------------------------------------------------------------------
+
+/// Compute the last instruction index where each vreg is *used* (read as
+/// a source operand).  This enables the code generator to free a register
+/// as soon as the value it holds is no longer needed — a simple form of
+/// whole-function (global) register allocation.
+fn compute_last_use(body: &[IrInstr]) -> HashMap<u32, usize> {
+    let mut last: HashMap<u32, usize> = HashMap::new();
+    for (idx, instr) in body.iter().enumerate() {
+        for id in collect_op_src_ids(&instr.op) {
+            last.insert(id, idx);
+        }
+    }
+    last
+}
+
+/// Collect all vreg IDs that are *read* by an IR operation (source operands).
+fn collect_op_src_ids(op: &IrOp) -> Vec<u32> {
+    let mut ids = Vec::new();
+    match op {
+        IrOp::LoadImm { .. } | IrOp::LoadGlobal { .. } | IrOp::LoadLocal { .. }
+        | IrOp::Label { .. } | IrOp::Jump { .. } | IrOp::AddrOfGlobal { .. } => {}
+        IrOp::StoreGlobal { src, .. } | IrOp::StoreLocal { src, .. } => { ids.push(src.id); }
+        IrOp::LoadPtr { ptr, .. } => { ids.push(ptr.id); }
+        IrOp::StorePtr { ptr, src } => { ids.push(ptr.id); ids.push(src.id); }
+        IrOp::Add { lhs, rhs, .. } | IrOp::Sub { lhs, rhs, .. }
+        | IrOp::Mul { lhs, rhs, .. } | IrOp::Div { lhs, rhs, .. }
+        | IrOp::Mod { lhs, rhs, .. } | IrOp::And { lhs, rhs, .. }
+        | IrOp::Or { lhs, rhs, .. } | IrOp::Xor { lhs, rhs, .. }
+        | IrOp::Shl { lhs, rhs, .. } | IrOp::Shr { lhs, rhs, .. }
+        | IrOp::Eq { lhs, rhs, .. } | IrOp::Ne { lhs, rhs, .. }
+        | IrOp::Lt { lhs, rhs, .. } | IrOp::Le { lhs, rhs, .. }
+        | IrOp::Gt { lhs, rhs, .. } | IrOp::Ge { lhs, rhs, .. } => {
+            ids.push(lhs.id);
+            ids.push(rhs.id);
+        }
+        IrOp::Neg { src, .. } | IrOp::Not { src, .. } | IrOp::LogicalNot { src, .. } => {
+            ids.push(src.id);
+        }
+        IrOp::Copy { src, .. } | IrOp::Cast { src, .. } => { ids.push(src.id); }
+        IrOp::JumpIfTrue { cond, .. } | IrOp::JumpIfFalse { cond, .. } => { ids.push(cond.id); }
+        IrOp::Call { args, .. } => {
+            for a in args { ids.push(a.id); }
+        }
+        IrOp::Return { value } => {
+            if let Some(v) = value { ids.push(v.id); }
+        }
+        IrOp::PtrAdd { ptr, offset, .. } => {
+            ids.push(ptr.id);
+            ids.push(offset.id);
+        }
+    }
+    ids
 }
 
 // ---------------------------------------------------------------------------

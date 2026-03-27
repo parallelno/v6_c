@@ -17,14 +17,26 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ir::{IrFunction, IrInstr, IrOp, IrProgram, VReg, Width};
+use crate::ir::{IrFunction, IrInstr, IrOp, IrProgram, Label, VReg, Width};
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
+/// Maximum IR instruction count for a function to be inlined.
+const INLINE_THRESHOLD: usize = 20;
+
 /// Optimize an entire IR program in-place.
 pub fn optimize(program: &mut IrProgram) {
+    // First, run per-function optimization passes.
+    for func in &mut program.functions {
+        optimize_function(func);
+    }
+
+    // Then, run whole-program passes (inlining).
+    inline_expand(program);
+
+    // Re-optimize after inlining to clean up.
     for func in &mut program.functions {
         optimize_function(func);
     }
@@ -39,6 +51,8 @@ fn optimize_function(func: &mut IrFunction) {
         changed |= strength_reduce(func);
         changed |= dead_code_eliminate(func);
         changed |= cse(func);
+        changed |= jump_threading(func);
+        changed |= loop_invariant_code_motion(func);
         if !changed {
             break;
         }
@@ -865,6 +879,560 @@ fn cse_key(op: &IrOp) -> Option<(CseKey, VReg)> {
 }
 
 // ---------------------------------------------------------------------------
+// Jump threading
+// ---------------------------------------------------------------------------
+
+/// Resolve jump chains at the IR level.
+///
+/// When a jump targets a label that is immediately followed by another
+/// unconditional jump, rewrite the first jump to target the final
+/// destination.  Also handles conditional branches.
+fn jump_threading(func: &mut IrFunction) -> bool {
+    // Build map: label → index in body
+    let mut label_index: HashMap<u32, usize> = HashMap::new();
+    for (i, instr) in func.body.iter().enumerate() {
+        if let IrOp::Label { label } = &instr.op {
+            label_index.insert(label.0, i);
+        }
+    }
+
+    // For each label, find the first non-label instruction after it.
+    // If it's an unconditional Jump, record the forwarding.
+    let mut forward: HashMap<u32, u32> = HashMap::new();
+    for (&label_id, &idx) in &label_index {
+        let mut j = idx + 1;
+        while j < func.body.len() {
+            match &func.body[j].op {
+                IrOp::Label { .. } => { j += 1; }
+                IrOp::Jump { target } => {
+                    if target.0 != label_id {
+                        forward.insert(label_id, target.0);
+                    }
+                    break;
+                }
+                _ => break,
+            }
+        }
+    }
+
+    if forward.is_empty() {
+        return false;
+    }
+
+    // Resolve transitive chains (limit iterations to prevent cycles).
+    for _ in 0..16 {
+        let mut any = false;
+        let snapshot: Vec<(u32, u32)> = forward.iter().map(|(&k, &v)| (k, v)).collect();
+        for (src, dst) in &snapshot {
+            if let Some(&further) = forward.get(dst) {
+                if further != *src {
+                    forward.insert(*src, further);
+                    any = true;
+                }
+            }
+        }
+        if !any { break; }
+    }
+
+    // Rewrite jump targets.
+    let mut changed = false;
+    for instr in &mut func.body {
+        match &mut instr.op {
+            IrOp::Jump { target } => {
+                if let Some(&new_target) = forward.get(&target.0) {
+                    target.0 = new_target;
+                    changed = true;
+                }
+            }
+            IrOp::JumpIfTrue { target, .. } | IrOp::JumpIfFalse { target, .. } => {
+                if let Some(&new_target) = forward.get(&target.0) {
+                    target.0 = new_target;
+                    changed = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    changed
+}
+
+// ---------------------------------------------------------------------------
+// Inline expansion
+// ---------------------------------------------------------------------------
+
+/// Inline small functions at call sites.
+///
+/// A function is eligible for inlining if:
+/// - It has ≤ `INLINE_THRESHOLD` IR instructions.
+/// - It is not recursive (doesn't call itself directly or indirectly).
+/// - It is not the "main" function.
+///
+/// When inlined, the call is replaced with:
+/// 1. Store arguments to the callee's parameter labels.
+/// 2. The callee's body with all vregs and labels remapped to fresh IDs.
+/// 3. `Return` instructions replaced by a jump to a merge label.
+fn inline_expand(program: &mut IrProgram) {
+    // Build a map of function name → index for lookup.
+    let func_map: HashMap<String, usize> = program
+        .functions
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.name.clone(), i))
+        .collect();
+
+    // Determine which functions are inline candidates.
+    let inline_candidates: HashSet<String> = program
+        .functions
+        .iter()
+        .filter(|f| {
+            f.name != "main"
+                && f.body.len() <= INLINE_THRESHOLD
+                && !calls_self(f)
+        })
+        .map(|f| f.name.clone())
+        .collect();
+
+    if inline_candidates.is_empty() {
+        return;
+    }
+
+    // We need a global vreg id counter and label id counter to avoid clashes.
+    let mut next_vreg_id: u32 = program
+        .functions
+        .iter()
+        .flat_map(|f| f.body.iter())
+        .filter_map(|instr| get_dst_vreg(&instr.op))
+        .map(|v| v.id + 1)
+        .max()
+        .unwrap_or(0);
+
+    let mut next_label_id: u32 = program
+        .functions
+        .iter()
+        .flat_map(|f| f.body.iter())
+        .filter_map(|instr| {
+            if let IrOp::Label { label } = &instr.op {
+                Some(label.0 + 1)
+            } else {
+                None
+            }
+        })
+        .max()
+        .unwrap_or(0);
+
+    // Clone candidates for inlining (to avoid borrow issues).
+    let callee_bodies: HashMap<String, IrFunction> = inline_candidates
+        .iter()
+        .filter_map(|name| {
+            func_map.get(name).map(|&i| (name.clone(), program.functions[i].clone()))
+        })
+        .collect();
+
+    // Process each function and inline call sites.
+    for func in &mut program.functions {
+        let mut new_body: Vec<IrInstr> = Vec::with_capacity(func.body.len());
+        let mut did_inline = false;
+
+        for instr in &func.body {
+            if let IrOp::Call { func_name, args, dst } = &instr.op {
+                if let Some(callee) = callee_bodies.get(func_name) {
+                    // Inline this call.
+                    let (inlined, nv, nl) = inline_call_site(
+                        callee, args, dst.as_ref(), next_vreg_id, next_label_id,
+                    );
+                    next_vreg_id = nv;
+                    next_label_id = nl;
+                    new_body.extend(inlined);
+                    did_inline = true;
+                    continue;
+                }
+            }
+            new_body.push(instr.clone());
+        }
+
+        if did_inline {
+            func.body = new_body;
+        }
+    }
+}
+
+/// Check if a function calls itself (direct recursion).
+fn calls_self(func: &IrFunction) -> bool {
+    func.body.iter().any(|instr| {
+        matches!(&instr.op, IrOp::Call { func_name, .. } if func_name == &func.name)
+    })
+}
+
+/// Get the destination vreg of any instruction (for computing max vreg ids).
+fn get_dst_vreg(op: &IrOp) -> Option<VReg> {
+    match op {
+        IrOp::LoadImm { dst, .. }
+        | IrOp::LoadGlobal { dst, .. }
+        | IrOp::LoadLocal { dst, .. }
+        | IrOp::LoadPtr { dst, .. }
+        | IrOp::Add { dst, .. }
+        | IrOp::Sub { dst, .. }
+        | IrOp::Mul { dst, .. }
+        | IrOp::Div { dst, .. }
+        | IrOp::Mod { dst, .. }
+        | IrOp::And { dst, .. }
+        | IrOp::Or { dst, .. }
+        | IrOp::Xor { dst, .. }
+        | IrOp::Shl { dst, .. }
+        | IrOp::Shr { dst, .. }
+        | IrOp::Eq { dst, .. }
+        | IrOp::Ne { dst, .. }
+        | IrOp::Lt { dst, .. }
+        | IrOp::Le { dst, .. }
+        | IrOp::Gt { dst, .. }
+        | IrOp::Ge { dst, .. }
+        | IrOp::Neg { dst, .. }
+        | IrOp::Not { dst, .. }
+        | IrOp::LogicalNot { dst, .. }
+        | IrOp::Copy { dst, .. }
+        | IrOp::Cast { dst, .. }
+        | IrOp::AddrOfGlobal { dst, .. }
+        | IrOp::PtrAdd { dst, .. } => Some(*dst),
+        IrOp::Call { dst, .. } => *dst,
+        _ => None,
+    }
+}
+
+/// Inline a single call site: produce a sequence of instructions that
+/// replaces the Call instruction.
+///
+/// Returns (instructions, next_vreg_id, next_label_id).
+fn inline_call_site(
+    callee: &IrFunction,
+    call_args: &[VReg],
+    call_dst: Option<&VReg>,
+    mut next_vreg: u32,
+    mut next_label: u32,
+) -> (Vec<IrInstr>, u32, u32) {
+    let mut result = Vec::new();
+
+    // Build vreg remapping: callee vreg id → new vreg id.
+    let mut vreg_map: HashMap<u32, u32> = HashMap::new();
+    let mut remap_vreg = |v: VReg, map: &mut HashMap<u32, u32>, nv: &mut u32| -> VReg {
+        let new_id = *map.entry(v.id).or_insert_with(|| {
+            let id = *nv;
+            *nv += 1;
+            id
+        });
+        VReg::new(new_id, v.width)
+    };
+
+    // Build label remapping.
+    let mut label_map: HashMap<u32, u32> = HashMap::new();
+    let mut remap_label = |l: Label, map: &mut HashMap<u32, u32>, nl: &mut u32| -> Label {
+        let new_id = *map.entry(l.0).or_insert_with(|| {
+            let id = *nl;
+            *nl += 1;
+            id
+        });
+        Label::new(new_id)
+    };
+
+    // Merge label: where Return instructions in the callee jump to.
+    let merge_label = Label::new(next_label);
+    next_label += 1;
+
+    // Vreg to hold the return value (if any).
+    let ret_vreg = call_dst.map(|d| {
+        let rv = VReg::new(next_vreg, d.width);
+        next_vreg += 1;
+        rv
+    });
+
+    // Step 1: Store arguments to callee's parameter labels.
+    // The callee body starts with StoreGlobal instructions for params,
+    // but the IR gen already did that at the call site. We need to
+    // write the actual argument vregs to the callee's param labels.
+    for (i, param) in callee.params.iter().enumerate() {
+        if i < call_args.len() {
+            let label = format!("_l_{}_{}", callee.name, param.name);
+            result.push(IrInstr::bare(IrOp::StoreGlobal {
+                addr_label: label,
+                src: call_args[i],
+            }));
+        }
+    }
+
+    // Step 2: Copy the callee body with remapped vregs/labels.
+    // Skip the initial parameter stores (StoreGlobal for _l_callee_param).
+    let skip_prefix = callee.params.len();
+    for instr in callee.body.iter().skip(skip_prefix) {
+        // Handle Return specially: it needs to produce Copy + Jump.
+        if let IrOp::Return { value } = &instr.op {
+            if let (Some(v), Some(rv_dst)) = (value, ret_vreg) {
+                let new_id = *vreg_map.entry(v.id).or_insert_with(|| {
+                    let id = next_vreg;
+                    next_vreg += 1;
+                    id
+                });
+                let remapped_src = VReg::new(new_id, v.width);
+                result.push(IrInstr::bare(IrOp::Copy { dst: rv_dst, src: remapped_src }));
+            }
+            result.push(IrInstr::bare(IrOp::Jump { target: merge_label }));
+            continue;
+        }
+        let new_op = remap_op(
+            &instr.op,
+            &mut vreg_map,
+            &mut label_map,
+            &mut next_vreg,
+            &mut next_label,
+        );
+        result.push(IrInstr { op: new_op, line: instr.line });
+    }
+
+    // Step 3: Emit merge label.
+    result.push(IrInstr::bare(IrOp::Label { label: merge_label }));
+
+    // Step 4: Copy return value to the call's destination.
+    if let (Some(dst), Some(rv)) = (call_dst, ret_vreg) {
+        result.push(IrInstr::bare(IrOp::Copy { dst: *dst, src: rv }));
+    }
+
+    (result, next_vreg, next_label)
+}
+
+/// Remap all vreg and label references in an IR operation.
+/// `Return` is handled separately in the caller.
+fn remap_op(
+    op: &IrOp,
+    vreg_map: &mut HashMap<u32, u32>,
+    label_map: &mut HashMap<u32, u32>,
+    next_vreg: &mut u32,
+    next_label: &mut u32,
+) -> IrOp {
+    // Helper closures
+    let mut rv = |v: VReg| -> VReg {
+        let new_id = *vreg_map.entry(v.id).or_insert_with(|| {
+            let id = *next_vreg;
+            *next_vreg += 1;
+            id
+        });
+        VReg::new(new_id, v.width)
+    };
+    let mut rl = |l: Label| -> Label {
+        let new_id = *label_map.entry(l.0).or_insert_with(|| {
+            let id = *next_label;
+            *next_label += 1;
+            id
+        });
+        Label::new(new_id)
+    };
+
+    match op {
+        IrOp::LoadImm { dst, value } => IrOp::LoadImm { dst: rv(*dst), value: *value },
+        IrOp::LoadGlobal { dst, addr_label } => IrOp::LoadGlobal { dst: rv(*dst), addr_label: addr_label.clone() },
+        IrOp::StoreGlobal { addr_label, src } => IrOp::StoreGlobal { addr_label: addr_label.clone(), src: rv(*src) },
+        IrOp::LoadLocal { dst, offset } => IrOp::LoadLocal { dst: rv(*dst), offset: *offset },
+        IrOp::StoreLocal { offset, src } => IrOp::StoreLocal { offset: *offset, src: rv(*src) },
+        IrOp::LoadPtr { dst, ptr } => IrOp::LoadPtr { dst: rv(*dst), ptr: rv(*ptr) },
+        IrOp::StorePtr { ptr, src } => IrOp::StorePtr { ptr: rv(*ptr), src: rv(*src) },
+        IrOp::Add { dst, lhs, rhs, width } => IrOp::Add { dst: rv(*dst), lhs: rv(*lhs), rhs: rv(*rhs), width: *width },
+        IrOp::Sub { dst, lhs, rhs, width } => IrOp::Sub { dst: rv(*dst), lhs: rv(*lhs), rhs: rv(*rhs), width: *width },
+        IrOp::Mul { dst, lhs, rhs, width, signed } => IrOp::Mul { dst: rv(*dst), lhs: rv(*lhs), rhs: rv(*rhs), width: *width, signed: *signed },
+        IrOp::Div { dst, lhs, rhs, width, signed } => IrOp::Div { dst: rv(*dst), lhs: rv(*lhs), rhs: rv(*rhs), width: *width, signed: *signed },
+        IrOp::Mod { dst, lhs, rhs, width, signed } => IrOp::Mod { dst: rv(*dst), lhs: rv(*lhs), rhs: rv(*rhs), width: *width, signed: *signed },
+        IrOp::And { dst, lhs, rhs, width } => IrOp::And { dst: rv(*dst), lhs: rv(*lhs), rhs: rv(*rhs), width: *width },
+        IrOp::Or { dst, lhs, rhs, width } => IrOp::Or { dst: rv(*dst), lhs: rv(*lhs), rhs: rv(*rhs), width: *width },
+        IrOp::Xor { dst, lhs, rhs, width } => IrOp::Xor { dst: rv(*dst), lhs: rv(*lhs), rhs: rv(*rhs), width: *width },
+        IrOp::Shl { dst, lhs, rhs, width } => IrOp::Shl { dst: rv(*dst), lhs: rv(*lhs), rhs: rv(*rhs), width: *width },
+        IrOp::Shr { dst, lhs, rhs, width, arithmetic } => IrOp::Shr { dst: rv(*dst), lhs: rv(*lhs), rhs: rv(*rhs), width: *width, arithmetic: *arithmetic },
+        IrOp::Eq { dst, lhs, rhs, width } => IrOp::Eq { dst: rv(*dst), lhs: rv(*lhs), rhs: rv(*rhs), width: *width },
+        IrOp::Ne { dst, lhs, rhs, width } => IrOp::Ne { dst: rv(*dst), lhs: rv(*lhs), rhs: rv(*rhs), width: *width },
+        IrOp::Lt { dst, lhs, rhs, width, signed } => IrOp::Lt { dst: rv(*dst), lhs: rv(*lhs), rhs: rv(*rhs), width: *width, signed: *signed },
+        IrOp::Le { dst, lhs, rhs, width, signed } => IrOp::Le { dst: rv(*dst), lhs: rv(*lhs), rhs: rv(*rhs), width: *width, signed: *signed },
+        IrOp::Gt { dst, lhs, rhs, width, signed } => IrOp::Gt { dst: rv(*dst), lhs: rv(*lhs), rhs: rv(*rhs), width: *width, signed: *signed },
+        IrOp::Ge { dst, lhs, rhs, width, signed } => IrOp::Ge { dst: rv(*dst), lhs: rv(*lhs), rhs: rv(*rhs), width: *width, signed: *signed },
+        IrOp::Neg { dst, src, width } => IrOp::Neg { dst: rv(*dst), src: rv(*src), width: *width },
+        IrOp::Not { dst, src, width } => IrOp::Not { dst: rv(*dst), src: rv(*src), width: *width },
+        IrOp::LogicalNot { dst, src, width } => IrOp::LogicalNot { dst: rv(*dst), src: rv(*src), width: *width },
+        IrOp::Copy { dst, src } => IrOp::Copy { dst: rv(*dst), src: rv(*src) },
+        IrOp::Cast { dst, src, to_type } => IrOp::Cast { dst: rv(*dst), src: rv(*src), to_type: to_type.clone() },
+        IrOp::Jump { target } => IrOp::Jump { target: rl(*target) },
+        IrOp::JumpIfTrue { cond, target } => IrOp::JumpIfTrue { cond: rv(*cond), target: rl(*target) },
+        IrOp::JumpIfFalse { cond, target } => IrOp::JumpIfFalse { cond: rv(*cond), target: rl(*target) },
+        IrOp::Label { label } => IrOp::Label { label: rl(*label) },
+        IrOp::AddrOfGlobal { dst, name } => IrOp::AddrOfGlobal { dst: rv(*dst), name: name.clone() },
+        IrOp::PtrAdd { dst, ptr, offset, element_size } => IrOp::PtrAdd { dst: rv(*dst), ptr: rv(*ptr), offset: rv(*offset), element_size: *element_size },
+        IrOp::Return { .. } => unreachable!("Return handled in caller"),
+        IrOp::Call { func_name, args, dst } => IrOp::Call {
+            func_name: func_name.clone(),
+            args: args.iter().map(|a| rv(*a)).collect(),
+            dst: dst.map(|d| rv(d)),
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Loop-invariant code motion (LICM)
+// ---------------------------------------------------------------------------
+
+/// Detect natural loops and hoist loop-invariant instructions to the
+/// pre-header position (just before the loop header label).
+///
+/// A natural loop is identified by a back-edge: an unconditional or
+/// conditional jump whose target label appears *before* the jump in the
+/// linear instruction stream.  The loop body spans from the header label
+/// up to (and including) the back-edge jump.
+///
+/// An instruction is loop-invariant if:
+///  - It is "pure" (no side effects: no stores, calls, jumps, labels, returns).
+///  - All of its source operands are defined *outside* the current loop body.
+///
+/// Such instructions are moved to the pre-header, i.e. just before the
+/// header label.
+fn loop_invariant_code_motion(func: &mut IrFunction) -> bool {
+    // Build label → index map.
+    let mut label_index: HashMap<u32, usize> = HashMap::new();
+    for (i, instr) in func.body.iter().enumerate() {
+        if let IrOp::Label { label } = &instr.op {
+            label_index.insert(label.0, i);
+        }
+    }
+
+    // Find back edges: instructions that jump to a label appearing earlier.
+    // Each back edge identifies a natural loop: header..=back_edge.
+    struct LoopInfo {
+        header_idx: usize,
+        back_edge_idx: usize,
+    }
+    let mut loops: Vec<LoopInfo> = Vec::new();
+
+    for (i, instr) in func.body.iter().enumerate() {
+        let target_id = match &instr.op {
+            IrOp::Jump { target } => Some(target.0),
+            IrOp::JumpIfTrue { target, .. } => Some(target.0),
+            // JumpIfFalse is the loop-exit branch (while/for), not a back-edge.
+            _ => None,
+        };
+        if let Some(tid) = target_id {
+            if let Some(&header_idx) = label_index.get(&tid) {
+                if header_idx < i {
+                    loops.push(LoopInfo { header_idx, back_edge_idx: i });
+                }
+            }
+        }
+    }
+
+    if loops.is_empty() {
+        return false;
+    }
+
+    // Process loops from innermost (smallest span) first.
+    loops.sort_by_key(|l| l.back_edge_idx - l.header_idx);
+
+    let mut changed = false;
+
+    for lp in &loops {
+        // Collect all vregs *defined* inside the loop body.
+        let mut loop_defs: HashSet<u32> = HashSet::new();
+        for idx in lp.header_idx..=lp.back_edge_idx {
+            if let Some(dst) = get_dst_vreg(&func.body[idx].op) {
+                loop_defs.insert(dst.id);
+            }
+        }
+
+        // Identify loop-invariant instructions: pure instructions whose
+        // source operands are ALL defined outside the loop.
+        let mut hoist_indices: Vec<usize> = Vec::new();
+        for idx in lp.header_idx..=lp.back_edge_idx {
+            let op = &func.body[idx].op;
+            // Only hoist pure instructions (no side effects).
+            if get_pure_dst(op).is_none() {
+                continue;
+            }
+            // Check that all source operands are defined outside the loop.
+            let sources = collect_src_vregs(op);
+            if sources.iter().all(|s| !loop_defs.contains(s)) {
+                hoist_indices.push(idx);
+                // Remove this definition from loop_defs since we're
+                // hoisting it — this allows dependent invariant instructions
+                // to be hoisted too in subsequent iterations.
+                if let Some(dst) = get_dst_vreg(op) {
+                    loop_defs.remove(&dst.id);
+                }
+            }
+        }
+
+        if hoist_indices.is_empty() {
+            continue;
+        }
+
+        // Build new body: insert hoisted instructions just before the header
+        // label, and remove them from their original positions.
+        let hoist_set: HashSet<usize> = hoist_indices.iter().copied().collect();
+        let mut new_body: Vec<IrInstr> = Vec::with_capacity(func.body.len());
+
+        for (i, instr) in func.body.iter().enumerate() {
+            if i == lp.header_idx {
+                // Insert hoisted instructions before the header label.
+                for &hi in &hoist_indices {
+                    new_body.push(func.body[hi].clone());
+                }
+            }
+            if !hoist_set.contains(&i) {
+                new_body.push(instr.clone());
+            }
+        }
+
+        func.body = new_body;
+        changed = true;
+
+        // Note: after modifying func.body, indices for subsequent loops are
+        // invalidated, but since we're in a fixed-point loop in
+        // optimize_function, we'll re-detect loops next iteration.
+        break;
+    }
+
+    changed
+}
+
+/// Collect all vreg IDs that are *read* (source operands) by an instruction.
+fn collect_src_vregs(op: &IrOp) -> Vec<u32> {
+    let mut srcs = Vec::new();
+    match op {
+        IrOp::LoadImm { .. } | IrOp::LoadGlobal { .. } | IrOp::LoadLocal { .. }
+        | IrOp::Label { .. } | IrOp::Jump { .. } | IrOp::AddrOfGlobal { .. } => {}
+        IrOp::StoreGlobal { src, .. } | IrOp::StoreLocal { src, .. } => { srcs.push(src.id); }
+        IrOp::LoadPtr { ptr, .. } => { srcs.push(ptr.id); }
+        IrOp::StorePtr { ptr, src } => { srcs.push(ptr.id); srcs.push(src.id); }
+        IrOp::Add { lhs, rhs, .. } | IrOp::Sub { lhs, rhs, .. }
+        | IrOp::Mul { lhs, rhs, .. } | IrOp::Div { lhs, rhs, .. }
+        | IrOp::Mod { lhs, rhs, .. } | IrOp::And { lhs, rhs, .. }
+        | IrOp::Or { lhs, rhs, .. } | IrOp::Xor { lhs, rhs, .. }
+        | IrOp::Shl { lhs, rhs, .. } | IrOp::Shr { lhs, rhs, .. }
+        | IrOp::Eq { lhs, rhs, .. } | IrOp::Ne { lhs, rhs, .. }
+        | IrOp::Lt { lhs, rhs, .. } | IrOp::Le { lhs, rhs, .. }
+        | IrOp::Gt { lhs, rhs, .. } | IrOp::Ge { lhs, rhs, .. } => {
+            srcs.push(lhs.id);
+            srcs.push(rhs.id);
+        }
+        IrOp::Neg { src, .. } | IrOp::Not { src, .. } | IrOp::LogicalNot { src, .. } => {
+            srcs.push(src.id);
+        }
+        IrOp::Copy { src, .. } | IrOp::Cast { src, .. } => { srcs.push(src.id); }
+        IrOp::JumpIfTrue { cond, .. } | IrOp::JumpIfFalse { cond, .. } => { srcs.push(cond.id); }
+        IrOp::Call { args, .. } => {
+            for a in args { srcs.push(a.id); }
+        }
+        IrOp::Return { value } => {
+            if let Some(v) = value { srcs.push(v.id); }
+        }
+        IrOp::PtrAdd { ptr, offset, .. } => {
+            srcs.push(ptr.id);
+            srcs.push(offset.id);
+        }
+    }
+    srcs
+}
+
+// ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
 
@@ -1421,5 +1989,123 @@ mod tests {
         let result = opt_body(body);
         assert!(result.iter().any(|i| matches!(&i.op,
             IrOp::LoadImm { dst, value: 0 } if dst.id == 1)));
+    }
+
+    // -- Loop-invariant code motion ---------------------------------------
+
+    #[test]
+    fn licm_hoists_invariant_computation() {
+        // Simulate:
+        //   a = load_global "_g_a"              // vreg 0
+        //   b = load_global "_g_b"              // vreg 1
+        // L0:                                    // loop header
+        //   c = add a, b                         // invariant! (vreg 2)
+        //   i = load_global "_g_i"               // vreg 3 (changes each iter)
+        //   store_global "_g_x", c
+        //   jump_if_true i L0                    // back edge
+        //
+        // After LICM, the Add should be before L0.
+        let body = vec![
+            IrInstr::bare(IrOp::LoadGlobal {
+                dst: VReg::new(0, Width::W16),
+                addr_label: "_g_a".into(),
+            }),
+            IrInstr::bare(IrOp::LoadGlobal {
+                dst: VReg::new(1, Width::W16),
+                addr_label: "_g_b".into(),
+            }),
+            IrInstr::bare(IrOp::Label { label: Label::new(0) }),
+            IrInstr::bare(IrOp::Add {
+                dst: VReg::new(2, Width::W16),
+                lhs: VReg::new(0, Width::W16),
+                rhs: VReg::new(1, Width::W16),
+                width: Width::W16,
+            }),
+            IrInstr::bare(IrOp::LoadGlobal {
+                dst: VReg::new(3, Width::W16),
+                addr_label: "_g_i".into(),
+            }),
+            IrInstr::bare(IrOp::StoreGlobal {
+                addr_label: "_g_x".into(),
+                src: VReg::new(2, Width::W16),
+            }),
+            IrInstr::bare(IrOp::JumpIfTrue {
+                cond: VReg::new(3, Width::W16),
+                target: Label::new(0),
+            }),
+            IrInstr::bare(IrOp::ret(None)),
+        ];
+
+        let result = opt_body(body);
+
+        // The Add of vreg 0 + vreg 1 producing vreg 2 should appear
+        // before the Label(0), i.e., it was hoisted out of the loop.
+        let label_pos = result
+            .iter()
+            .position(|i| matches!(&i.op, IrOp::Label { label } if label.0 == 0))
+            .expect("label L0 must exist");
+        let add_pos = result
+            .iter()
+            .position(|i| matches!(&i.op, IrOp::Add { dst, .. } if dst.id == 2))
+            .expect("add must exist");
+        assert!(
+            add_pos < label_pos,
+            "invariant Add should be hoisted before the loop header (add at {}, label at {})",
+            add_pos, label_pos,
+        );
+    }
+
+    #[test]
+    fn licm_does_not_hoist_loop_dependent() {
+        // Instruction that depends on a loop-defined vreg should NOT be hoisted.
+        //   a = load_global "_g_a"              // vreg 0
+        // L0:
+        //   i = load_global "_g_i"               // vreg 1 (loop-variant)
+        //   c = add a, i                         // depends on i → NOT invariant
+        //   store_global "_g_x", c
+        //   jump_if_true i L0
+        let body = vec![
+            IrInstr::bare(IrOp::LoadGlobal {
+                dst: VReg::new(0, Width::W16),
+                addr_label: "_g_a".into(),
+            }),
+            IrInstr::bare(IrOp::Label { label: Label::new(0) }),
+            IrInstr::bare(IrOp::LoadGlobal {
+                dst: VReg::new(1, Width::W16),
+                addr_label: "_g_i".into(),
+            }),
+            IrInstr::bare(IrOp::Add {
+                dst: VReg::new(2, Width::W16),
+                lhs: VReg::new(0, Width::W16),
+                rhs: VReg::new(1, Width::W16),
+                width: Width::W16,
+            }),
+            IrInstr::bare(IrOp::StoreGlobal {
+                addr_label: "_g_x".into(),
+                src: VReg::new(2, Width::W16),
+            }),
+            IrInstr::bare(IrOp::JumpIfTrue {
+                cond: VReg::new(1, Width::W16),
+                target: Label::new(0),
+            }),
+            IrInstr::bare(IrOp::ret(None)),
+        ];
+
+        let result = opt_body(body);
+
+        // The Add should still be AFTER the label (not hoisted).
+        let label_pos = result
+            .iter()
+            .position(|i| matches!(&i.op, IrOp::Label { label } if label.0 == 0))
+            .expect("label L0 must exist");
+        let add_pos = result
+            .iter()
+            .position(|i| matches!(&i.op, IrOp::Add { dst, .. } if dst.id == 2))
+            .expect("add must exist");
+        assert!(
+            add_pos > label_pos,
+            "loop-dependent Add should NOT be hoisted (add at {}, label at {})",
+            add_pos, label_pos,
+        );
     }
 }

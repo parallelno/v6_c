@@ -51,7 +51,7 @@ impl Width {
         match ty {
             CType::Char { .. } => Some(Width::W8),
             CType::Int { .. } | CType::Pointer(_) | CType::Enum { .. } => Some(Width::W16),
-            CType::Long { .. } => Some(Width::W32),
+            CType::Long { .. } | CType::Float => Some(Width::W32),
             _ => None,
         }
     }
@@ -334,6 +334,9 @@ pub struct IrFunction {
     /// `LoadLocal` / `StoreLocal`.  When `false`, all values live in virtual
     /// registers (register-promotion mode).
     pub is_stack_mode: bool,
+
+    /// When `true`, this function accepts a variable number of arguments.
+    pub is_variadic: bool,
 }
 
 impl IrFunction {
@@ -345,6 +348,7 @@ impl IrFunction {
             body: Vec::new(),
             return_type,
             is_stack_mode: false,
+            is_variadic: false,
         }
     }
 
