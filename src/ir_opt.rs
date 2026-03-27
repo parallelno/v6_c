@@ -16,6 +16,7 @@
 //! an optimized copy.
 
 use std::collections::{HashMap, HashSet};
+use std::env;
 
 use crate::ir::{IrFunction, IrInstr, IrOp, IrProgram, Label, VReg, Width};
 
@@ -26,19 +27,37 @@ use crate::ir::{IrFunction, IrInstr, IrOp, IrProgram, Label, VReg, Width};
 /// Maximum IR instruction count for a function to be inlined.
 const INLINE_THRESHOLD: usize = 20;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OptProfile {
+    Default,
+    Benchmark,
+}
+
+fn current_opt_profile() -> OptProfile {
+    match env::var("V6C_OPT_PROFILE") {
+        Ok(v) if v.eq_ignore_ascii_case("bench") || v.eq_ignore_ascii_case("benchmark") => {
+            OptProfile::Benchmark
+        }
+        _ => OptProfile::Default,
+    }
+}
+
 /// Optimize an entire IR program in-place.
 pub fn optimize(program: &mut IrProgram) {
+    let profile = current_opt_profile();
+
     // First, run per-function optimization passes.
     for func in &mut program.functions {
-        optimize_function(func);
+        optimize_function(func, profile);
     }
 
     // Then, run whole-program passes (inlining).
     inline_expand(program);
+    function_specialization(program, profile);
 
     // Re-optimize after inlining to clean up.
     for func in &mut program.functions {
-        optimize_function(func);
+        optimize_function(func, profile);
     }
 
     // Run loop-specific passes once (outside the fixed-point loop to avoid
@@ -49,27 +68,343 @@ pub fn optimize(program: &mut IrProgram) {
         loop_changed |= loop_unrolling(func);
         if loop_changed {
             // Clean up after loop transformations.
-            optimize_function(func);
+            optimize_function(func, profile);
+        }
+    }
+
+    // Benchmark profile runs one extra cleanup round.
+    if profile == OptProfile::Benchmark {
+        for func in &mut program.functions {
+            optimize_function(func, profile);
         }
     }
 }
 
 /// Run all optimization passes on a single function.
-fn optimize_function(func: &mut IrFunction) {
+fn optimize_function(func: &mut IrFunction, profile: OptProfile) {
     // Run passes in a fixed-point loop until no more changes.
     loop {
         let mut changed = false;
-        changed |= constant_fold_and_propagate(func);
-        changed |= load_store_forwarding(func);
-        changed |= strength_reduce(func);
-        changed |= narrow_byte_ops(func);
-        changed |= dead_code_eliminate(func);
-        changed |= cse(func);
-        changed |= jump_threading(func);
-        changed |= loop_invariant_code_motion(func);
+        match profile {
+            OptProfile::Default => {
+                changed |= constant_fold_and_propagate(func);
+                changed |= load_store_forwarding(func);
+                changed |= strength_reduce(func);
+                changed |= narrow_byte_ops(func);
+                changed |= dead_code_eliminate(func);
+                changed |= cse(func);
+                changed |= jump_threading(func);
+                changed |= loop_invariant_code_motion(func);
+            }
+            OptProfile::Benchmark => {
+                changed |= constant_fold_and_propagate(func);
+                changed |= load_store_forwarding(func);
+                changed |= cse(func);
+                changed |= narrow_byte_ops(func);
+                changed |= strength_reduce(func);
+                changed |= jump_threading(func);
+                changed |= loop_invariant_code_motion(func);
+                changed |= dead_code_eliminate(func);
+            }
+        }
         if !changed {
             break;
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Function specialization for constant arguments
+// ---------------------------------------------------------------------------
+
+fn function_specialization(program: &mut IrProgram, profile: OptProfile) {
+    let size_limit = match profile {
+        OptProfile::Default => 40,
+        OptProfile::Benchmark => 80,
+    };
+
+    let callee_templates: HashMap<String, IrFunction> = program
+        .functions
+        .iter()
+        .map(|f| (f.name.clone(), f.clone()))
+        .collect();
+
+    let candidates: HashSet<String> = program
+        .functions
+        .iter()
+        .filter(|f| {
+            !f.name.contains("__spec_")
+                && !f.is_variadic
+                && f.body.len() <= size_limit
+                && !calls_self(f)
+        })
+        .map(|f| f.name.clone())
+        .collect();
+
+    if candidates.is_empty() {
+        return;
+    }
+
+    let mut next_vreg = next_vreg_id(program);
+    let mut spec_cache: HashMap<String, String> = HashMap::new();
+    let mut pending_funcs: Vec<IrFunction> = Vec::new();
+    let mut pending_globals: Vec<crate::ir::GlobalVar> = Vec::new();
+
+    for caller in &mut program.functions {
+        let mut const_map: HashMap<u32, i64> = HashMap::new();
+
+        for instr in &mut caller.body {
+            match &mut instr.op {
+                IrOp::LoadImm { dst, value } => {
+                    const_map.insert(dst.id, *value);
+                }
+                IrOp::Copy { dst, src } => {
+                    if let Some(v) = const_map.get(&src.id).copied() {
+                        const_map.insert(dst.id, v);
+                    } else {
+                        const_map.remove(&dst.id);
+                    }
+                }
+                IrOp::Cast { dst, src, .. } => {
+                    if let Some(v) = const_map.get(&src.id).copied() {
+                        const_map.insert(dst.id, v);
+                    } else {
+                        const_map.remove(&dst.id);
+                    }
+                }
+                IrOp::Label { .. }
+                | IrOp::Jump { .. }
+                | IrOp::JumpIfTrue { .. }
+                | IrOp::JumpIfFalse { .. }
+                | IrOp::Return { .. } => {
+                    const_map.clear();
+                }
+                IrOp::Call { func_name, args, .. } => {
+                    if candidates.contains(func_name) && !func_name.contains("__spec_") {
+                        let const_args: Vec<(usize, i64)> = args
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, arg)| const_map.get(&arg.id).copied().map(|v| (i, v)))
+                            .collect();
+
+                        if !const_args.is_empty() {
+                            let key = specialization_key(func_name, &const_args);
+                            let spec_name = if let Some(existing) = spec_cache.get(&key).cloned() {
+                                existing
+                            } else {
+                                let Some(callee) = callee_templates.get(func_name).cloned() else {
+                                    continue;
+                                };
+                                let name = format!("__spec_{}_{}", func_name, spec_cache.len());
+                                let (clone_func, clone_globals) = clone_specialized_function(
+                                    &callee,
+                                    &name,
+                                    &const_args,
+                                    &mut next_vreg,
+                                    &program.globals,
+                                );
+
+                                let mut optimized_clone = clone_func;
+                                optimize_function(&mut optimized_clone, profile);
+
+                                pending_globals.extend(clone_globals);
+                                pending_funcs.push(optimized_clone);
+                                spec_cache.insert(key, name.clone());
+                                name
+                            };
+                            *func_name = spec_name;
+                        }
+                    }
+
+                    const_map.clear();
+                }
+                _ => {
+                    if let Some(dst) = get_dst_vreg(&instr.op) {
+                        const_map.remove(&dst.id);
+                    }
+                }
+            }
+        }
+    }
+
+    if !pending_globals.is_empty() {
+        program.globals.extend(pending_globals);
+    }
+    if !pending_funcs.is_empty() {
+        program.functions.extend(pending_funcs);
+    }
+}
+
+fn next_vreg_id(program: &IrProgram) -> u32 {
+    program
+        .functions
+        .iter()
+        .flat_map(|f| f.body.iter())
+        .flat_map(|instr| collect_vregs(&instr.op))
+        .map(|v| v.id)
+        .max()
+        .map(|id| id + 1)
+        .unwrap_or(0)
+}
+
+fn collect_vregs(op: &IrOp) -> Vec<VReg> {
+    let mut out = Vec::new();
+    if let Some(dst) = get_dst_vreg(op) {
+        out.push(dst);
+    }
+    match op {
+        IrOp::StoreGlobal { src, .. } | IrOp::StoreLocal { src, .. } => out.push(*src),
+        IrOp::LoadPtr { ptr, .. } => out.push(*ptr),
+        IrOp::StorePtr { ptr, src } => {
+            out.push(*ptr);
+            out.push(*src);
+        }
+        IrOp::Add { lhs, rhs, .. }
+        | IrOp::Sub { lhs, rhs, .. }
+        | IrOp::Mul { lhs, rhs, .. }
+        | IrOp::Div { lhs, rhs, .. }
+        | IrOp::Mod { lhs, rhs, .. }
+        | IrOp::And { lhs, rhs, .. }
+        | IrOp::Or { lhs, rhs, .. }
+        | IrOp::Xor { lhs, rhs, .. }
+        | IrOp::Shl { lhs, rhs, .. }
+        | IrOp::Shr { lhs, rhs, .. }
+        | IrOp::Eq { lhs, rhs, .. }
+        | IrOp::Ne { lhs, rhs, .. }
+        | IrOp::Lt { lhs, rhs, .. }
+        | IrOp::Le { lhs, rhs, .. }
+        | IrOp::Gt { lhs, rhs, .. }
+        | IrOp::Ge { lhs, rhs, .. } => {
+            out.push(*lhs);
+            out.push(*rhs);
+        }
+        IrOp::Neg { src, .. } | IrOp::Not { src, .. } | IrOp::LogicalNot { src, .. } => out.push(*src),
+        IrOp::Copy { src, .. } | IrOp::Cast { src, .. } => out.push(*src),
+        IrOp::JumpIfTrue { cond, .. } | IrOp::JumpIfFalse { cond, .. } => out.push(*cond),
+        IrOp::Call { args, dst, .. } => {
+            out.extend(args.iter().copied());
+            if let Some(d) = dst {
+                out.push(*d);
+            }
+        }
+        IrOp::Return { value } => {
+            if let Some(v) = value {
+                out.push(*v);
+            }
+        }
+        IrOp::PtrAdd { ptr, offset, .. } => {
+            out.push(*ptr);
+            out.push(*offset);
+        }
+        _ => {}
+    }
+    out
+}
+
+fn specialization_key(func_name: &str, const_args: &[(usize, i64)]) -> String {
+    let mut parts: Vec<String> = const_args
+        .iter()
+        .map(|(i, v)| format!("{}={}", i, v))
+        .collect();
+    parts.sort();
+    format!("{}|{}", func_name, parts.join(","))
+}
+
+fn clone_specialized_function(
+    callee: &IrFunction,
+    new_name: &str,
+    const_args: &[(usize, i64)],
+    next_vreg: &mut u32,
+    globals: &[crate::ir::GlobalVar],
+) -> (IrFunction, Vec<crate::ir::GlobalVar>) {
+    let old_name = callee.name.clone();
+    let old_prefix = format!("_l_{}", old_name);
+    let new_prefix = format!("_l_{}", new_name);
+
+    let const_map: HashMap<usize, i64> = const_args.iter().copied().collect();
+
+    let mut cloned = callee.clone();
+    cloned.name = new_name.to_string();
+
+    let mut body = Vec::with_capacity(cloned.body.len() + const_map.len() * 2);
+
+    for instr in &cloned.body {
+        let rewritten = rename_local_labels_in_op(&instr.op, &old_prefix, &new_prefix);
+
+        if let IrOp::StoreGlobal { addr_label, .. } = &rewritten {
+            if let Some((arg_idx, _param)) = cloned
+                .params
+                .iter()
+                .enumerate()
+                .find(|(_, p)| addr_label == &format!("{}_{}", new_prefix, p.name))
+            {
+                if let Some(&const_val) = const_map.get(&arg_idx) {
+                    let width = cloned.params[arg_idx].vreg.width;
+                    let c = VReg::new(*next_vreg, width);
+                    *next_vreg += 1;
+                    body.push(IrInstr {
+                        op: IrOp::LoadImm {
+                            dst: c,
+                            value: const_val,
+                        },
+                        line: instr.line,
+                    });
+                    body.push(IrInstr {
+                        op: IrOp::StoreGlobal {
+                            addr_label: addr_label.clone(),
+                            src: c,
+                        },
+                        line: instr.line,
+                    });
+                    continue;
+                }
+            }
+        }
+
+        body.push(IrInstr {
+            op: rewritten,
+            line: instr.line,
+        });
+    }
+
+    cloned.body = body;
+
+    let cloned_globals: Vec<crate::ir::GlobalVar> = globals
+        .iter()
+        .filter(|g| g.name.starts_with(&old_prefix))
+        .map(|g| crate::ir::GlobalVar {
+            name: g.name.replacen(&old_prefix, &new_prefix, 1),
+            ty: g.ty.clone(),
+            init: g.init.clone(),
+        })
+        .collect();
+
+    (cloned, cloned_globals)
+}
+
+fn rename_local_labels_in_op(op: &IrOp, old_prefix: &str, new_prefix: &str) -> IrOp {
+    match op {
+        IrOp::LoadGlobal { dst, addr_label } => IrOp::LoadGlobal {
+            dst: *dst,
+            addr_label: maybe_rewrite_local_label(addr_label, old_prefix, new_prefix),
+        },
+        IrOp::StoreGlobal { addr_label, src } => IrOp::StoreGlobal {
+            addr_label: maybe_rewrite_local_label(addr_label, old_prefix, new_prefix),
+            src: *src,
+        },
+        IrOp::AddrOfGlobal { dst, name } => IrOp::AddrOfGlobal {
+            dst: *dst,
+            name: maybe_rewrite_local_label(name, old_prefix, new_prefix),
+        },
+        _ => op.clone(),
+    }
+}
+
+fn maybe_rewrite_local_label(label: &str, old_prefix: &str, new_prefix: &str) -> String {
+    if label.starts_with(old_prefix) {
+        label.replacen(old_prefix, new_prefix, 1)
+    } else {
+        label.to_string()
     }
 }
 
@@ -1471,25 +1806,9 @@ fn inline_call_site(
 
     // Build vreg remapping: callee vreg id → new vreg id.
     let mut vreg_map: HashMap<u32, u32> = HashMap::new();
-    let mut remap_vreg = |v: VReg, map: &mut HashMap<u32, u32>, nv: &mut u32| -> VReg {
-        let new_id = *map.entry(v.id).or_insert_with(|| {
-            let id = *nv;
-            *nv += 1;
-            id
-        });
-        VReg::new(new_id, v.width)
-    };
 
     // Build label remapping.
     let mut label_map: HashMap<u32, u32> = HashMap::new();
-    let mut remap_label = |l: Label, map: &mut HashMap<u32, u32>, nl: &mut u32| -> Label {
-        let new_id = *map.entry(l.0).or_insert_with(|| {
-            let id = *nl;
-            *nl += 1;
-            id
-        });
-        Label::new(new_id)
-    };
 
     // Merge label: where Return instructions in the callee jump to.
     let merge_label = Label::new(next_label);

@@ -308,6 +308,10 @@ impl CodeGenerator {
         }
     }
 
+    fn known_imm(&self, vreg: VReg) -> Option<i64> {
+        self.regalloc.immediate_of(vreg)
+    }
+
     fn load_stack_arg_for_push(&mut self, arg: VReg) {
         match arg.width {
             Width::W8 => {
@@ -839,6 +843,28 @@ impl CodeGenerator {
     fn gen_mul(&mut self, dst: VReg, lhs: VReg, rhs: VReg, width: Width, _signed: bool) {
         match width {
             Width::W8 => {
+                if let Some(k) = self.known_imm(rhs).or_else(|| self.known_imm(lhs)) {
+                    let var = if self.known_imm(rhs).is_some() { lhs } else { rhs };
+                    match k {
+                        0 => {
+                            self.emit_inst("MVI A,0");
+                            self.mark(dst, PhysReg::A);
+                            return;
+                        }
+                        1 => {
+                            self.ensure_a(var);
+                            self.mark(dst, PhysReg::A);
+                            return;
+                        }
+                        2 => {
+                            self.ensure_a(var);
+                            self.emit_inst("ADD A");
+                            self.mark(dst, PhysReg::A);
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
                 // Widen to 16-bit and use runtime
                 self.spill_live_before_call("__mul16");
                 self.ensure_hl(lhs);
@@ -847,6 +873,44 @@ impl CodeGenerator {
                 self.mark(dst, PhysReg::HL);
             }
             Width::W16 => {
+                if let Some(k) = self.known_imm(rhs).or_else(|| self.known_imm(lhs)) {
+                    let var = if self.known_imm(rhs).is_some() { lhs } else { rhs };
+                    match k {
+                        0 => {
+                            self.emit_inst("LXI H,0");
+                            self.mark(dst, PhysReg::HL);
+                            return;
+                        }
+                        1 => {
+                            self.ensure_hl(var);
+                            self.mark(dst, PhysReg::HL);
+                            return;
+                        }
+                        2 | 4 | 8 => {
+                            self.ensure_hl(var);
+                            let shifts = match k {
+                                2 => 1,
+                                4 => 2,
+                                _ => 3,
+                            };
+                            for _ in 0..shifts {
+                                self.emit_inst("DAD H");
+                            }
+                            self.mark(dst, PhysReg::HL);
+                            return;
+                        }
+                        3 => {
+                            self.ensure_hl(var);
+                            self.emit_inst("MOV D,H");
+                            self.emit_inst("MOV E,L");
+                            self.emit_inst("DAD H");
+                            self.emit_inst("DAD D");
+                            self.mark(dst, PhysReg::HL);
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
                 self.spill_live_before_call("__mul16");
                 self.ensure_de(rhs);
                 self.ensure_hl(lhs);
@@ -872,6 +936,11 @@ impl CodeGenerator {
     fn gen_div(&mut self, dst: VReg, lhs: VReg, rhs: VReg, width: Width, signed: bool) {
         match width {
             Width::W8 => {
+                if !signed && self.known_imm(rhs) == Some(1) {
+                    self.ensure_a(lhs);
+                    self.mark(dst, PhysReg::A);
+                    return;
+                }
                 let helper = if signed { "__div16s" } else { "__div16u" };
                 self.spill_live_before_call(helper);
                 self.ensure_de(rhs);
@@ -881,6 +950,11 @@ impl CodeGenerator {
                 self.mark(dst, PhysReg::A);
             }
             Width::W16 => {
+                if !signed && self.known_imm(rhs) == Some(1) {
+                    self.ensure_hl(lhs);
+                    self.mark(dst, PhysReg::HL);
+                    return;
+                }
                 let helper = if signed { "__div16s" } else { "__div16u" };
                 self.spill_live_before_call(helper);
                 self.ensure_de(rhs);
@@ -907,6 +981,19 @@ impl CodeGenerator {
     fn gen_mod(&mut self, dst: VReg, lhs: VReg, rhs: VReg, width: Width, signed: bool) {
         match width {
             Width::W8 => {
+                if !signed {
+                    if self.known_imm(rhs) == Some(1) {
+                        self.emit_inst("MVI A,0");
+                        self.mark(dst, PhysReg::A);
+                        return;
+                    }
+                    if self.known_imm(rhs) == Some(2) {
+                        self.ensure_a(lhs);
+                        self.emit_inst("ANI 1");
+                        self.mark(dst, PhysReg::A);
+                        return;
+                    }
+                }
                 let helper = if signed { "__mod16s" } else { "__mod16u" };
                 self.spill_live_before_call(helper);
                 self.ensure_de(rhs);
@@ -916,6 +1003,22 @@ impl CodeGenerator {
                 self.mark(dst, PhysReg::A);
             }
             Width::W16 => {
+                if !signed {
+                    if self.known_imm(rhs) == Some(1) {
+                        self.emit_inst("LXI H,0");
+                        self.mark(dst, PhysReg::HL);
+                        return;
+                    }
+                    if self.known_imm(rhs) == Some(2) {
+                        self.ensure_hl(lhs);
+                        self.emit_inst("MOV A,L");
+                        self.emit_inst("ANI 1");
+                        self.emit_inst("MOV L,A");
+                        self.emit_inst("MVI H,0");
+                        self.mark(dst, PhysReg::HL);
+                        return;
+                    }
+                }
                 let helper = if signed { "__mod16s" } else { "__mod16u" };
                 self.spill_live_before_call(helper);
                 self.ensure_de(rhs);
@@ -1009,6 +1112,34 @@ impl CodeGenerator {
                 self.mark(dst, PhysReg::A);
             }
             Width::W16 => {
+                if let Some(raw) = self.known_imm(rhs) {
+                    let count = (raw & 0x1f) as u32;
+                    if count == 0 {
+                        self.ensure_hl(lhs);
+                        self.mark(dst, PhysReg::HL);
+                        return;
+                    }
+                    if !is_right && count <= 3 {
+                        self.ensure_hl(lhs);
+                        for _ in 0..count {
+                            self.emit_inst("DAD H");
+                        }
+                        self.mark(dst, PhysReg::HL);
+                        return;
+                    }
+                    if is_right && !arithmetic && count == 1 {
+                        self.ensure_hl(lhs);
+                        self.emit_inst("MOV A,H");
+                        self.emit_inst("ORA A");
+                        self.emit_inst("RAR");
+                        self.emit_inst("MOV H,A");
+                        self.emit_inst("MOV A,L");
+                        self.emit_inst("RAR");
+                        self.emit_inst("MOV L,A");
+                        self.mark(dst, PhysReg::HL);
+                        return;
+                    }
+                }
                 // Use runtime helpers: shift count in B, value in HL
                 let helper = if is_right {
                     if arithmetic {

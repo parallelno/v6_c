@@ -391,7 +391,14 @@ mod tests {
         "#;
         let out = compile_source(src, "test.c", &[]).expect("compilation failed");
         assert!(has_line(&out, "compute:"), "must have compute function");
-        assert!(has_line(&out, "CALL compute"), "must call compute");
+        let calls_compute = has_line(&out, "CALL compute");
+        let calls_specialized_compute = out
+            .iter()
+            .any(|l| l.contains("CALL __spec_compute"));
+        assert!(
+            calls_compute || calls_specialized_compute,
+            "must call compute or a specialized compute clone"
+        );
     }
 
     #[test]
@@ -757,9 +764,16 @@ mod tests {
         "#;
         let out = compile_source(src, "test.c", &[]).expect("compilation failed");
         // Should have JMP heavy instead of CALL heavy / RET.
+        let has_direct_tail_jmp = has_line(&out, "JMP heavy");
+        let has_specialized_tail_jmp = out
+            .iter()
+            .any(|l| l.contains("JMP __spec_heavy"));
+        let has_any_heavy_call = out.iter().any(|l| {
+            l.contains("CALL heavy") || l.contains("CALL __spec_heavy")
+        });
         assert!(
-            has_line(&out, "JMP heavy"),
-            "tail call should be optimized to JMP"
+            has_direct_tail_jmp || has_specialized_tail_jmp || !has_any_heavy_call,
+            "tail call should be optimized to JMP or eliminated"
         );
     }
 

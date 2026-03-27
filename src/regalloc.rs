@@ -240,8 +240,18 @@ impl RegAllocator {
                 return ops;
             }
             // Evict whoever is in target.
-            if let Some(spill_op) = self.spill(target) {
-                ops.push(spill_op);
+            if let Some(displaced_id) = self.occupant(target) {
+                if let Some(alt) = self.find_free_alternate(target) {
+                    self.reg_contents.insert(target, None);
+                    self.reg_contents.insert(alt, Some(displaced_id));
+                    self.vreg_map.insert(displaced_id, Location::Reg(alt));
+                    ops.push(MoveOp::RegToReg {
+                        src: target,
+                        dst: alt,
+                    });
+                } else if let Some(spill_op) = self.spill(target) {
+                    ops.push(spill_op);
+                }
             }
             // Move vreg from current → target.
             self.reg_contents.insert(current, None);
@@ -255,8 +265,18 @@ impl RegAllocator {
         }
 
         // Vreg is in memory — evict target, then reload.
-        if let Some(spill_op) = self.spill(target) {
-            ops.push(spill_op);
+        if let Some(displaced_id) = self.occupant(target) {
+            if let Some(alt) = self.find_free_alternate(target) {
+                self.reg_contents.insert(target, None);
+                self.reg_contents.insert(alt, Some(displaced_id));
+                self.vreg_map.insert(displaced_id, Location::Reg(alt));
+                ops.push(MoveOp::RegToReg {
+                    src: target,
+                    dst: alt,
+                });
+            } else if let Some(spill_op) = self.spill(target) {
+                ops.push(spill_op);
+            }
         }
 
         if let Some(Location::Memory(label)) = self.vreg_map.get(&vreg.id).cloned() {
@@ -313,6 +333,12 @@ impl RegAllocator {
         let ops = self.mark_allocated(vreg, reg);
         self.remat_imm.insert(vreg.id, value);
         ops
+    }
+
+    /// Return the tracked immediate value for a vreg when rematerialization
+    /// is available.
+    pub fn immediate_of(&self, vreg: VReg) -> Option<i64> {
+        self.remat_imm.get(&vreg.id).copied()
     }
 
     /// Save all live registers to memory (e.g. before a CALL).
@@ -380,6 +406,17 @@ impl RegAllocator {
         self.reg_contents.insert(reg, Some(vreg.id));
         self.vreg_map.insert(vreg.id, Location::Reg(reg));
         (reg, ops)
+    }
+
+    fn find_free_alternate(&self, target: PhysReg) -> Option<PhysReg> {
+        match target.width() {
+            Width::W8 => None,
+            Width::W16 => PhysReg::PAIR_PREF
+                .iter()
+                .copied()
+                .find(|r| *r != target && self.is_free(*r)),
+            Width::W32 => None,
+        }
     }
 }
 
@@ -486,14 +523,16 @@ mod tests {
         let mut ra = RegAllocator::new();
         ra.allocate(v16(0)); // HL
         ra.allocate(v16(1)); // DE
-        // Move vreg 1 to HL — should spill vreg 0 first.
+        // Move vreg 1 to HL — relocate vreg 0 to BC first.
         let ops = ra.ensure_in_reg(v16(1), PhysReg::HL);
         assert_eq!(ops.len(), 2);
-        // First op: spill vreg 0 from HL.
-        match &ops[0] {
-            MoveOp::Spill { src, .. } => assert_eq!(*src, PhysReg::HL),
-            other => panic!("expected Spill, got {:?}", other),
-        }
+        assert_eq!(
+            ops[0],
+            MoveOp::RegToReg {
+                src: PhysReg::HL,
+                dst: PhysReg::BC,
+            }
+        );
         // Second op: move vreg 1 from DE to HL.
         assert_eq!(
             ops[1],
