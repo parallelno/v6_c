@@ -2,10 +2,12 @@
 //!
 //! Writes the final `.asm` file for the **v6asm** assembler targeting
 //! the Vector 06 computer.  The emitter prepends the standard header
-//! (`ORG`, entry-point jump) and appends a runtime-library section
-//! marker after the code-generator output.
+//! (`ORG`, entry-point jump, CRT0 startup) and appends the runtime
+//! library routines that are actually referenced by the generated code.
 
 use std::io::Write;
+
+use crate::runtime;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -17,10 +19,10 @@ use std::io::Write;
 ///
 /// 1. A header comment identifying the compiler.
 /// 2. `ORG 0x100` – the standard Vector 06 load address.
-/// 3. `JMP main` – entry-point jump.
-/// 4. All assembly lines produced by the code generator / peephole optimizer.
-/// 5. A runtime-library section marker (the actual runtime is linked
-///    separately).
+/// 3. `JMP _start` – jump to runtime startup.
+/// 4. CRT0   – stack init, call to main, HLT.
+/// 5. All assembly lines produced by the code generator / peephole optimizer.
+/// 6. Referenced runtime library routines (auto-detected from CALL/JMP).
 pub fn emit_asm(code_lines: &[String], output_path: &str) -> std::io::Result<()> {
     let mut f = std::fs::File::create(output_path)?;
 
@@ -32,8 +34,19 @@ pub fn emit_asm(code_lines: &[String], output_path: &str) -> std::io::Result<()>
     writeln!(f, "\tORG 0x100")?;
     writeln!(f)?;
 
-    // Entry point
-    writeln!(f, "\tJMP main")?;
+    // Entry point — jump to CRT0 startup
+    writeln!(f, "\tJMP _start")?;
+    writeln!(f)?;
+
+    // CRT0 startup code
+    writeln!(f, "; --- crt0 startup ---")?;
+    for line in runtime::crt0_asm().lines() {
+        // Skip comment-only header lines already in the source
+        if line.starts_with(';') && !line.contains("_start") {
+            continue;
+        }
+        writeln!(f, "{}", line)?;
+    }
     writeln!(f)?;
 
     // Code from the code generator
@@ -41,10 +54,13 @@ pub fn emit_asm(code_lines: &[String], output_path: &str) -> std::io::Result<()>
         writeln!(f, "{}", line)?;
     }
 
-    // Runtime library marker
+    // Runtime library — include only the modules that are referenced
     writeln!(f)?;
     writeln!(f, "; --- runtime library ---")?;
-    writeln!(f, "; (linked separately)")?;
+    let rt = runtime::collect_runtime(code_lines);
+    if !rt.is_empty() {
+        write!(f, "{}", rt)?;
+    }
 
     Ok(())
 }
@@ -80,7 +96,16 @@ mod tests {
     #[test]
     fn entry_point_jump() {
         let out = emit_and_read(&[]);
-        assert!(out.contains("\tJMP main"));
+        assert!(out.contains("\tJMP _start"));
+    }
+
+    #[test]
+    fn crt0_startup_present() {
+        let out = emit_and_read(&[]);
+        assert!(out.contains("_start:"));
+        assert!(out.contains("LXI SP"));
+        assert!(out.contains("CALL main"));
+        assert!(out.contains("HLT"));
     }
 
     #[test]
@@ -103,12 +128,23 @@ mod tests {
     }
 
     #[test]
+    fn runtime_included_when_needed() {
+        let lines = vec![
+            "main:".to_string(),
+            "\tCALL __mul16".to_string(),
+            "\tRET".to_string(),
+        ];
+        let out = emit_and_read(&lines);
+        assert!(out.contains("__mul16:"), "runtime __mul16 should be included");
+    }
+
+    #[test]
     fn order_is_correct() {
         let lines = vec!["\tNOP".to_string()];
         let out = emit_and_read(&lines);
 
         let org_pos = out.find("\tORG 0x100").unwrap();
-        let jmp_pos = out.find("\tJMP main").unwrap();
+        let jmp_pos = out.find("\tJMP _start").unwrap();
         let nop_pos = out.find("\tNOP").unwrap();
         let rt_pos = out.find("; --- runtime library ---").unwrap();
 

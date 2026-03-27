@@ -1,17 +1,25 @@
 ; memcpy.asm — memory operations for Intel 8080
 ;
-; Minimal implementations for the C standard library.
-; The v6c codegen does not call these directly in Phase 1
-; but they are part of the runtime library for user programs.
-;
+; C calling convention: arg0 in HL, arg1 in DE, arg2+ on stack.
+; Return value in HL (16-bit).
 ; Clobbers: A, B, C, D, E, H, L, flags
 
 ; ---------------------------------------------------------------------------
-; memcpy — copy BC bytes from (DE) to (HL)
-;   Entry: HL = dest, DE = src, BC = count
-;   Exit:  HL = original dest
+; memcpy — copy n bytes from src to dest
+;   C: void *memcpy(void *dest, void *src, unsigned int n)
+;   Entry: HL = dest, DE = src, n at [SP+2]
+;   Exit:  HL = dest
 ; ---------------------------------------------------------------------------
 memcpy:
+	; Read n from stack
+	PUSH H			; save dest
+	LXI H,4		; 2(push) + 2(ret_addr)
+	DAD SP
+	MOV C,M
+	INX H
+	MOV B,M			; BC = n
+	POP H			; HL = dest
+
 	MOV A,B
 	ORA C
 	RZ			; count == 0 → done
@@ -29,35 +37,42 @@ __memcpy_loop:
 	RET
 
 ; ---------------------------------------------------------------------------
-; memset — fill BC bytes at (HL) with value A
-;   Entry: HL = dest, A = value, BC = count
-;   Exit:  HL = original dest
+; memset — fill n bytes at dest with value c
+;   C: void *memset(void *dest, int c, unsigned int n)
+;   Entry: HL = dest, DE = c (low byte E), n at [SP+2]
+;   Exit:  HL = dest
 ; ---------------------------------------------------------------------------
 memset:
-	PUSH H			; save dest for return
-	PUSH PSW		; save fill value
+	; Read n from stack
+	PUSH H			; save dest
+	LXI H,4		; 2(push) + 2(ret_addr)
+	DAD SP
+	MOV C,M
+	INX H
+	MOV B,M			; BC = n
+	POP H			; HL = dest
+
 	MOV A,B
 	ORA C
-	JZ __memset_done
-	POP PSW
-	PUSH PSW
+	RZ			; n == 0 → done
+	PUSH H			; save dest for return
+	MOV A,E			; A = fill value (low byte of c)
 __memset_loop:
 	MOV M,A
 	INX H
 	DCX B
-	MOV D,A			; preserve fill value (B may change)
+	PUSH PSW		; save A (fill value)
 	MOV A,B
 	ORA C
-	MOV A,D
+	POP PSW			; restore A
 	JNZ __memset_loop
-__memset_done:
-	POP PSW			; discard saved value
 	POP H			; return original dest
 	RET
 
 ; ---------------------------------------------------------------------------
-; strlen — return length of null-terminated string at (HL)
-;   Entry: HL = string pointer
+; strlen — return length of null-terminated string
+;   C: unsigned int strlen(char *s)
+;   Entry: HL = s
 ;   Exit:  HL = length (16-bit)
 ; ---------------------------------------------------------------------------
 strlen:
@@ -76,6 +91,7 @@ __strlen_done:
 
 ; ---------------------------------------------------------------------------
 ; strcmp — compare two null-terminated strings
+;   C: int strcmp(char *s1, char *s2)
 ;   Entry: HL = s1, DE = s2
 ;   Exit:  HL = <0 if s1<s2, 0 if equal, >0 if s1>s2
 ; ---------------------------------------------------------------------------

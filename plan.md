@@ -282,11 +282,11 @@ Each routine is hand‑optimized for the 8080 instruction set. The multiply/divi
 
 **Goal:** Usable for real‑world Vector 06 programs.
 
-- [ ] **4.1 Full string.h** — All standard string functions in assembly.
-- [ ] **4.2 stdio.h subset** — `printf` (integer formats), `puts`, `getchar`, `putchar`.
-- [ ] **4.3 stdlib.h subset** — `malloc`/`free`, `atoi`, `abs`, `rand`.
-- [ ] **4.4 Vector 06 target support** — Binary output (ORG `0x100`). Vector 06‑specific I/O stubs (keyboard, display).
-- [ ] **4.5 Linker integration** — Support multi‑file compilation; resolve extern symbols across translation units.
+- [x] **4.1 Full string.h** — All standard string functions in assembly.
+- [x] **4.2 stdio.h subset** — `printf` (integer formats), `puts`, `getchar`, `putchar`.
+- [x] **4.3 stdlib.h subset** — `malloc`/`free`, `atoi`, `abs`, `rand`.
+- [x] **4.4 Vector 06 target support** — Binary output (ORG `0x100`). Vector 06‑specific I/O stubs (keyboard, display).
+- [x] **4.5 Linker integration** — Support multi‑file compilation; resolve extern symbols across translation units.
 
 ### Phase 5 — Advanced Optimizations
 

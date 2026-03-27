@@ -609,10 +609,19 @@ impl<'t> Parser<'t> {
         }
 
         loop {
+            // Accept `...` (variadic) at the end of the parameter list
+            if self.eat(&TokenKind::Ellipsis) {
+                break;
+            }
             if let Some(param) = self.parse_param() {
                 params.push(param);
             }
             if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+            // Check for `...` after the comma
+            if self.check(&TokenKind::Ellipsis) {
+                self.advance();
                 break;
             }
         }

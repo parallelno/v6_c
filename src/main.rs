@@ -10,23 +10,37 @@ mod parser;
 mod peephole;
 mod preproc;
 mod regalloc;
+mod runtime;
 mod types;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    let (input_path, output_path) = match parse_args(&args) {
-        Ok(paths) => paths,
+    let opts = match parse_args(&args) {
+        Ok(o) => o,
         Err(msg) => {
             eprintln!("v6c: {}", msg);
             std::process::exit(1);
         }
     };
 
-    if let Err(e) = compile(&input_path, &output_path) {
+    if let Err(e) = compile(&opts) {
         eprintln!("v6c: {}", e);
         std::process::exit(1);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Compiler options
+// ---------------------------------------------------------------------------
+
+struct CompilerOpts {
+    /// Input source files.
+    inputs: Vec<String>,
+    /// Output assembly file.
+    output: String,
+    /// Additional include search paths (`-I`).
+    include_paths: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -34,16 +48,18 @@ fn main() {
 // ---------------------------------------------------------------------------
 
 fn print_usage() {
-    eprintln!("Usage: v6c <input.c> [-o <output.asm>]");
+    eprintln!("Usage: v6c <input.c> [input2.c ...] [-o <output.asm>] [-I <path>]");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  -o <file>   Output file path (default: input with .asm extension)");
+    eprintln!("  -o <file>   Output file path (default: first input with .asm extension)");
+    eprintln!("  -I <path>   Add include search path");
     eprintln!("  -h, --help  Show this help message");
 }
 
-fn parse_args(args: &[String]) -> Result<(String, String), String> {
-    let mut input: Option<String> = None;
+fn parse_args(args: &[String]) -> Result<CompilerOpts, String> {
+    let mut inputs: Vec<String> = Vec::new();
     let mut output: Option<String> = None;
+    let mut include_paths: Vec<String> = Vec::new();
 
     let mut i = 1; // skip program name
     while i < args.len() {
@@ -59,49 +75,196 @@ fn parse_args(args: &[String]) -> Result<(String, String), String> {
                 }
                 output = Some(args[i].clone());
             }
+            "-I" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("-I requires an argument".into());
+                }
+                include_paths.push(args[i].clone());
+            }
+            arg if arg.starts_with("-I") => {
+                // Support -Ipath (no space)
+                include_paths.push(arg[2..].to_string());
+            }
             arg if arg.starts_with('-') => {
                 return Err(format!("unknown option: {}", arg));
             }
             _ => {
-                if input.is_some() {
-                    return Err("multiple input files not supported".into());
-                }
-                input = Some(args[i].clone());
+                inputs.push(args[i].clone());
             }
         }
         i += 1;
     }
 
-    let input_path = input.ok_or("no input file specified")?;
+    if inputs.is_empty() {
+        return Err("no input file specified".into());
+    }
 
     let output_path = output.unwrap_or_else(|| {
-        if let Some(stem) = input_path.strip_suffix(".c") {
+        let first = &inputs[0];
+        if let Some(stem) = first.strip_suffix(".c") {
             format!("{}.asm", stem)
         } else {
-            format!("{}.asm", input_path)
+            format!("{}.asm", first)
         }
     });
 
-    Ok((input_path, output_path))
+    Ok(CompilerOpts {
+        inputs,
+        output: output_path,
+        include_paths,
+    })
 }
 
 // ---------------------------------------------------------------------------
 // Compilation pipeline
 // ---------------------------------------------------------------------------
 
-fn compile(input_path: &str, output_path: &str) -> Result<(), String> {
-    let source = std::fs::read_to_string(input_path)
-        .map_err(|e| format!("{}: {}", input_path, e))?;
-    let optimized = compile_source(&source, input_path)?;
-    emit::emit_asm(&optimized, output_path)
-        .map_err(|e| format!("{}: {}", output_path, e))?;
+/// Detect the `include/` directory bundled with the compiler.
+fn find_system_include_dir() -> Option<String> {
+    // Try relative to the executable
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let include = dir.join("include");
+            if include.is_dir() {
+                return Some(include.to_string_lossy().into_owned());
+            }
+            // Also try one level up (for cargo build layouts)
+            if let Some(parent) = dir.parent() {
+                let include = parent.join("include");
+                if include.is_dir() {
+                    return Some(include.to_string_lossy().into_owned());
+                }
+                // Two levels up
+                if let Some(grandparent) = parent.parent() {
+                    let include = grandparent.join("include");
+                    if include.is_dir() {
+                        return Some(include.to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
+    }
+    // Try relative to working directory
+    let cwd_include = std::path::Path::new("include");
+    if cwd_include.is_dir() {
+        return Some("include".to_string());
+    }
+    None
+}
+
+fn compile(opts: &CompilerOpts) -> Result<(), String> {
+    if opts.inputs.len() == 1 {
+        // Single-file mode (most common)
+        let source = std::fs::read_to_string(&opts.inputs[0])
+            .map_err(|e| format!("{}: {}", opts.inputs[0], e))?;
+        let optimized = compile_source(&source, &opts.inputs[0], &opts.include_paths)?;
+        emit::emit_asm(&optimized, &opts.output)
+            .map_err(|e| format!("{}: {}", opts.output, e))?;
+    } else {
+        // Multi-file mode: parse each file into IR separately, merge, then
+        // run optimization and codegen on the merged program.
+        let optimized = compile_multi(&opts.inputs, &opts.include_paths)?;
+        emit::emit_asm(&optimized, &opts.output)
+            .map_err(|e| format!("{}: {}", opts.output, e))?;
+    }
     Ok(())
 }
 
+/// Multi-file compilation: preprocess/parse/lower each file to IR, merge,
+/// then optimize/analyze/codegen the combined program.
+fn compile_multi(inputs: &[String], include_paths: &[String]) -> Result<Vec<String>, String> {
+    let mut merged = ir::IrProgram::new();
+
+    for path in inputs {
+        let source = std::fs::read_to_string(path)
+            .map_err(|e| format!("{}: {}", path, e))?;
+
+        let mut pp = preproc::Preprocessor::new();
+        // Set up include paths
+        if let Some(sys) = find_system_include_dir() {
+            pp.add_system_include_path(&sys);
+        }
+        for ip in include_paths {
+            pp.add_include_path(ip);
+        }
+
+        let processed = pp
+            .preprocess(&source, path)
+            .map_err(|e| format!("{}: preprocessor: {}", path, e.message))?;
+
+        let tokens = lexer::tokenize(&processed)
+            .map_err(|e| format!("{}:{}:{}: {}", path, e.line, e.column, e.message))?;
+
+        let program = parser::Parser::new(&tokens)
+            .parse()
+            .map_err(|errs| {
+                errs.iter()
+                    .map(|e| format!("{}:{}:{}: {}", path, e.line, e.column, e.message))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })?;
+
+        let ir_program = ir_gen::generate(&program).map_err(|errs| {
+            errs.iter()
+                .map(|e| format!("{}:{}: {}", path, e.line, e.message))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })?;
+
+        // Merge: append globals, functions, strings (avoiding duplicates)
+        merge_ir(&mut merged, ir_program);
+    }
+
+    // Optimize the merged program
+    ir_opt::optimize(&mut merged);
+
+    // Call-graph analysis on the whole program
+    let analysis = callgraph::analyze(&merged, None);
+
+    // Code generation
+    let code_lines = codegen::generate(&merged, &analysis);
+
+    // Peephole optimization
+    Ok(peephole::peephole_optimize(code_lines))
+}
+
+/// Merge `src` into `dst`, skipping duplicate globals/functions.
+fn merge_ir(dst: &mut ir::IrProgram, src: ir::IrProgram) {
+    // Merge globals (skip duplicates by name)
+    let existing_globals: std::collections::HashSet<String> =
+        dst.globals.iter().map(|g| g.name.clone()).collect();
+    for g in src.globals {
+        if !existing_globals.contains(&g.name) {
+            dst.globals.push(g);
+        }
+    }
+
+    // Merge functions (skip duplicates by name — first definition wins)
+    let existing_funcs: std::collections::HashSet<String> =
+        dst.functions.iter().map(|f| f.name.clone()).collect();
+    for f in src.functions {
+        if !existing_funcs.contains(&f.name) {
+            dst.functions.push(f);
+        }
+    }
+
+    // Merge string literals (always append; label uniqueness is guaranteed
+    // by the per-file counter prefix)
+    dst.strings.extend(src.strings);
+}
+
 /// Compile C source text through the full pipeline, returning assembly lines.
-fn compile_source(source: &str, filename: &str) -> Result<Vec<String>, String> {
+fn compile_source(source: &str, filename: &str, include_paths: &[String]) -> Result<Vec<String>, String> {
     // 1. Preprocessor
     let mut pp = preproc::Preprocessor::new();
+    if let Some(sys) = find_system_include_dir() {
+        pp.add_system_include_path(&sys);
+    }
+    for ip in include_paths {
+        pp.add_include_path(ip);
+    }
+
     let processed = pp
         .preprocess(source, filename)
         .map_err(|e| format!("preprocessor error: {}", e.message))?;
@@ -156,7 +319,7 @@ mod tests {
     #[test]
     fn pipeline_return_constant() {
         let src = "int main(void) { return 42; }";
-        let out = compile_source(src, "test.c").expect("compilation failed");
+        let out = compile_source(src, "test.c", &[]).expect("compilation failed");
         assert!(has_line(&out, "main:"), "must have main label");
         assert!(has_line(&out, "RET"), "must have RET");
     }
@@ -164,7 +327,7 @@ mod tests {
     #[test]
     fn pipeline_global_variable() {
         let src = "int x; void main(void) { x = 10; }";
-        let out = compile_source(src, "test.c").expect("compilation failed");
+        let out = compile_source(src, "test.c", &[]).expect("compilation failed");
         assert!(has_line(&out, "main:"));
         assert!(has_line(&out, "_g_x"));
     }
@@ -175,7 +338,7 @@ mod tests {
             int add(int a, int b) { return a + b; }
             void main(void) { int r; r = add(3, 4); }
         "#;
-        let out = compile_source(src, "test.c").expect("compilation failed");
+        let out = compile_source(src, "test.c", &[]).expect("compilation failed");
         assert!(has_line(&out, "add:"), "must have add function");
         assert!(has_line(&out, "CALL add"), "must call add");
     }
@@ -194,7 +357,7 @@ mod tests {
                 }
             }
         "#;
-        let out = compile_source(src, "test.c").expect("compilation failed");
+        let out = compile_source(src, "test.c", &[]).expect("compilation failed");
         assert!(has_line(&out, "main:"));
         // Must have at least one conditional jump (loop condition)
         let has_jump = out.iter().any(|l| {
@@ -217,7 +380,7 @@ mod tests {
                 }
             }
         "#;
-        let out = compile_source(src, "test.c").expect("compilation failed");
+        let out = compile_source(src, "test.c", &[]).expect("compilation failed");
         assert!(has_line(&out, "main:"));
     }
 
@@ -233,7 +396,7 @@ mod tests {
                 }
             }
         "#;
-        let out = compile_source(src, "test.c").expect("compilation failed");
+        let out = compile_source(src, "test.c", &[]).expect("compilation failed");
         assert!(has_line(&out, "main:"));
     }
 
@@ -247,14 +410,14 @@ mod tests {
                 result = a * b;
             }
         "#;
-        let out = compile_source(src, "test.c").expect("compilation failed");
+        let out = compile_source(src, "test.c", &[]).expect("compilation failed");
         assert!(has_line(&out, "CALL __mul16"), "multiply must call __mul16");
     }
 
     #[test]
     fn pipeline_data_section_present() {
         let src = "int x; void main(void) { x = 1; }";
-        let out = compile_source(src, "test.c").expect("compilation failed");
+        let out = compile_source(src, "test.c", &[]).expect("compilation failed");
         assert!(has_line(&out, "; --- data section ---"));
     }
 
@@ -268,7 +431,7 @@ mod tests {
                 *p = 42;
             }
         "#;
-        let out = compile_source(src, "test.c").expect("compilation failed");
+        let out = compile_source(src, "test.c", &[]).expect("compilation failed");
         assert!(has_line(&out, "main:"));
     }
 
@@ -280,19 +443,20 @@ mod tests {
                 ch = 'A';
             }
         "#;
-        let out = compile_source(src, "test.c").expect("compilation failed");
+        let out = compile_source(src, "test.c", &[]).expect("compilation failed");
         assert!(has_line(&out, "main:"));
     }
 
     #[test]
     fn emit_produces_valid_file() {
         let src = "void main(void) { return; }";
-        let out = compile_source(src, "test.c").expect("compilation failed");
-        let path = "/tmp/v6c_test_emit.asm";
+        let out = compile_source(src, "test.c", &[]).expect("compilation failed");
+        let path = std::env::temp_dir().join("v6c_test_emit.asm");
+        let path = path.to_str().unwrap();
         emit::emit_asm(&out, path).expect("emit failed");
         let contents = std::fs::read_to_string(path).expect("read failed");
         assert!(contents.contains("ORG 0x100"));
-        assert!(contents.contains("JMP main"));
+        assert!(contents.contains("JMP _start"));
         let _ = std::fs::remove_file(path);
     }
 
@@ -318,7 +482,7 @@ mod tests {
                 result = 6 * 7;
             }
         "#;
-        let out = compile_source(src, "test.c").expect("compilation failed");
+        let out = compile_source(src, "test.c", &[]).expect("compilation failed");
         assert!(
             !has_line(&out, "CALL __mul16"),
             "constant multiply should be folded, not call __mul16"
@@ -340,7 +504,7 @@ mod tests {
                 result = 2 * 3 + 1;
             }
         "#;
-        let out = compile_source(src, "test.c").expect("compilation failed");
+        let out = compile_source(src, "test.c", &[]).expect("compilation failed");
         // Should fold to constant 7, no runtime multiply needed.
         assert!(
             !has_line(&out, "CALL __mul16"),
@@ -362,7 +526,7 @@ mod tests {
                 result = x * 4;
             }
         "#;
-        let out = compile_source(src, "test.c").expect("compilation failed");
+        let out = compile_source(src, "test.c", &[]).expect("compilation failed");
         // Should use shift instead of multiply.
         assert!(
             !has_line(&out, "CALL __mul16"),
@@ -380,7 +544,7 @@ mod tests {
                 result = x / 8;
             }
         "#;
-        let out = compile_source(src, "test.c").expect("compilation failed");
+        let out = compile_source(src, "test.c", &[]).expect("compilation failed");
         assert!(
             !has_line(&out, "CALL __div16u"),
             "unsigned divide by 8 should be strength-reduced to shift"
@@ -397,7 +561,7 @@ mod tests {
                 result = x % 16;
             }
         "#;
-        let out = compile_source(src, "test.c").expect("compilation failed");
+        let out = compile_source(src, "test.c", &[]).expect("compilation failed");
         assert!(
             !has_line(&out, "CALL __mod16u"),
             "unsigned modulo 16 should be strength-reduced to AND mask"
@@ -415,7 +579,7 @@ mod tests {
                 result = 1;
             }
         "#;
-        let out = compile_source(src, "test.c").expect("compilation failed");
+        let out = compile_source(src, "test.c", &[]).expect("compilation failed");
         assert!(has_line(&out, "main:"));
         // The dead store to `unused` may or may not be eliminated depending
         // on the IR optimization, but the code should still compile correctly.
@@ -428,7 +592,7 @@ mod tests {
             void helper(void) { return; }
             void main(void) { helper(); }
         "#;
-        let out = compile_source(src, "test.c").expect("compilation failed");
+        let out = compile_source(src, "test.c", &[]).expect("compilation failed");
         // Should have JMP helper instead of CALL helper / RET.
         assert!(
             has_line(&out, "JMP helper"),
@@ -467,7 +631,7 @@ mod tests {
                 }
             }
         "#;
-        let out = compile_source(src, "test.c")
+        let out = compile_source(src, "test.c", &[])
             .expect("sieve compilation failed");
         assert!(has_line(&out, "main:"), "sieve must have main");
         let inst_count = count_instructions(&out);
@@ -487,7 +651,7 @@ mod tests {
                 result = 10 + 20 + 30;
             }
         "#;
-        let out = compile_source(src, "test.c").expect("compilation failed");
+        let out = compile_source(src, "test.c", &[]).expect("compilation failed");
         let inst_count = count_instructions(&out);
         // With folding: 10 + 20 + 30 = 60, should be just LXI + SHLD + RET.
         assert!(
@@ -509,7 +673,7 @@ mod tests {
                 x = b;
             }
         "#;
-        let out = compile_source(src, "test.c").expect("compilation failed");
+        let out = compile_source(src, "test.c", &[]).expect("compilation failed");
         for line in &out {
             let trimmed = line.trim();
             if trimmed.starts_with("MOV") {
@@ -534,7 +698,7 @@ mod tests {
                 x = 42;
             }
         "#;
-        let out = compile_source(src, "test.c").expect("compilation failed");
+        let out = compile_source(src, "test.c", &[]).expect("compilation failed");
         assert!(
             !has_line(&out, "\tNOP"),
             "peephole should eliminate all NOPs"
@@ -559,7 +723,7 @@ mod tests {
                 }
             }
         "#;
-        let out = compile_source(src, "test.c").expect("compilation failed");
+        let out = compile_source(src, "test.c", &[]).expect("compilation failed");
         assert!(has_line(&out, "main:"));
         let inst_count = count_instructions(&out);
         assert!(
@@ -588,7 +752,7 @@ mod tests {
                 result = p.x + p.y;
             }
         "#;
-        let out = compile_source(src, "test.c").expect("struct compilation failed");
+        let out = compile_source(src, "test.c", &[]).expect("struct compilation failed");
         assert!(has_line(&out, "main:"));
     }
 
@@ -610,7 +774,7 @@ mod tests {
                 result = p.x + p.y;
             }
         "#;
-        let out = compile_source(src, "test.c").expect("struct-pointer compilation failed");
+        let out = compile_source(src, "test.c", &[]).expect("struct-pointer compilation failed");
         assert!(has_line(&out, "main:"));
         assert!(has_line(&out, "set:"));
     }
@@ -628,7 +792,7 @@ mod tests {
                 }
             }
         "#;
-        let out = compile_source(src, "test.c").expect("enum compilation failed");
+        let out = compile_source(src, "test.c", &[]).expect("enum compilation failed");
         assert!(has_line(&out, "main:"));
     }
 
@@ -641,7 +805,7 @@ mod tests {
                 result = BUSY;
             }
         "#;
-        let out = compile_source(src, "test.c").expect("enum explicit values failed");
+        let out = compile_source(src, "test.c", &[]).expect("enum explicit values failed");
         assert!(has_line(&out, "main:"));
     }
 
@@ -656,7 +820,7 @@ mod tests {
                 x = y + 5;
             }
         "#;
-        let out = compile_source(src, "test.c").expect("typedef compilation failed");
+        let out = compile_source(src, "test.c", &[]).expect("typedef compilation failed");
         assert!(has_line(&out, "main:"));
     }
 
@@ -683,7 +847,7 @@ mod tests {
                 }
             }
         "#;
-        let out = compile_source(src, "test.c").expect("switch compilation failed");
+        let out = compile_source(src, "test.c", &[]).expect("switch compilation failed");
         assert!(has_line(&out, "main:"));
     }
 
@@ -701,7 +865,7 @@ mod tests {
                 }
             }
         "#;
-        let out = compile_source(src, "test.c").expect("switch default-only failed");
+        let out = compile_source(src, "test.c", &[]).expect("switch default-only failed");
         assert!(has_line(&out, "main:"));
     }
 
@@ -719,7 +883,7 @@ mod tests {
                 result = d.c;
             }
         "#;
-        let out = compile_source(src, "test.c").expect("union compilation failed");
+        let out = compile_source(src, "test.c", &[]).expect("union compilation failed");
         assert!(has_line(&out, "main:"));
     }
 
@@ -732,7 +896,7 @@ mod tests {
                 result = arr[1];
             }
         "#;
-        let out = compile_source(src, "test.c").expect("array initializer failed");
+        let out = compile_source(src, "test.c", &[]).expect("array initializer failed");
         assert!(has_line(&out, "main:"));
     }
 
@@ -748,7 +912,7 @@ mod tests {
                 result = sizeof(struct pair);
             }
         "#;
-        let out = compile_source(src, "test.c").expect("sizeof struct failed");
+        let out = compile_source(src, "test.c", &[]).expect("sizeof struct failed");
         assert!(has_line(&out, "main:"));
     }
 
@@ -767,7 +931,7 @@ mod tests {
                 result = p.x + p.y;
             }
         "#;
-        let out = compile_source(src, "test.c").expect("typedef struct failed");
+        let out = compile_source(src, "test.c", &[]).expect("typedef struct failed");
         assert!(has_line(&out, "main:"));
     }
 
@@ -787,7 +951,7 @@ mod tests {
                 }
             }
         "#;
-        let out = compile_source(src, "test.c").expect("switch with enum failed");
+        let out = compile_source(src, "test.c", &[]).expect("switch with enum failed");
         assert!(has_line(&out, "main:"));
     }
 }

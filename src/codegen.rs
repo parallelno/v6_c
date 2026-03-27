@@ -1098,43 +1098,51 @@ impl CodeGenerator {
         let save_ops = self.regalloc.save_all();
         self.emit_moves(&save_ops);
 
-        // Place arguments per the calling convention:
-        //   arg0 (16-bit) → HL, arg1 (16-bit) → DE, 8-bit → A
-        // For simplicity, support up to 2 args via registers.
-        for (i, &arg) in args.iter().enumerate() {
-            // Reload the arg from its spill location.
-            match (i, arg.width) {
-                (0, Width::W16 | Width::W32) => {
-                    if let Some(Location::Memory(label)) = self.regalloc.get_location(arg).cloned()
-                    {
-                        self.emit_inst(&format!("LHLD {}", label));
-                    }
-                }
-                (1, Width::W16 | Width::W32) => {
-                    if let Some(Location::Memory(label)) = self.regalloc.get_location(arg).cloned()
-                    {
-                        self.emit_inst(&format!("LHLD {}", label));
-                        self.emit_inst("XCHG");
-                    }
-                }
-                (0, Width::W8) => {
-                    if let Some(Location::Memory(label)) = self.regalloc.get_location(arg).cloned()
+        // Push stack arguments (index >= 2) right-to-left (C convention).
+        let stack_arg_count = if args.len() > 2 { args.len() - 2 } else { 0 };
+        for &arg in args.iter().skip(2).rev() {
+            if let Some(Location::Memory(label)) = self.regalloc.get_location(arg).cloned() {
+                self.emit_inst(&format!("LHLD {}", label));
+                self.emit_inst("PUSH H");
+            }
+        }
+
+        // Place register arguments:
+        //   arg0 (16-bit) → HL, arg1 (16-bit) → DE, 8-bit arg0 → A
+        // Load arg1 first (into DE) so arg0 can freely use HL.
+        if args.len() > 1 {
+            let arg = args[1];
+            if let Some(Location::Memory(label)) = self.regalloc.get_location(arg).cloned() {
+                self.emit_inst(&format!("LHLD {}", label));
+                self.emit_inst("XCHG");
+            }
+        }
+        if !args.is_empty() {
+            let arg = args[0];
+            match arg.width {
+                Width::W8 => {
+                    if let Some(Location::Memory(label)) =
+                        self.regalloc.get_location(arg).cloned()
                     {
                         self.emit_inst(&format!("LDA {}", label));
                     }
                 }
-                _ => {
-                    // Additional args: push onto stack
-                    if let Some(Location::Memory(label)) = self.regalloc.get_location(arg).cloned()
+                Width::W16 | Width::W32 => {
+                    if let Some(Location::Memory(label)) =
+                        self.regalloc.get_location(arg).cloned()
                     {
                         self.emit_inst(&format!("LHLD {}", label));
-                        self.emit_inst("PUSH H");
                     }
                 }
             }
         }
 
         self.emit_inst(&format!("CALL {}", func_name));
+
+        // Clean up stack arguments.
+        for _ in 0..stack_arg_count {
+            self.emit_inst("POP B");
+        }
 
         // Result is in HL (16-bit) or A (8-bit).
         if let Some(d) = dst {
