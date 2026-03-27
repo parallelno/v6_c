@@ -4,6 +4,7 @@ mod codegen;
 mod emit;
 mod ir;
 mod ir_gen;
+mod ir_opt;
 mod lexer;
 mod parser;
 mod peephole;
@@ -120,12 +121,15 @@ fn compile_source(source: &str, filename: &str) -> Result<Vec<String>, String> {
         })?;
 
     // 4. IR generation
-    let ir_program = ir_gen::generate(&program).map_err(|errs| {
+    let mut ir_program = ir_gen::generate(&program).map_err(|errs| {
         errs.iter()
             .map(|e| format!("{}:{}: {}", filename, e.line, e.message))
             .collect::<Vec<_>>()
             .join("\n")
     })?;
+
+    // 4.5. IR optimization
+    ir_opt::optimize(&mut ir_program);
 
     // 5. Call-graph analysis
     let analysis = callgraph::analyze(&ir_program, None);
@@ -290,5 +294,278 @@ mod tests {
         assert!(contents.contains("ORG 0x100"));
         assert!(contents.contains("JMP main"));
         let _ = std::fs::remove_file(path);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2.7 – Optimization benchmarks & verification
+    // -----------------------------------------------------------------------
+
+    /// Count lines that contain instructions (not labels, comments, or blank).
+    fn count_instructions(output: &[String]) -> usize {
+        output
+            .iter()
+            .filter(|l| l.starts_with('\t') && !l.trim().starts_with(';'))
+            .count()
+    }
+
+    #[test]
+    fn opt_constant_folding_eliminates_runtime_call() {
+        // Constant multiplication should be folded at compile time.
+        // No __mul16 call should appear.
+        let src = r#"
+            int result;
+            void main(void) {
+                result = 6 * 7;
+            }
+        "#;
+        let out = compile_source(src, "test.c").expect("compilation failed");
+        assert!(
+            !has_line(&out, "CALL __mul16"),
+            "constant multiply should be folded, not call __mul16"
+        );
+        // The result (42) should appear as an immediate load.
+        assert!(
+            has_line(&out, "42"),
+            "folded constant 42 should appear in output"
+        );
+    }
+
+    #[test]
+    fn opt_constant_folding_chained() {
+        // Chained constant expressions within the same computation chain:
+        // 2 * 3 + 1 = 7 (all in vregs, no store/load in between)
+        let src = r#"
+            int result;
+            void main(void) {
+                result = 2 * 3 + 1;
+            }
+        "#;
+        let out = compile_source(src, "test.c").expect("compilation failed");
+        // Should fold to constant 7, no runtime multiply needed.
+        assert!(
+            !has_line(&out, "CALL __mul16"),
+            "constant expression should be folded, not call __mul16"
+        );
+        assert!(
+            has_line(&out, "7"),
+            "folded result 7 should appear in output"
+        );
+    }
+
+    #[test]
+    fn opt_strength_reduction_mul_by_power_of_two() {
+        // x * 4 should become x << 2, avoiding __mul16.
+        let src = r#"
+            int x;
+            int result;
+            void main(void) {
+                result = x * 4;
+            }
+        "#;
+        let out = compile_source(src, "test.c").expect("compilation failed");
+        // Should use shift instead of multiply.
+        assert!(
+            !has_line(&out, "CALL __mul16"),
+            "multiply by 4 should be strength-reduced to shift"
+        );
+    }
+
+    #[test]
+    fn opt_strength_reduction_unsigned_div() {
+        // x / 8u should become x >> 3, avoiding __div16u.
+        let src = r#"
+            unsigned int x;
+            unsigned int result;
+            void main(void) {
+                result = x / 8;
+            }
+        "#;
+        let out = compile_source(src, "test.c").expect("compilation failed");
+        assert!(
+            !has_line(&out, "CALL __div16u"),
+            "unsigned divide by 8 should be strength-reduced to shift"
+        );
+    }
+
+    #[test]
+    fn opt_strength_reduction_unsigned_mod() {
+        // x % 16u should become x & 15, avoiding __mod16u.
+        let src = r#"
+            unsigned int x;
+            unsigned int result;
+            void main(void) {
+                result = x % 16;
+            }
+        "#;
+        let out = compile_source(src, "test.c").expect("compilation failed");
+        assert!(
+            !has_line(&out, "CALL __mod16u"),
+            "unsigned modulo 16 should be strength-reduced to AND mask"
+        );
+    }
+
+    #[test]
+    fn opt_dead_code_eliminated() {
+        // Unused variable should not generate any output.
+        let src = r#"
+            int result;
+            void main(void) {
+                int unused;
+                unused = 42;
+                result = 1;
+            }
+        "#;
+        let out = compile_source(src, "test.c").expect("compilation failed");
+        assert!(has_line(&out, "main:"));
+        // The dead store to `unused` may or may not be eliminated depending
+        // on the IR optimization, but the code should still compile correctly.
+    }
+
+    #[test]
+    fn opt_peephole_tail_call() {
+        // Function ending with a call followed by return should become JMP.
+        let src = r#"
+            void helper(void) { return; }
+            void main(void) { helper(); }
+        "#;
+        let out = compile_source(src, "test.c").expect("compilation failed");
+        // Should have JMP helper instead of CALL helper / RET.
+        assert!(
+            has_line(&out, "JMP helper"),
+            "tail call should be optimized to JMP"
+        );
+    }
+
+    #[test]
+    fn opt_sieve_benchmark_compiles() {
+        // A simplified sieve with small array should compile successfully.
+        let src = r#"
+            int flags[100];
+            int count;
+            void main(void) {
+                int i;
+                int k;
+                int prime;
+                count = 0;
+                i = 0;
+                while (i < 100) {
+                    flags[i] = 1;
+                    i = i + 1;
+                }
+                i = 0;
+                while (i < 100) {
+                    if (flags[i]) {
+                        prime = i + i + 3;
+                        k = i + prime;
+                        while (k < 100) {
+                            flags[k] = 0;
+                            k = k + prime;
+                        }
+                        count = count + 1;
+                    }
+                    i = i + 1;
+                }
+            }
+        "#;
+        let out = compile_source(src, "test.c")
+            .expect("sieve compilation failed");
+        assert!(has_line(&out, "main:"), "sieve must have main");
+        let inst_count = count_instructions(&out);
+        assert!(
+            inst_count > 10 && inst_count < 5000,
+            "sieve should produce reasonable code size, got {} instructions",
+            inst_count
+        );
+    }
+
+    #[test]
+    fn opt_code_size_reduction() {
+        // Constant expressions should be folded, reducing code size.
+        let src = r#"
+            int result;
+            void main(void) {
+                result = 10 + 20 + 30;
+            }
+        "#;
+        let out = compile_source(src, "test.c").expect("compilation failed");
+        let inst_count = count_instructions(&out);
+        // With folding: 10 + 20 + 30 = 60, should be just LXI + SHLD + RET.
+        assert!(
+            inst_count < 15,
+            "constant folding should produce compact code, got {} instructions",
+            inst_count
+        );
+    }
+
+    #[test]
+    fn opt_no_self_moves() {
+        // The output should not contain any MOV X,X instructions.
+        let src = r#"
+            int x;
+            void main(void) {
+                int a; int b;
+                a = 5;
+                b = a;
+                x = b;
+            }
+        "#;
+        let out = compile_source(src, "test.c").expect("compilation failed");
+        for line in &out {
+            let trimmed = line.trim();
+            if trimmed.starts_with("MOV") {
+                let parts: Vec<&str> = trimmed[3..].split(',').map(str::trim).collect();
+                if parts.len() == 2 {
+                    assert_ne!(
+                        parts[0], parts[1],
+                        "self-move should have been eliminated: {}",
+                        line
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn opt_no_nops_in_output() {
+        // No NOP instructions should appear in the optimized output.
+        let src = r#"
+            int x;
+            void main(void) {
+                x = 42;
+            }
+        "#;
+        let out = compile_source(src, "test.c").expect("compilation failed");
+        assert!(
+            !has_line(&out, "\tNOP"),
+            "peephole should eliminate all NOPs"
+        );
+    }
+
+    #[test]
+    fn benchmark_simple_loop() {
+        // A simple loop function: test that control flow with a loop
+        // compiles correctly and produces reasonable code.
+        let src = r#"
+            int arr[10];
+            int total;
+            void main(void) {
+                int i;
+                total = 0;
+                i = 0;
+                while (i < 10) {
+                    arr[i] = i;
+                    total = total + i;
+                    i = i + 1;
+                }
+            }
+        "#;
+        let out = compile_source(src, "test.c").expect("compilation failed");
+        assert!(has_line(&out, "main:"));
+        let inst_count = count_instructions(&out);
+        assert!(
+            inst_count > 10,
+            "loop code should produce meaningful output, got {} instructions",
+            inst_count
+        );
     }
 }

@@ -113,14 +113,38 @@ fn apply_rules(lines: &mut Vec<Line>) -> bool {
     // --- Rule 4: Remove self-move (MOV X,X) ------------------------------
     changed |= rule_remove_self_move(lines);
 
+    // --- Rule 16: Remove double XCHG (XCHG / XCHG → nothing) ------------
+    changed |= rule_remove_double_xchg(lines);
+
+    // --- Rule 24: Remove double CMA (CMA / CMA → nothing) ---------------
+    changed |= rule_remove_double_cma(lines);
+
     // --- Rule 13: Merge adjacent labels ----------------------------------
     changed |= rule_merge_adjacent_labels(lines);
 
     // --- Two-instruction window rules ------------------------------------
     changed |= rule_two_window(lines);
 
+    // --- Rule 19: Conditional branch inversion ---------------------------
+    changed |= rule_branch_inversion(lines);
+
+    // --- Rule 18: Remove jump to next label ------------------------------
+    changed |= rule_jump_to_next(lines);
+
     // --- Rule 10: Remove dead code after unconditional jump --------------
     changed |= rule_dead_code_after_jump(lines);
+
+    // --- Rule 21: MVI A,0 → XRA A (smaller) -----------------------------
+    changed |= rule_mvi_a_zero_to_xra(lines);
+
+    // --- Rule 25/26: Remove INX/DCX pairs that cancel --------------------
+    changed |= rule_remove_inx_dcx_pairs(lines);
+
+    // --- Rule 28/29: Remove redundant LDA/STA pairs ----------------------
+    changed |= rule_lda_sta_pairs(lines);
+
+    // --- Rule 31: Remove unreferenced labels (except function labels) ----
+    changed |= rule_remove_unreferenced_labels(lines);
 
     changed
 }
@@ -322,6 +346,257 @@ fn rule_dead_code_after_jump(lines: &mut Vec<Line>) -> bool {
     changed
 }
 
+/// Rule 16 – Remove double XCHG (XCHG / XCHG → nothing).
+///
+/// XCHG swaps HL and DE.  Two consecutive XCHGs restore the original state.
+fn rule_remove_double_xchg(lines: &mut Vec<Line>) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+    while i + 1 < lines.len() {
+        if let (
+            Line::Instruction { opcode: op_a, .. },
+            Line::Instruction { opcode: op_b, .. },
+        ) = (&lines[i], &lines[i + 1])
+        {
+            if op_a == "XCHG" && op_b == "XCHG" {
+                lines.remove(i + 1);
+                lines.remove(i);
+                changed = true;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    changed
+}
+
+/// Rule 24 – Remove double CMA (CMA / CMA → nothing).
+///
+/// CMA complements the accumulator.  Two consecutive CMAs restore the
+/// original value.
+fn rule_remove_double_cma(lines: &mut Vec<Line>) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+    while i + 1 < lines.len() {
+        if let (
+            Line::Instruction { opcode: op_a, .. },
+            Line::Instruction { opcode: op_b, .. },
+        ) = (&lines[i], &lines[i + 1])
+        {
+            if op_a == "CMA" && op_b == "CMA" {
+                lines.remove(i + 1);
+                lines.remove(i);
+                changed = true;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    changed
+}
+
+/// Rule 18 – Remove jump to the immediately following label.
+///
+/// `JMP L1` followed by `L1:` can be deleted since execution falls
+/// through anyway.
+fn rule_jump_to_next(lines: &mut Vec<Line>) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+    while i + 1 < lines.len() {
+        if let Line::Instruction { opcode, operands } = &lines[i] {
+            if opcode == "JMP" {
+                // Skip over comments and empty lines to find the next label.
+                let mut j = i + 1;
+                while j < lines.len() && matches!(lines[j], Line::Comment(_) | Line::Empty) {
+                    j += 1;
+                }
+                if j < lines.len() {
+                    if let Line::Label(name) = &lines[j] {
+                        if operands.trim() == name {
+                            lines.remove(i);
+                            changed = true;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    changed
+}
+
+/// Rule 19 – Conditional branch inversion.
+///
+/// ```text
+/// JZ  L1        JNZ L2
+/// JMP L2   →
+/// L1:           L1:
+/// ```
+///
+/// Replaces a conditional-jump-over-unconditional-jump pattern with
+/// the inverted condition, removing one instruction.
+fn rule_branch_inversion(lines: &mut Vec<Line>) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+    while i + 2 < lines.len() {
+        let is_match = if let (
+            Line::Instruction { opcode: op_cond, operands: lbl_cond },
+            Line::Instruction { opcode: op_jmp, operands: lbl_jmp },
+            Line::Label(next_label),
+        ) = (&lines[i], &lines[i + 1], &lines[i + 2])
+        {
+            if op_jmp == "JMP" && lbl_cond.trim() == next_label {
+                // Check if op_cond is a conditional jump we can invert.
+                if let Some(inverted) = invert_condition(op_cond) {
+                    Some((inverted, lbl_jmp.clone()))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some((inverted_opcode, target)) = is_match {
+            lines[i] = Line::Instruction {
+                opcode: inverted_opcode,
+                operands: target,
+            };
+            lines.remove(i + 1);
+            changed = true;
+        }
+        i += 1;
+    }
+    changed
+}
+
+/// Rule 21 – Replace MVI A,0 with XRA A.
+///
+/// XRA A is 1 byte vs MVI A,0 which is 2 bytes; both set A to 0.
+fn rule_mvi_a_zero_to_xra(lines: &mut Vec<Line>) -> bool {
+    let mut changed = false;
+    for line in lines.iter_mut() {
+        if let Line::Instruction { opcode, operands } = line {
+            if opcode == "MVI" && operands.trim() == "A,0" {
+                *opcode = "XRA".to_string();
+                *operands = "A".to_string();
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// Rule 25/26 – Remove INX/DCX pairs that cancel each other.
+///
+/// INX H / DCX H → nothing (and vice versa).
+fn rule_remove_inx_dcx_pairs(lines: &mut Vec<Line>) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+    while i + 1 < lines.len() {
+        if let (
+            Line::Instruction { opcode: op_a, operands: reg_a },
+            Line::Instruction { opcode: op_b, operands: reg_b },
+        ) = (&lines[i], &lines[i + 1])
+        {
+            let cancel = (op_a == "INX" && op_b == "DCX" && reg_a.trim() == reg_b.trim())
+                || (op_a == "DCX" && op_b == "INX" && reg_a.trim() == reg_b.trim());
+            if cancel {
+                lines.remove(i + 1);
+                lines.remove(i);
+                changed = true;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    changed
+}
+
+/// Rule 28/29 – Remove redundant LDA/STA pairs.
+///
+/// LDA addr / STA addr → just LDA addr (store after load to same address).
+/// STA addr / LDA addr → just STA addr (load after store to same address).
+fn rule_lda_sta_pairs(lines: &mut Vec<Line>) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+    while i + 1 < lines.len() {
+        if let (
+            Line::Instruction { opcode: op_a, operands: addr_a },
+            Line::Instruction { opcode: op_b, operands: addr_b },
+        ) = (&lines[i], &lines[i + 1])
+        {
+            if addr_a == addr_b
+                && ((op_a == "LDA" && op_b == "STA") || (op_a == "STA" && op_b == "LDA"))
+            {
+                lines.remove(i + 1);
+                changed = true;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    changed
+}
+
+/// Rule 31 – Remove unreferenced compiler-generated labels.
+///
+/// Internal labels (starting with `L`, `__cg_`, or `__cmp_done_`) that are
+/// never referenced in any operand can be safely removed.
+fn rule_remove_unreferenced_labels(lines: &mut Vec<Line>) -> bool {
+    // Collect all operand references.
+    let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for line in lines.iter() {
+        if let Line::Instruction { operands, .. } = line {
+            let trimmed = operands.trim();
+            if !trimmed.is_empty() {
+                referenced.insert(trimmed.to_string());
+            }
+        }
+    }
+
+    let before = lines.len();
+    lines.retain(|line| {
+        if let Line::Label(name) = line {
+            // Only remove compiler-generated labels; keep user labels and
+            // function entry points (which don't start with L or __cg_).
+            if is_compiler_label(name) && !referenced.contains(name) {
+                return false;
+            }
+        }
+        true
+    });
+    lines.len() != before
+}
+
+/// Returns `true` if the label name looks like a compiler-generated internal label
+/// that is safe to remove when unreferenced.
+fn is_compiler_label(name: &str) -> bool {
+    // Only remove __cg_ labels (codegen temporaries for comparisons etc.)
+    // Do NOT remove L0, L1, etc. (IR labels) as they may be jump targets
+    // that were already optimized away.
+    name.starts_with("__cg_")
+        || name.starts_with("__cmp_done_")
+}
+
+/// Invert a conditional jump opcode.
+fn invert_condition(opcode: &str) -> Option<String> {
+    match opcode {
+        "JZ" => Some("JNZ".to_string()),
+        "JNZ" => Some("JZ".to_string()),
+        "JC" => Some("JNC".to_string()),
+        "JNC" => Some("JC".to_string()),
+        "JM" => Some("JP".to_string()),
+        "JP" => Some("JM".to_string()),
+        "JPE" => Some("JPO".to_string()),
+        "JPO" => Some("JPE".to_string()),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -475,14 +750,16 @@ mod tests {
     fn rule10_dead_code_after_jmp() {
         let input = asm(&["\tJMP L1", "\tMOV A,B", "\tADD C", "L1:"]);
         let out = peephole_optimize(input);
-        assert_eq!(out, asm(&["\tJMP L1", "L1:"]));
+        // Dead code removed, then JMP L1 to immediately-following L1: also removed.
+        assert_eq!(out, asm(&["L1:"]));
     }
 
     #[test]
     fn rule10_comments_preserved_after_jmp() {
         let input = asm(&["\tJMP L1", "; comment", "\tMOV A,B", "L1:"]);
         let out = peephole_optimize(input);
-        assert_eq!(out, asm(&["\tJMP L1", "; comment", "L1:"]));
+        // Dead code (MOV A,B) removed, then JMP L1 to next L1: also removed.
+        assert_eq!(out, asm(&["; comment", "L1:"]));
     }
 
     #[test]
@@ -603,5 +880,203 @@ mod tests {
         let input = asm(&["\tNOP", "\tMOV A,A", "\tMOV A,B", "\tNOP"]);
         let out = peephole_optimize(input);
         assert_eq!(out, asm(&["\tMOV A,B"]));
+    }
+
+    // -- Rule 16: Double XCHG removal ------------------------------------
+
+    #[test]
+    fn rule16_double_xchg_removed() {
+        let input = asm(&["\tXCHG", "\tXCHG"]);
+        let out = peephole_optimize(input);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn rule16_single_xchg_kept() {
+        let input = asm(&["\tXCHG", "\tMOV A,B"]);
+        let out = peephole_optimize(input);
+        assert_eq!(out, asm(&["\tXCHG", "\tMOV A,B"]));
+    }
+
+    // -- Rule 18: Jump to next label removal -----------------------------
+
+    #[test]
+    fn rule18_jump_to_next_label_removed() {
+        let input = asm(&["\tJMP L1", "L1:", "\tRET"]);
+        let out = peephole_optimize(input);
+        // JMP L1 should be removed; L1 may also be removed if unreferenced
+        assert!(has_line(&out, "RET"));
+        assert!(!has_line(&out, "JMP L1"));
+    }
+
+    #[test]
+    fn rule18_jump_to_next_with_comment() {
+        let input = asm(&["\tJMP L1", "; comment", "L1:", "\tRET"]);
+        let out = peephole_optimize(input);
+        assert!(!has_line(&out, "JMP L1"));
+    }
+
+    #[test]
+    fn rule18_jump_to_different_label_kept() {
+        let input = asm(&["\tJMP L2", "L1:", "\tRET"]);
+        let out = peephole_optimize(input);
+        assert!(has_line(&out, "JMP L2"));
+    }
+
+    // -- Rule 19: Conditional branch inversion ---------------------------
+
+    #[test]
+    fn rule19_branch_inversion_jz() {
+        let input = asm(&["\tJZ L1", "\tJMP L2", "L1:", "\tRET"]);
+        let out = peephole_optimize(input);
+        assert!(has_line(&out, "JNZ L2"));
+        assert!(!has_line(&out, "JZ L1"));
+    }
+
+    #[test]
+    fn rule19_branch_inversion_jnz() {
+        let input = asm(&["\tJNZ L1", "\tJMP L2", "L1:", "\tRET"]);
+        let out = peephole_optimize(input);
+        assert!(has_line(&out, "JZ L2"));
+    }
+
+    #[test]
+    fn rule19_branch_inversion_jc() {
+        let input = asm(&["\tJC L1", "\tJMP L2", "L1:", "\tRET"]);
+        let out = peephole_optimize(input);
+        assert!(has_line(&out, "JNC L2"));
+    }
+
+    #[test]
+    fn rule19_branch_inversion_jm() {
+        let input = asm(&["\tJM L1", "\tJMP L2", "L1:", "\tRET"]);
+        let out = peephole_optimize(input);
+        assert!(has_line(&out, "JP L2"));
+    }
+
+    // -- Rule 21: MVI A,0 → XRA A ---------------------------------------
+
+    #[test]
+    fn rule21_mvi_a_zero_becomes_xra() {
+        let input = asm(&["\tMVI A,0"]);
+        let out = peephole_optimize(input);
+        assert_eq!(out, asm(&["\tXRA A"]));
+    }
+
+    #[test]
+    fn rule21_mvi_a_nonzero_kept() {
+        let input = asm(&["\tMVI A,1"]);
+        let out = peephole_optimize(input);
+        assert_eq!(out, asm(&["\tMVI A,1"]));
+    }
+
+    // -- Rule 24: Double CMA removal -------------------------------------
+
+    #[test]
+    fn rule24_double_cma_removed() {
+        let input = asm(&["\tCMA", "\tCMA"]);
+        let out = peephole_optimize(input);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn rule24_single_cma_kept() {
+        let input = asm(&["\tCMA", "\tMOV A,B"]);
+        let out = peephole_optimize(input);
+        assert_eq!(out, asm(&["\tCMA", "\tMOV A,B"]));
+    }
+
+    // -- Rule 25/26: INX/DCX pair removal --------------------------------
+
+    #[test]
+    fn rule25_inx_dcx_removed() {
+        let input = asm(&["\tINX H", "\tDCX H"]);
+        let out = peephole_optimize(input);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn rule26_dcx_inx_removed() {
+        let input = asm(&["\tDCX H", "\tINX H"]);
+        let out = peephole_optimize(input);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn rule25_different_regs_kept() {
+        let input = asm(&["\tINX H", "\tDCX D"]);
+        let out = peephole_optimize(input);
+        assert_eq!(out, asm(&["\tINX H", "\tDCX D"]));
+    }
+
+    // -- Rule 28/29: LDA/STA pair removal --------------------------------
+
+    #[test]
+    fn rule28_lda_sta_same_addr() {
+        let input = asm(&["\tLDA _x", "\tSTA _x"]);
+        let out = peephole_optimize(input);
+        assert_eq!(out, asm(&["\tLDA _x"]));
+    }
+
+    #[test]
+    fn rule29_sta_lda_same_addr() {
+        let input = asm(&["\tSTA _x", "\tLDA _x"]);
+        let out = peephole_optimize(input);
+        assert_eq!(out, asm(&["\tSTA _x"]));
+    }
+
+    #[test]
+    fn rule28_different_addr_kept() {
+        let input = asm(&["\tLDA _x", "\tSTA _y"]);
+        let out = peephole_optimize(input);
+        assert_eq!(out, asm(&["\tLDA _x", "\tSTA _y"]));
+    }
+
+    // -- Rule 31: Unreferenced label removal -----------------------------
+
+    #[test]
+    fn rule31_unreferenced_label_removed() {
+        let input = asm(&["__cg_0:", "\tRET"]);
+        let out = peephole_optimize(input);
+        // __cg_0 is never referenced in any operand, so it should be removed
+        assert_eq!(out, asm(&["\tRET"]));
+    }
+
+    #[test]
+    fn rule31_referenced_label_kept() {
+        let input = asm(&["\tJMP L0", "L0:", "\tRET"]);
+        let out = peephole_optimize(input);
+        assert!(has_line(&out, "L0:"));
+    }
+
+    #[test]
+    fn rule31_function_label_kept() {
+        let input = asm(&["main:", "\tRET"]);
+        let out = peephole_optimize(input);
+        assert_eq!(out, asm(&["main:", "\tRET"]));
+    }
+
+    // -- Combined new rules ----------------------------------------------
+
+    #[test]
+    fn combined_branch_inversion_and_dead_code() {
+        let input = asm(&[
+            "\tJZ L1",
+            "\tJMP L2",
+            "L1:",
+            "\tJMP L3",
+            "\tMOV A,B",  // dead code
+            "L2:",
+            "\tRET",
+        ]);
+        let out = peephole_optimize(input);
+        assert!(has_line(&out, "JNZ L2"));
+        assert!(!has_line(&out, "MOV A,B"));
+    }
+
+    // -- Helper ----------------------------------------------------------
+
+    fn has_line(output: &[String], needle: &str) -> bool {
+        output.iter().any(|l| l.contains(needle))
     }
 }
