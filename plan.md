@@ -271,11 +271,11 @@ Each routine is hand‑optimized for the 8080 instruction set. The multiply/divi
 
 **Goal:** Support idiomatic C programs.
 
-- [ ] **3.1 `struct` and `union`** — Layout, member access, passing by pointer.
-- [ ] **3.2 `enum`** — Syntactic sugar over `int`.
-- [ ] **3.3 `typedef`** — Type aliases.
-- [ ] **3.4 `switch`/`case`** — Jump‑table implementation for dense cases; if‑chain for sparse.
-- [ ] **3.5 Multi‑dimensional arrays & initializer lists.**
+- [x] **3.1 `struct` and `union`** — Layout, member access, passing by pointer.
+- [x] **3.2 `enum`** — Syntactic sugar over `int`.
+- [x] **3.3 `typedef`** — Type aliases.
+- [x] **3.4 `switch`/`case`** — Jump‑table implementation for dense cases; if‑chain for sparse.
+- [x] **3.5 Multi‑dimensional arrays & initializer lists.**
 - [ ] **3.6 Stack mode improvements** — Software frame pointer; efficient SP‑relative access helpers.
 
 ### Phase 4 — Standard Library & Vector 06 Target

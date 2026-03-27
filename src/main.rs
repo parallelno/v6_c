@@ -568,4 +568,226 @@ mod tests {
             inst_count
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Phase 3 – struct, union, enum, typedef, switch/case, init lists
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pipeline_struct_basic() {
+        let src = r#"
+            struct point {
+                int x;
+                int y;
+            };
+            struct point p;
+            int result;
+            void main(void) {
+                p.x = 10;
+                p.y = 20;
+                result = p.x + p.y;
+            }
+        "#;
+        let out = compile_source(src, "test.c").expect("struct compilation failed");
+        assert!(has_line(&out, "main:"));
+    }
+
+    #[test]
+    fn pipeline_struct_pointer() {
+        let src = r#"
+            struct point {
+                int x;
+                int y;
+            };
+            struct point p;
+            int result;
+            void set(struct point *pp) {
+                pp->x = 100;
+                pp->y = 200;
+            }
+            void main(void) {
+                set(&p);
+                result = p.x + p.y;
+            }
+        "#;
+        let out = compile_source(src, "test.c").expect("struct-pointer compilation failed");
+        assert!(has_line(&out, "main:"));
+        assert!(has_line(&out, "set:"));
+    }
+
+    #[test]
+    fn pipeline_enum() {
+        let src = r#"
+            enum color { RED, GREEN, BLUE };
+            int result;
+            void main(void) {
+                int c;
+                c = GREEN;
+                if (c == 1) {
+                    result = 42;
+                }
+            }
+        "#;
+        let out = compile_source(src, "test.c").expect("enum compilation failed");
+        assert!(has_line(&out, "main:"));
+    }
+
+    #[test]
+    fn pipeline_enum_explicit_values() {
+        let src = r#"
+            enum status { OK = 0, ERR = -1, BUSY = 5 };
+            int result;
+            void main(void) {
+                result = BUSY;
+            }
+        "#;
+        let out = compile_source(src, "test.c").expect("enum explicit values failed");
+        assert!(has_line(&out, "main:"));
+    }
+
+    #[test]
+    fn pipeline_typedef() {
+        let src = r#"
+            typedef int myint;
+            myint x;
+            void main(void) {
+                myint y;
+                y = 10;
+                x = y + 5;
+            }
+        "#;
+        let out = compile_source(src, "test.c").expect("typedef compilation failed");
+        assert!(has_line(&out, "main:"));
+    }
+
+    #[test]
+    fn pipeline_switch_case() {
+        let src = r#"
+            int result;
+            void main(void) {
+                int x;
+                x = 2;
+                switch (x) {
+                case 1:
+                    result = 10;
+                    break;
+                case 2:
+                    result = 20;
+                    break;
+                case 3:
+                    result = 30;
+                    break;
+                default:
+                    result = 0;
+                    break;
+                }
+            }
+        "#;
+        let out = compile_source(src, "test.c").expect("switch compilation failed");
+        assert!(has_line(&out, "main:"));
+    }
+
+    #[test]
+    fn pipeline_switch_default_only() {
+        let src = r#"
+            int result;
+            void main(void) {
+                int x;
+                x = 99;
+                switch (x) {
+                default:
+                    result = 42;
+                    break;
+                }
+            }
+        "#;
+        let out = compile_source(src, "test.c").expect("switch default-only failed");
+        assert!(has_line(&out, "main:"));
+    }
+
+    #[test]
+    fn pipeline_union() {
+        let src = r#"
+            union data {
+                int i;
+                char c;
+            };
+            union data d;
+            int result;
+            void main(void) {
+                d.i = 0x4142;
+                result = d.c;
+            }
+        "#;
+        let out = compile_source(src, "test.c").expect("union compilation failed");
+        assert!(has_line(&out, "main:"));
+    }
+
+    #[test]
+    fn pipeline_array_initializer() {
+        let src = r#"
+            int result;
+            void main(void) {
+                int arr[3] = {10, 20, 30};
+                result = arr[1];
+            }
+        "#;
+        let out = compile_source(src, "test.c").expect("array initializer failed");
+        assert!(has_line(&out, "main:"));
+    }
+
+    #[test]
+    fn pipeline_sizeof_struct() {
+        let src = r#"
+            struct pair {
+                int a;
+                int b;
+            };
+            int result;
+            void main(void) {
+                result = sizeof(struct pair);
+            }
+        "#;
+        let out = compile_source(src, "test.c").expect("sizeof struct failed");
+        assert!(has_line(&out, "main:"));
+    }
+
+    #[test]
+    fn pipeline_typedef_struct() {
+        let src = r#"
+            typedef struct {
+                int x;
+                int y;
+            } Point;
+            Point p;
+            int result;
+            void main(void) {
+                p.x = 5;
+                p.y = 10;
+                result = p.x + p.y;
+            }
+        "#;
+        let out = compile_source(src, "test.c").expect("typedef struct failed");
+        assert!(has_line(&out, "main:"));
+    }
+
+    #[test]
+    fn pipeline_switch_with_enum() {
+        let src = r#"
+            enum dir { UP, DOWN, LEFT, RIGHT };
+            int result;
+            void main(void) {
+                int d;
+                d = LEFT;
+                switch (d) {
+                case UP:    result = 1; break;
+                case DOWN:  result = 2; break;
+                case LEFT:  result = 3; break;
+                case RIGHT: result = 4; break;
+                }
+            }
+        "#;
+        let out = compile_source(src, "test.c").expect("switch with enum failed");
+        assert!(has_line(&out, "main:"));
+    }
 }

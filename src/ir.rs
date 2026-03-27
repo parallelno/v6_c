@@ -50,7 +50,7 @@ impl Width {
     pub fn from_ctype(ty: &CType) -> Option<Width> {
         match ty {
             CType::Char { .. } => Some(Width::W8),
-            CType::Int { .. } | CType::Pointer(_) => Some(Width::W16),
+            CType::Int { .. } | CType::Pointer(_) | CType::Enum { .. } => Some(Width::W16),
             CType::Long { .. } => Some(Width::W32),
             _ => None,
         }

@@ -195,6 +195,21 @@ pub enum ExprKind {
         left: Box<Expr>,
         right: Box<Expr>,
     },
+
+    /// Member access: `expr.member`.
+    MemberAccess {
+        object: Box<Expr>,
+        member: String,
+    },
+
+    /// Pointer member access: `expr->member`.
+    PtrMemberAccess {
+        ptr: Box<Expr>,
+        member: String,
+    },
+
+    /// Initializer list: `{ expr1, expr2, ... }`.
+    InitList(Vec<Expr>),
 }
 
 /// Argument to `sizeof`: either a type name or a sub-expression.
@@ -288,6 +303,23 @@ pub enum StmtKind {
         storage: Option<StorageClass>,
         init: Option<Expr>,
     },
+
+    /// `switch (expr) { ... }`.
+    Switch {
+        expr: Expr,
+        body: Box<Stmt>,
+    },
+
+    /// `case const_expr:` label inside a switch body.
+    Case {
+        value: i64,
+        stmt: Box<Stmt>,
+    },
+
+    /// `default:` label inside a switch body.
+    Default {
+        stmt: Box<Stmt>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -354,6 +386,15 @@ pub enum TopLevelKind {
         storage: Option<StorageClass>,
         init: Option<Expr>,
     },
+
+    /// struct/union/enum type definition at file scope (no variable declared).
+    TypeDecl,
+
+    /// `typedef old_type new_name;` at file scope.
+    Typedef {
+        ty: CType,
+        name: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -364,11 +405,18 @@ pub enum TopLevelKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
     pub decls: Vec<TopLevel>,
+    /// Enum constant name → integer value, collected during parsing.
+    pub enum_constants: std::collections::HashMap<String, i64>,
 }
 
 impl Program {
-    pub fn new(decls: Vec<TopLevel>) -> Self {
-        Self { decls }
+    pub fn new(decls: Vec<TopLevel>, enum_constants: std::collections::HashMap<String, i64>) -> Self {
+        Self { decls, enum_constants }
+    }
+
+    /// Convenience constructor with no enum constants (useful for tests).
+    pub fn from_decls(decls: Vec<TopLevel>) -> Self {
+        Self { decls, enum_constants: std::collections::HashMap::new() }
     }
 }
 
@@ -527,7 +575,7 @@ mod tests {
             },
             loc(1),
         );
-        let prog = Program::new(vec![decl]);
+        let prog = Program::from_decls(vec![decl]);
         assert_eq!(prog.decls.len(), 1);
     }
 }

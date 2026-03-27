@@ -5,6 +5,7 @@
 //! subset grammar with proper operator precedence, type parsing, and
 //! error recovery.
 
+use std::collections::HashMap;
 use std::fmt;
 
 use crate::ast::*;
@@ -50,6 +51,16 @@ pub struct Parser<'t> {
     tokens: &'t [Token],
     pos: usize,
     errors: Vec<ParseError>,
+    /// Typedef aliases: `typedef_name → resolved CType`.
+    typedefs: HashMap<String, CType>,
+    /// Struct tag definitions: `tag_name → CType::Struct { .. }`.
+    struct_tags: HashMap<String, CType>,
+    /// Union tag definitions: `tag_name → CType::Union { .. }`.
+    union_tags: HashMap<String, CType>,
+    /// Enum tag definitions: `tag_name → CType::Enum { .. }`.
+    enum_tags: HashMap<String, CType>,
+    /// Enum constant values: `enumerator_name → integer_value`.
+    enum_constants: HashMap<String, i64>,
 }
 
 impl<'t> Parser<'t> {
@@ -59,6 +70,11 @@ impl<'t> Parser<'t> {
             tokens,
             pos: 0,
             errors: Vec::new(),
+            typedefs: HashMap::new(),
+            struct_tags: HashMap::new(),
+            union_tags: HashMap::new(),
+            enum_tags: HashMap::new(),
+            enum_constants: HashMap::new(),
         }
     }
 
@@ -67,7 +83,7 @@ impl<'t> Parser<'t> {
     pub fn parse(mut self) -> Result<Program, Vec<ParseError>> {
         let decls = self.parse_program();
         if self.errors.is_empty() {
-            Ok(Program::new(decls))
+            Ok(Program::new(decls, self.enum_constants.clone()))
         } else {
             Err(self.errors)
         }
@@ -210,7 +226,23 @@ impl<'t> Parser<'t> {
                 | TokenKind::Signed
                 | TokenKind::Unsigned
                 | TokenKind::Const
+                | TokenKind::Struct
+                | TokenKind::Union
+                | TokenKind::Enum
         )
+    }
+
+    /// `true` if the token at `offset` positions ahead looks like a type name
+    /// (built-in type keyword, struct/union/enum, or typedef name).
+    fn looks_like_type_at(&self, offset: usize) -> bool {
+        let tok = self.peek_ahead(offset);
+        if Self::is_type_keyword(&tok.kind) {
+            return true;
+        }
+        if tok.kind == TokenKind::Ident && self.typedefs.contains_key(&tok.value) {
+            return true;
+        }
+        false
     }
 
     /// `true` if `kind` is a storage-class specifier.
@@ -222,7 +254,7 @@ impl<'t> Parser<'t> {
     }
 
     /// `true` if the current position looks like the start of a declaration
-    /// (storage-class or type keyword).
+    /// (storage-class, type keyword, or typedef name).
     fn at_declaration_start(&self) -> bool {
         let kind = &self.peek().kind;
         if Self::is_storage_class(kind) {
@@ -230,6 +262,16 @@ impl<'t> Parser<'t> {
         }
         if Self::is_type_keyword(kind) {
             return true;
+        }
+        if *kind == TokenKind::Typedef {
+            return true;
+        }
+        // Check if the identifier is a typedef name.
+        if *kind == TokenKind::Ident {
+            let name = &self.peek().value;
+            if self.typedefs.contains_key(name) {
+                return true;
+            }
         }
         false
     }
@@ -262,11 +304,25 @@ impl<'t> Parser<'t> {
     fn parse_top_level(&mut self) -> Option<TopLevel> {
         let loc = self.current_loc();
 
+        // Handle typedef at file scope.
+        if self.check(&TokenKind::Typedef) {
+            return self.parse_typedef(loc);
+        }
+
         // Optional storage class.
         let storage = self.parse_storage_class();
 
         // Type specifier.
         let base_type = self.parse_type_specifier()?;
+
+        // If the type specifier consumed a struct/union/enum definition and
+        // the next token is `;`, this is a bare type declaration (no variable).
+        if self.check(&TokenKind::Semicolon)
+            && (base_type.is_struct_or_union() || base_type.is_enum())
+        {
+            self.advance(); // consume `;`
+            return Some(TopLevel::new(TopLevelKind::TypeDecl, loc));
+        }
 
         // Declarator: pointer indirections + name + optional array suffix.
         let (name, full_type) = self.parse_declarator(base_type)?;
@@ -278,7 +334,7 @@ impl<'t> Parser<'t> {
 
         // Global variable.
         let init = if self.eat(&TokenKind::Assign) {
-            Some(self.parse_assignment_expr()?)
+            Some(self.parse_initializer()?)
         } else {
             None
         };
@@ -359,7 +415,8 @@ impl<'t> Parser<'t> {
     // -----------------------------------------------------------------------
 
     /// Parse a type specifier.  Handles combinations such as `unsigned int`,
-    /// `const char`, `signed long`, plain `int`, etc.
+    /// `const char`, `signed long`, plain `int`, `struct tag`, `enum tag`,
+    /// and typedef names.
     fn parse_type_specifier(&mut self) -> Option<CType> {
         let mut is_const = false;
         let mut is_signed: Option<bool> = None; // None = unspecified
@@ -415,6 +472,25 @@ impl<'t> Parser<'t> {
                     self.eat(&TokenKind::Int);
                     break;
                 }
+                TokenKind::Struct | TokenKind::Union => {
+                    base = Some(self.parse_struct_or_union()?);
+                    break;
+                }
+                TokenKind::Enum => {
+                    base = Some(self.parse_enum_specifier()?);
+                    break;
+                }
+                TokenKind::Ident => {
+                    // Check for typedef name.
+                    let name = self.peek().value.clone();
+                    if let Some(ty) = self.typedefs.get(&name).cloned() {
+                        self.advance();
+                        base = Some(ty);
+                        break;
+                    }
+                    // Not a typedef name — fall through to error below.
+                    break;
+                }
                 _ => break,
             }
         }
@@ -449,7 +525,7 @@ impl<'t> Parser<'t> {
     }
 
     /// Parse a type-name (used in casts and sizeof). This is a type specifier
-    /// optionally followed by pointer stars.
+    /// optionally followed by pointer stars and array brackets.
     fn parse_type_name(&mut self) -> Option<CType> {
         let mut ty = self.parse_type_specifier()?;
         while self.eat(&TokenKind::Star) {
@@ -462,7 +538,7 @@ impl<'t> Parser<'t> {
     // Declarator
     // -----------------------------------------------------------------------
 
-    /// Parse a declarator: `*`* identifier (`[` constant `]`)?
+    /// Parse a declarator: `*`* identifier (`[` constant `]`)*
     ///
     /// Returns `(name, fully-qualified type)`.
     fn parse_declarator(&mut self, base_type: CType) -> Option<(String, CType)> {
@@ -484,8 +560,8 @@ impl<'t> Parser<'t> {
             return None;
         };
 
-        // Optional array suffix.
-        if self.eat(&TokenKind::LBracket) {
+        // Optional array suffix(es) — supports multi-dimensional arrays.
+        while self.eat(&TokenKind::LBracket) {
             let size = self.parse_array_size()?;
             self.expect(&TokenKind::RBracket);
             ty = CType::Array {
@@ -588,6 +664,9 @@ impl<'t> Parser<'t> {
             TokenKind::Break => self.parse_break_stmt(),
             TokenKind::Continue => self.parse_continue_stmt(),
             TokenKind::Goto => self.parse_goto_stmt(),
+            TokenKind::Switch => self.parse_switch_stmt(),
+            TokenKind::Case => self.parse_case_stmt(),
+            TokenKind::Default => self.parse_default_stmt(),
             // Label: `identifier ':'`
             TokenKind::Ident if self.peek_ahead(1).kind == TokenKind::Colon => {
                 self.parse_label_stmt()
@@ -603,10 +682,14 @@ impl<'t> Parser<'t> {
 
         while !self.check(&TokenKind::RBrace) && !self.at_eof() {
             if self.at_declaration_start() {
-                // Disambiguate: if we see a label (`ident :`), it is a
-                // statement even though `ident` might look like a type in
-                // some contexts. Since we don't support typedefs yet, a
-                // plain `Ident` token is never a type.
+                // Handle typedef inside a compound statement.
+                if self.check(&TokenKind::Typedef) {
+                    let tloc = self.current_loc();
+                    self.parse_typedef(tloc);
+                    // typedef doesn't produce a statement node — continue.
+                    continue;
+                }
+
                 match self.parse_local_var_decl() {
                     Some(s) => stmts.push(s),
                     None => self.synchronize(),
@@ -627,10 +710,18 @@ impl<'t> Parser<'t> {
         let loc = self.current_loc();
         let storage = self.parse_storage_class();
         let base_type = self.parse_type_specifier()?;
+
+        // Bare struct/union/enum definition followed by ';' at block scope.
+        if self.check(&TokenKind::Semicolon) && base_type.is_struct_or_union() {
+            self.advance();
+            // No variable declared — produce a dummy empty statement.
+            return Some(Stmt::new(StmtKind::Compound(vec![]), loc));
+        }
+
         let (name, ty) = self.parse_declarator(base_type)?;
 
         let init = if self.eat(&TokenKind::Assign) {
-            Some(self.parse_assignment_expr()?)
+            Some(self.parse_initializer()?)
         } else {
             None
         };
@@ -791,6 +882,264 @@ impl<'t> Parser<'t> {
         self.advance(); // consume `:`
         let stmt = Box::new(self.parse_stmt()?);
         Some(Stmt::new(StmtKind::Label { name, stmt }, loc))
+    }
+
+    // -----------------------------------------------------------------------
+    // Switch / Case / Default
+    // -----------------------------------------------------------------------
+
+    fn parse_switch_stmt(&mut self) -> Option<Stmt> {
+        let loc = self.current_loc();
+        self.advance(); // consume `switch`
+        self.expect(&TokenKind::LParen)?;
+        let expr = self.parse_expr()?;
+        self.expect(&TokenKind::RParen);
+        let body = Box::new(self.parse_stmt()?);
+        Some(Stmt::new(StmtKind::Switch { expr, body }, loc))
+    }
+
+    fn parse_case_stmt(&mut self) -> Option<Stmt> {
+        let loc = self.current_loc();
+        self.advance(); // consume `case`
+        let value = self.parse_const_expr()?;
+        self.expect(&TokenKind::Colon);
+        let stmt = Box::new(self.parse_stmt()?);
+        Some(Stmt::new(StmtKind::Case { value, stmt }, loc))
+    }
+
+    fn parse_default_stmt(&mut self) -> Option<Stmt> {
+        let loc = self.current_loc();
+        self.advance(); // consume `default`
+        self.expect(&TokenKind::Colon);
+        let stmt = Box::new(self.parse_stmt()?);
+        Some(Stmt::new(StmtKind::Default { stmt }, loc))
+    }
+
+    /// Parse a constant expression (integer literal, enum constant, or simple
+    /// arithmetic on constants).  For Phase 3 we support integer literals,
+    /// negative literals, and enum constants.
+    fn parse_const_expr(&mut self) -> Option<i64> {
+        let negate = self.eat(&TokenKind::Minus);
+        let val = if self.check(&TokenKind::IntLiteral) {
+            self.parse_int_literal()?
+        } else if self.check(&TokenKind::CharLiteral) {
+            let tok = self.advance();
+            if tok.value.is_empty() { 0i64 } else { tok.value.as_bytes()[0] as i64 }
+        } else if self.check(&TokenKind::Ident) {
+            let name = self.peek().value.clone();
+            if let Some(&v) = self.enum_constants.get(&name) {
+                self.advance();
+                v
+            } else {
+                self.error(format!("expected constant expression, found `{}`", name));
+                return None;
+            }
+        } else {
+            self.error(format!(
+                "expected constant expression, found `{}`",
+                self.peek().kind
+            ));
+            return None;
+        };
+        Some(if negate { -val } else { val })
+    }
+
+    // -----------------------------------------------------------------------
+    // Struct / Union
+    // -----------------------------------------------------------------------
+
+    /// Parse `struct tag { ... }` or `struct tag` or `union tag { ... }` etc.
+    fn parse_struct_or_union(&mut self) -> Option<CType> {
+        let is_struct = self.check(&TokenKind::Struct);
+        self.advance(); // consume `struct` or `union`
+
+        // Optional tag name.
+        let tag = if self.check(&TokenKind::Ident) {
+            let name = self.advance().value.clone();
+            Some(name)
+        } else {
+            None
+        };
+
+        // If `{` follows, parse the member list (definition).
+        if self.check(&TokenKind::LBrace) {
+            self.advance(); // consume `{`
+            let mut members = Vec::new();
+
+            while !self.check(&TokenKind::RBrace) && !self.at_eof() {
+                let field_type = self.parse_type_specifier()?;
+                let (field_name, field_full_type) = self.parse_declarator(field_type)?;
+                self.expect(&TokenKind::Semicolon);
+                members.push((field_name, field_full_type));
+            }
+            self.expect(&TokenKind::RBrace);
+
+            let tag_str = tag.clone().unwrap_or_default();
+            let ty = if is_struct {
+                CType::Struct {
+                    tag: tag_str,
+                    members,
+                }
+            } else {
+                CType::Union {
+                    tag: tag_str,
+                    members,
+                }
+            };
+
+            // Register the tag if it has a name.
+            if let Some(ref t) = tag {
+                if is_struct {
+                    self.struct_tags.insert(t.clone(), ty.clone());
+                } else {
+                    self.union_tags.insert(t.clone(), ty.clone());
+                }
+            }
+
+            Some(ty)
+        } else {
+            // No `{` — must be a reference to a previously defined tag.
+            let tag_name = tag.unwrap_or_else(|| {
+                self.error("expected struct/union tag name or `{`");
+                String::new()
+            });
+            let table = if is_struct {
+                &self.struct_tags
+            } else {
+                &self.union_tags
+            };
+            if let Some(ty) = table.get(&tag_name).cloned() {
+                Some(ty)
+            } else {
+                // Forward reference — create an incomplete struct/union.
+                let ty = if is_struct {
+                    CType::Struct {
+                        tag: tag_name.clone(),
+                        members: vec![],
+                    }
+                } else {
+                    CType::Union {
+                        tag: tag_name.clone(),
+                        members: vec![],
+                    }
+                };
+                Some(ty)
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Enum
+    // -----------------------------------------------------------------------
+
+    /// Parse `enum tag { ... }` or `enum tag`.
+    fn parse_enum_specifier(&mut self) -> Option<CType> {
+        self.advance(); // consume `enum`
+
+        // Optional tag name.
+        let tag = if self.check(&TokenKind::Ident) {
+            let name = self.advance().value.clone();
+            Some(name)
+        } else {
+            None
+        };
+
+        // If `{` follows, parse the enumerator list.
+        if self.check(&TokenKind::LBrace) {
+            self.advance(); // consume `{`
+            let mut next_val: i64 = 0;
+
+            while !self.check(&TokenKind::RBrace) && !self.at_eof() {
+                if !self.check(&TokenKind::Ident) {
+                    self.error("expected enumerator name");
+                    break;
+                }
+                let name = self.advance().value.clone();
+
+                if self.eat(&TokenKind::Assign) {
+                    next_val = self.parse_const_expr()?;
+                }
+
+                self.enum_constants.insert(name, next_val);
+                next_val += 1;
+
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(&TokenKind::RBrace);
+        }
+
+        let tag_str = tag.clone().unwrap_or_default();
+        let ty = CType::Enum { tag: tag_str };
+        if let Some(ref t) = tag {
+            self.enum_tags.insert(t.clone(), ty.clone());
+        }
+        Some(ty)
+    }
+
+    // -----------------------------------------------------------------------
+    // Typedef
+    // -----------------------------------------------------------------------
+
+    /// Parse `typedef type alias ;`.
+    fn parse_typedef(&mut self, loc: SourceLocation) -> Option<TopLevel> {
+        self.advance(); // consume `typedef`
+        let base_type = self.parse_type_specifier()?;
+
+        // Parse pointer indirections + name.
+        let mut ty = base_type;
+        while self.eat(&TokenKind::Star) {
+            ty = CType::Pointer(Box::new(ty));
+        }
+
+        let name = if self.check(&TokenKind::Ident) {
+            self.advance().value.clone()
+        } else {
+            self.error("expected typedef name");
+            return None;
+        };
+
+        // Handle array suffix for typedefs like `typedef int arr_t[10];`
+        while self.eat(&TokenKind::LBracket) {
+            let size = self.parse_array_size()?;
+            self.expect(&TokenKind::RBracket);
+            ty = CType::Array {
+                element: Box::new(ty),
+                size,
+            };
+        }
+
+        self.expect(&TokenKind::Semicolon);
+
+        // Register the typedef.
+        self.typedefs.insert(name.clone(), ty.clone());
+
+        Some(TopLevel::new(TopLevelKind::Typedef { ty, name }, loc))
+    }
+
+    // -----------------------------------------------------------------------
+    // Initializer (handles both scalar and braced initializer lists)
+    // -----------------------------------------------------------------------
+
+    fn parse_initializer(&mut self) -> Option<Expr> {
+        if self.check(&TokenKind::LBrace) {
+            let loc = self.current_loc();
+            self.advance(); // consume `{`
+            let mut elements = Vec::new();
+
+            while !self.check(&TokenKind::RBrace) && !self.at_eof() {
+                elements.push(self.parse_assignment_expr()?);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+                // Allow trailing comma: `{1, 2, 3,}`
+            }
+            self.expect(&TokenKind::RBrace);
+            Some(Expr::new(ExprKind::InitList(elements), loc))
+        } else {
+            self.parse_assignment_expr()
+        }
     }
 
     fn parse_expr_stmt(&mut self) -> Option<Stmt> {
@@ -1101,11 +1450,11 @@ impl<'t> Parser<'t> {
 
     /// Cast expression: `(type_name) cast_expr` or fall through to unary.
     ///
-    /// Ambiguity resolution: if we see `(` followed by a type keyword, treat
-    /// it as a cast; otherwise it's a parenthesized expression (handled in
-    /// `parse_unary_expr` → `parse_primary_expr`).
+    /// Ambiguity resolution: if we see `(` followed by a type keyword or
+    /// typedef name, treat it as a cast; otherwise it's a parenthesized
+    /// expression (handled in `parse_unary_expr` → `parse_primary_expr`).
     fn parse_cast_expr(&mut self) -> Option<Expr> {
-        if self.check(&TokenKind::LParen) && Self::is_type_keyword(&self.peek_ahead(1).kind) {
+        if self.check(&TokenKind::LParen) && self.looks_like_type_at(1) {
             let loc = self.current_loc();
             self.advance(); // consume `(`
             let ty = self.parse_type_name()?;
@@ -1214,7 +1563,7 @@ impl<'t> Parser<'t> {
 
     /// Parse `sizeof(type)` or `sizeof expr`.
     fn parse_sizeof(&mut self, loc: SourceLocation) -> Option<Expr> {
-        if self.check(&TokenKind::LParen) && Self::is_type_keyword(&self.peek_ahead(1).kind) {
+        if self.check(&TokenKind::LParen) && self.looks_like_type_at(1) {
             self.advance(); // consume `(`
             let ty = self.parse_type_name()?;
             self.expect(&TokenKind::RParen);
@@ -1228,7 +1577,8 @@ impl<'t> Parser<'t> {
         }
     }
 
-    /// Postfix expression: primary followed by `(args)`, `[index]`, `++`, `--`.
+    /// Postfix expression: primary followed by `(args)`, `[index]`, `++`, `--`,
+    /// `.member`, `->member`.
     fn parse_postfix_expr(&mut self) -> Option<Expr> {
         let mut expr = self.parse_primary_expr()?;
 
@@ -1280,6 +1630,42 @@ impl<'t> Parser<'t> {
                         ExprKind::UnaryOp {
                             op: UnaryOp::PostDec,
                             operand: Box::new(expr),
+                        },
+                        loc,
+                    );
+                }
+                TokenKind::Dot => {
+                    // Direct member access: `expr.member`
+                    let loc = expr.loc;
+                    self.advance(); // consume `.`
+                    let member = if self.check(&TokenKind::Ident) {
+                        self.advance().value.clone()
+                    } else {
+                        self.error("expected member name after `.`");
+                        return None;
+                    };
+                    expr = Expr::new(
+                        ExprKind::MemberAccess {
+                            object: Box::new(expr),
+                            member,
+                        },
+                        loc,
+                    );
+                }
+                TokenKind::Arrow => {
+                    // Pointer member access: `expr->member`
+                    let loc = expr.loc;
+                    self.advance(); // consume `->`
+                    let member = if self.check(&TokenKind::Ident) {
+                        self.advance().value.clone()
+                    } else {
+                        self.error("expected member name after `->``");
+                        return None;
+                    };
+                    expr = Expr::new(
+                        ExprKind::PtrMemberAccess {
+                            ptr: Box::new(expr),
+                            member,
                         },
                         loc,
                     );

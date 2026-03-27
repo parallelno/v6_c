@@ -43,6 +43,20 @@ enum LValueResult {
 }
 
 // ---------------------------------------------------------------------------
+// SwitchContext
+// ---------------------------------------------------------------------------
+
+/// Tracks case/default labels during switch statement codegen.
+struct SwitchContext {
+    /// Label for the break target (end of switch).
+    break_label: Label,
+    /// (case_value, label) pairs collected from Case statements.
+    cases: Vec<(i64, Label)>,
+    /// Label for the default branch, if present.
+    default_label: Option<Label>,
+}
+
+// ---------------------------------------------------------------------------
 // IrGenerator
 // ---------------------------------------------------------------------------
 
@@ -78,6 +92,14 @@ pub struct IrGenerator {
     // ---- goto / user labels ----
     user_labels: HashMap<String, Label>,
 
+    // ---- switch ----
+    /// Stack of (break_label, Vec<(case_value, Label)>, Option<default_label>)
+    /// for the innermost switch statement being compiled.
+    switch_stack: Vec<SwitchContext>,
+
+    // ---- enum constants ----
+    enum_constants: HashMap<String, i64>,
+
     // ---- misc ----
     string_count: u32,
     errors: Vec<IrGenError>,
@@ -92,6 +114,7 @@ pub struct IrGenerator {
 /// Returns `Err` with accumulated errors if any problems were detected.
 pub fn generate(program: &Program) -> Result<IrProgram, Vec<IrGenError>> {
     let mut gen = IrGenerator::new();
+    gen.enum_constants = program.enum_constants.clone();
     for decl in &program.decls {
         gen.gen_top_level(decl);
     }
@@ -128,6 +151,8 @@ impl IrGenerator {
             break_stack: Vec::new(),
             continue_stack: Vec::new(),
             user_labels: HashMap::new(),
+            switch_stack: Vec::new(),
+            enum_constants: HashMap::new(),
             string_count: 0,
             errors: Vec::new(),
         }
@@ -258,6 +283,24 @@ impl IrGenerator {
             ExprKind::SizeOf(_) => CType::int_unsigned(),
             ExprKind::Conditional { then_expr, .. } => self.expr_type(then_expr),
             ExprKind::Comma { right, .. } => self.expr_type(right),
+            ExprKind::MemberAccess { object, member } => {
+                let obj_ty = self.expr_type(object);
+                obj_ty
+                    .field_offset(member)
+                    .map(|(_, ty)| ty)
+                    .unwrap_or(CType::int_signed())
+            }
+            ExprKind::PtrMemberAccess { ptr, member } => {
+                let ptr_ty = self.expr_type(ptr);
+                let struct_ty = ptr_ty.pointee().cloned().unwrap_or(CType::int_signed());
+                struct_ty
+                    .field_offset(member)
+                    .map(|(_, ty)| ty)
+                    .unwrap_or(CType::int_signed())
+            }
+            ExprKind::InitList(elems) => {
+                elems.last().map(|e| self.expr_type(e)).unwrap_or(CType::int_signed())
+            }
         }
     }
 
@@ -292,6 +335,10 @@ impl IrGenerator {
                 self.func_return_types
                     .insert(name.clone(), return_type.clone());
             }
+
+            // Type declarations and typedefs are resolved at parse time;
+            // nothing to emit for them.
+            TopLevelKind::TypeDecl | TopLevelKind::Typedef { .. } => {}
         }
     }
 
@@ -328,7 +375,58 @@ impl IrGenerator {
                 bytes[0] = *ch;
                 Some(bytes)
             }
+            ExprKind::InitList(elems) => {
+                self.const_init_list_bytes(elems, ty)
+            }
             _ => None,
+        }
+    }
+
+    /// Try to fold an initializer list into a byte vector for global data.
+    fn const_init_list_bytes(&self, elems: &[Expr], ty: &CType) -> Option<Vec<u8>> {
+        let total_size = ty.size_of()?;
+        let mut bytes = vec![0u8; total_size];
+        match ty {
+            CType::Array { element: ref elem_ty, .. } => {
+                let elem_size = elem_ty.size_of()?;
+                for (i, elem) in elems.iter().enumerate() {
+                    let offset = i * elem_size;
+                    if offset >= total_size {
+                        break;
+                    }
+                    let elem_bytes = self.const_init_bytes(elem, elem_ty)?;
+                    for (j, b) in elem_bytes.iter().enumerate() {
+                        if offset + j < total_size {
+                            bytes[offset + j] = *b;
+                        }
+                    }
+                }
+                Some(bytes)
+            }
+            CType::Struct { members, .. } => {
+                let mut offset = 0usize;
+                for (i, (_mname, mty)) in members.iter().enumerate() {
+                    if i >= elems.len() {
+                        break;
+                    }
+                    let elem_bytes = self.const_init_bytes(&elems[i], mty)?;
+                    for (j, b) in elem_bytes.iter().enumerate() {
+                        if offset + j < total_size {
+                            bytes[offset + j] = *b;
+                        }
+                    }
+                    offset += mty.size_of().unwrap_or(1);
+                }
+                Some(bytes)
+            }
+            _ => {
+                // Scalar – use first element.
+                if let Some(first) = elems.first() {
+                    self.const_init_bytes(first, ty)
+                } else {
+                    Some(bytes)
+                }
+            }
         }
     }
 
@@ -481,6 +579,27 @@ impl IrGenerator {
                 storage: _,
                 init,
             } => self.gen_var_decl(name, ty, init),
+
+            StmtKind::Switch { expr, body } => self.gen_switch(expr, body),
+
+            StmtKind::Case { value, stmt } => {
+                // Emit the label for this case value.
+                let lbl = self.label_alloc.alloc();
+                if let Some(ctx) = self.switch_stack.last_mut() {
+                    ctx.cases.push((*value, lbl));
+                }
+                self.emit(IrOp::label(lbl));
+                self.gen_stmt(stmt);
+            }
+
+            StmtKind::Default { stmt } => {
+                let lbl = self.label_alloc.alloc();
+                if let Some(ctx) = self.switch_stack.last_mut() {
+                    ctx.default_label = Some(lbl);
+                }
+                self.emit(IrOp::label(lbl));
+                self.gen_stmt(stmt);
+            }
         }
     }
 
@@ -574,6 +693,56 @@ impl IrGenerator {
         self.continue_stack.pop();
     }
 
+    fn gen_switch(&mut self, expr: &Expr, body: &Stmt) {
+        let (val, _val_ty) = self.gen_expr(expr);
+
+        let dispatch_lbl = self.label_alloc.alloc();
+        let end_lbl = self.label_alloc.alloc();
+
+        // Jump to the dispatch block (emitted after the body).
+        self.emit(IrOp::jump(dispatch_lbl));
+
+        // Push switch context so Case/Default statements can register labels.
+        self.switch_stack.push(SwitchContext {
+            break_label: end_lbl,
+            cases: Vec::new(),
+            default_label: None,
+        });
+        self.break_stack.push(end_lbl);
+
+        // Generate the switch body (case/default labels are registered).
+        self.gen_stmt(body);
+        // Fall through to end after the last case.
+        self.emit(IrOp::jump(end_lbl));
+
+        // Emit the dispatch block: compare val against each case value.
+        self.emit(IrOp::label(dispatch_lbl));
+        let ctx = self.switch_stack.pop().unwrap();
+        self.break_stack.pop();
+
+        for (case_val, case_lbl) in &ctx.cases {
+            let imm = self.vreg_alloc.alloc(Width::W16);
+            self.emit(IrOp::load_imm(imm, *case_val));
+            let cmp = self.vreg_alloc.alloc(Width::W16);
+            self.emit(IrOp::Eq {
+                dst: cmp,
+                lhs: val,
+                rhs: imm,
+                width: Width::W16,
+            });
+            self.emit(IrOp::jump_if_true(cmp, *case_lbl));
+        }
+
+        // Jump to default or end.
+        if let Some(default_lbl) = ctx.default_label {
+            self.emit(IrOp::jump(default_lbl));
+        } else {
+            self.emit(IrOp::jump(end_lbl));
+        }
+
+        self.emit(IrOp::label(end_lbl));
+    }
+
     fn gen_var_decl(&mut self, name: &str, ty: &CType, init: &Option<Expr>) {
         let label = format!("_l_{}_{}", self.current_func_name, name);
         self.globals.push(GlobalVar {
@@ -585,8 +754,76 @@ impl IrGenerator {
             .insert(name.to_string(), (label.clone(), ty.clone()));
 
         if let Some(init_expr) = init {
-            let (val, _) = self.gen_expr(init_expr);
-            self.emit(IrOp::store_global(&label, val));
+            match &init_expr.kind {
+                ExprKind::InitList(elems) => {
+                    self.gen_init_list_store(&label, ty, elems);
+                }
+                _ => {
+                    let (val, _) = self.gen_expr(init_expr);
+                    self.emit(IrOp::store_global(&label, val));
+                }
+            }
+        }
+    }
+
+    /// Generate stores for an initializer list into a named variable.
+    fn gen_init_list_store(&mut self, label: &str, ty: &CType, elems: &[Expr]) {
+        match ty {
+            CType::Array { element: ref elem_ty, .. } => {
+                let elem_size = elem_ty.size_of().unwrap_or(1);
+                let base = self.vreg_alloc.alloc(Width::W16);
+                self.emit(IrOp::addr_of_global(base, label));
+                for (i, elem_expr) in elems.iter().enumerate() {
+                    let (val, _) = self.gen_expr(elem_expr);
+                    if i == 0 {
+                        self.emit(IrOp::store_ptr(base, val));
+                    } else {
+                        let offset = self.vreg_alloc.alloc(Width::W16);
+                        self.emit(IrOp::load_imm(offset, (i * elem_size) as i64));
+                        let ptr = self.vreg_alloc.alloc(Width::W16);
+                        self.emit(IrOp::Add {
+                            dst: ptr,
+                            lhs: base,
+                            rhs: offset,
+                            width: Width::W16,
+                        });
+                        self.emit(IrOp::store_ptr(ptr, val));
+                    }
+                }
+            }
+            CType::Struct { members, .. } => {
+                let base = self.vreg_alloc.alloc(Width::W16);
+                self.emit(IrOp::addr_of_global(base, label));
+                let mut offset_bytes = 0usize;
+                for (i, (_mname, mty)) in members.iter().enumerate() {
+                    if i >= elems.len() {
+                        break;
+                    }
+                    let (val, _) = self.gen_expr(&elems[i]);
+                    if offset_bytes == 0 {
+                        self.emit(IrOp::store_ptr(base, val));
+                    } else {
+                        let off_reg = self.vreg_alloc.alloc(Width::W16);
+                        self.emit(IrOp::load_imm(off_reg, offset_bytes as i64));
+                        let ptr = self.vreg_alloc.alloc(Width::W16);
+                        self.emit(IrOp::Add {
+                            dst: ptr,
+                            lhs: base,
+                            rhs: off_reg,
+                            width: Width::W16,
+                        });
+                        self.emit(IrOp::store_ptr(ptr, val));
+                    }
+                    offset_bytes += mty.size_of().unwrap_or(1);
+                }
+            }
+            _ => {
+                // Scalar with brace initializer – use first element.
+                if let Some(first) = elems.first() {
+                    let (val, _) = self.gen_expr(first);
+                    self.emit(IrOp::store_global(label, val));
+                }
+            }
         }
     }
 
@@ -666,6 +903,24 @@ impl IrGenerator {
                 self.gen_expr(left);
                 self.gen_expr(right)
             }
+
+            ExprKind::MemberAccess { object, member } => {
+                self.gen_member_access(object, member)
+            }
+
+            ExprKind::PtrMemberAccess { ptr, member } => {
+                self.gen_ptr_member_access(ptr, member)
+            }
+
+            ExprKind::InitList(elems) => {
+                // InitList in expression context: evaluate all elements,
+                // return the last (GCC extension behavior).
+                let mut result = (self.vreg_alloc.alloc(Width::W16), CType::int_signed());
+                for e in elems {
+                    result = self.gen_expr(e);
+                }
+                result
+            }
         }
     }
 
@@ -679,6 +934,12 @@ impl IrGenerator {
         // Global variables.
         if let Some((label, ty)) = self.global_syms.get(name).cloned() {
             return self.load_named_var(&label, &ty);
+        }
+        // Enum constants.
+        if let Some(&val) = self.enum_constants.get(name) {
+            let dst = self.vreg_alloc.alloc(Width::W16);
+            self.emit(IrOp::load_imm(dst, val));
+            return (dst, CType::int_signed());
         }
         // Known function name → address (function pointer decay).
         if self.func_return_types.contains_key(name) {
@@ -702,6 +963,11 @@ impl IrGenerator {
             let dst = self.vreg_alloc.alloc(Width::W16);
             self.emit(IrOp::addr_of_global(dst, label));
             (dst, ptr_ty)
+        } else if ty.is_struct_or_union() {
+            // Structs/unions don't fit in a register; return their address.
+            let dst = self.vreg_alloc.alloc(Width::W16);
+            self.emit(IrOp::addr_of_global(dst, label));
+            (dst, CType::ptr(ty.clone()))
         } else {
             let w = Width::from_ctype(ty).unwrap_or(Width::W16);
             let dst = self.vreg_alloc.alloc(w);
@@ -1074,6 +1340,67 @@ impl IrGenerator {
         }
     }
 
+    // ---- member access (`.` and `->`) ------------------------------------
+
+    fn gen_member_access(&mut self, object: &Expr, member: &str) -> (VReg, CType) {
+        // Get the address of the struct object.
+        let lv = self.gen_lvalue(object);
+        let base_ty = self.lvalue_type(&lv);
+        let base_ptr = match &lv {
+            LValueResult::Global { label, .. } => {
+                let p = self.vreg_alloc.alloc(Width::W16);
+                self.emit(IrOp::addr_of_global(p, label));
+                p
+            }
+            LValueResult::Ptr { reg, .. } => *reg,
+        };
+        self.access_field(base_ptr, &base_ty, member)
+    }
+
+    fn gen_ptr_member_access(&mut self, ptr_expr: &Expr, member: &str) -> (VReg, CType) {
+        let (base_ptr, ptr_ty) = self.gen_expr(ptr_expr);
+        let struct_ty = ptr_ty.pointee().cloned().unwrap_or(CType::int_signed());
+        self.access_field(base_ptr, &struct_ty, member)
+    }
+
+    /// Given a pointer to a struct/union and a field name, load the field.
+    fn access_field(&mut self, base_ptr: VReg, struct_ty: &CType, member: &str) -> (VReg, CType) {
+        if let Some((offset, field_ty)) = struct_ty.field_offset(member) {
+            let field_ptr = if offset == 0 {
+                base_ptr
+            } else {
+                let off_reg = self.vreg_alloc.alloc(Width::W16);
+                self.emit(IrOp::load_imm(off_reg, offset as i64));
+                let p = self.vreg_alloc.alloc(Width::W16);
+                self.emit(IrOp::Add {
+                    dst: p,
+                    lhs: base_ptr,
+                    rhs: off_reg,
+                    width: Width::W16,
+                });
+                p
+            };
+            // If the field is an array, decay to pointer (don't load).
+            if field_ty.is_array() {
+                let elem = field_ty.element_type().unwrap().clone();
+                return (field_ptr, CType::ptr(elem));
+            }
+            // If the field is a struct/union, return its address as a pointer.
+            if field_ty.is_struct_or_union() {
+                return (field_ptr, field_ty);
+            }
+            let w = Width::from_ctype(&field_ty).unwrap_or(Width::W16);
+            let dst = self.vreg_alloc.alloc(w);
+            self.emit(IrOp::load_ptr(dst, field_ptr));
+            (dst, field_ty)
+        } else {
+            self.error(&format!("no member '{}' in type", member));
+            let dst = self.vreg_alloc.alloc(Width::W16);
+            self.emit(IrOp::load_imm(dst, 0));
+            (dst, CType::int_signed())
+        }
+    }
+
     // ---- ternary conditional ----------------------------------------------
 
     fn gen_conditional(
@@ -1170,6 +1497,74 @@ impl IrGenerator {
                 LValueResult::Ptr {
                     reg: ptr,
                     pointee_ty: elem_ty,
+                }
+            }
+            ExprKind::MemberAccess { object, member } => {
+                let lv = self.gen_lvalue(object);
+                let base_ty = self.lvalue_type(&lv);
+                let base_ptr = match &lv {
+                    LValueResult::Global { label, .. } => {
+                        let p = self.vreg_alloc.alloc(Width::W16);
+                        self.emit(IrOp::addr_of_global(p, label));
+                        p
+                    }
+                    LValueResult::Ptr { reg, .. } => *reg,
+                };
+                if let Some((offset, field_ty)) = base_ty.field_offset(member) {
+                    let field_ptr = if offset == 0 {
+                        base_ptr
+                    } else {
+                        let off_reg = self.vreg_alloc.alloc(Width::W16);
+                        self.emit(IrOp::load_imm(off_reg, offset as i64));
+                        let p = self.vreg_alloc.alloc(Width::W16);
+                        self.emit(IrOp::Add {
+                            dst: p,
+                            lhs: base_ptr,
+                            rhs: off_reg,
+                            width: Width::W16,
+                        });
+                        p
+                    };
+                    LValueResult::Ptr {
+                        reg: field_ptr,
+                        pointee_ty: field_ty,
+                    }
+                } else {
+                    self.error(&format!("no member '{}' in type", member));
+                    LValueResult::Global {
+                        label: "_error".to_string(),
+                        ty: CType::int_signed(),
+                    }
+                }
+            }
+            ExprKind::PtrMemberAccess { ptr, member } => {
+                let (base_ptr, ptr_ty) = self.gen_expr(ptr);
+                let struct_ty = ptr_ty.pointee().cloned().unwrap_or(CType::int_signed());
+                if let Some((offset, field_ty)) = struct_ty.field_offset(member) {
+                    let field_ptr = if offset == 0 {
+                        base_ptr
+                    } else {
+                        let off_reg = self.vreg_alloc.alloc(Width::W16);
+                        self.emit(IrOp::load_imm(off_reg, offset as i64));
+                        let p = self.vreg_alloc.alloc(Width::W16);
+                        self.emit(IrOp::Add {
+                            dst: p,
+                            lhs: base_ptr,
+                            rhs: off_reg,
+                            width: Width::W16,
+                        });
+                        p
+                    };
+                    LValueResult::Ptr {
+                        reg: field_ptr,
+                        pointee_ty: field_ty,
+                    }
+                } else {
+                    self.error(&format!("no member '{}' in type", member));
+                    LValueResult::Global {
+                        label: "_error".to_string(),
+                        ty: CType::int_signed(),
+                    }
                 }
             }
             _ => {
@@ -1315,7 +1710,7 @@ mod tests {
         params: Vec<Param>,
         body: Stmt,
     ) -> Program {
-        Program::new(vec![TopLevel::new(
+        Program::from_decls(vec![TopLevel::new(
             TopLevelKind::FuncDef {
                 name: name.into(),
                 return_type: ret,
@@ -1338,7 +1733,7 @@ mod tests {
 
     #[test]
     fn global_var_uninitialized() {
-        let prog = Program::new(vec![TopLevel::new(
+        let prog = Program::from_decls(vec![TopLevel::new(
             TopLevelKind::GlobalVar {
                 name: "x".into(),
                 ty: CType::int_signed(),
@@ -1355,7 +1750,7 @@ mod tests {
 
     #[test]
     fn global_var_with_init() {
-        let prog = Program::new(vec![TopLevel::new(
+        let prog = Program::from_decls(vec![TopLevel::new(
             TopLevelKind::GlobalVar {
                 name: "y".into(),
                 ty: CType::int_signed(),
@@ -1699,7 +2094,7 @@ mod tests {
 
     #[test]
     fn function_call_with_args() {
-        let prog = Program::new(vec![
+        let prog = Program::from_decls(vec![
             TopLevel::new(
                 TopLevelKind::FuncDecl {
                     name: "add".into(),
@@ -1747,7 +2142,7 @@ mod tests {
 
     #[test]
     fn simple_assignment() {
-        let prog = Program::new(vec![
+        let prog = Program::from_decls(vec![
             TopLevel::new(
                 TopLevelKind::GlobalVar {
                     name: "x".into(),
@@ -1786,7 +2181,7 @@ mod tests {
 
     #[test]
     fn compound_add_assign() {
-        let prog = Program::new(vec![
+        let prog = Program::from_decls(vec![
             TopLevel::new(
                 TopLevelKind::GlobalVar {
                     name: "x".into(),
@@ -1825,7 +2220,7 @@ mod tests {
 
     #[test]
     fn pre_increment() {
-        let prog = Program::new(vec![
+        let prog = Program::from_decls(vec![
             TopLevel::new(
                 TopLevelKind::GlobalVar {
                     name: "x".into(),
@@ -1862,7 +2257,7 @@ mod tests {
 
     #[test]
     fn post_increment_returns_old() {
-        let prog = Program::new(vec![
+        let prog = Program::from_decls(vec![
             TopLevel::new(
                 TopLevelKind::GlobalVar {
                     name: "x".into(),
@@ -1980,7 +2375,7 @@ mod tests {
 
     #[test]
     fn addr_of_global() {
-        let prog = Program::new(vec![
+        let prog = Program::from_decls(vec![
             TopLevel::new(
                 TopLevelKind::GlobalVar {
                     name: "x".into(),
@@ -2037,7 +2432,7 @@ mod tests {
 
     #[test]
     fn array_subscript() {
-        let prog = Program::new(vec![
+        let prog = Program::from_decls(vec![
             TopLevel::new(
                 TopLevelKind::GlobalVar {
                     name: "arr".into(),
@@ -2297,7 +2692,7 @@ mod tests {
 
     #[test]
     fn func_decl_registers_type() {
-        let prog = Program::new(vec![
+        let prog = Program::from_decls(vec![
             TopLevel::new(
                 TopLevelKind::FuncDecl {
                     name: "ext".into(),
@@ -2373,7 +2768,7 @@ mod tests {
 
     #[test]
     fn subscript_lvalue() {
-        let prog = Program::new(vec![
+        let prog = Program::from_decls(vec![
             TopLevel::new(
                 TopLevelKind::GlobalVar {
                     name: "arr".into(),
@@ -2417,7 +2812,7 @@ mod tests {
 
     #[test]
     fn void_function_call() {
-        let prog = Program::new(vec![
+        let prog = Program::from_decls(vec![
             TopLevel::new(
                 TopLevelKind::FuncDecl {
                     name: "noop".into(),

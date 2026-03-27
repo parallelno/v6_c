@@ -41,6 +41,28 @@ pub enum CType {
         return_type: Box<CType>,
         params: Vec<CType>,
     },
+
+    /// `struct` type with named fields (no padding on 8080).
+    Struct {
+        /// Tag name (empty string for anonymous structs).
+        tag: String,
+        /// Ordered fields: `(field_name, field_type)`.
+        members: Vec<(String, CType)>,
+    },
+
+    /// `union` type — all fields share the same starting offset.
+    Union {
+        /// Tag name (empty string for anonymous unions).
+        tag: String,
+        /// Fields: `(field_name, field_type)`.
+        members: Vec<(String, CType)>,
+    },
+
+    /// `enum` type — syntactic sugar over `int`.
+    Enum {
+        /// Tag name (empty string for anonymous enums).
+        tag: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -73,12 +95,30 @@ impl CType {
             CType::Pointer(_) => Some(2),
             CType::Array { element, size } => element.size_of().map(|es| es * size),
             CType::Function { .. } => None,
+            CType::Struct { members, .. } => {
+                let mut total = 0usize;
+                for (_, ty) in members {
+                    total += ty.size_of()?;
+                }
+                Some(total)
+            }
+            CType::Union { members, .. } => {
+                let mut max = 0usize;
+                for (_, ty) in members {
+                    let s = ty.size_of()?;
+                    if s > max {
+                        max = s;
+                    }
+                }
+                Some(max)
+            }
+            CType::Enum { .. } => Some(2), // enum is int-sized
         }
     }
 
-    /// `true` for `Char`, `Int`, and `Long` (signed or unsigned).
+    /// `true` for `Char`, `Int`, `Long`, and `Enum` (signed or unsigned).
     pub fn is_integer(&self) -> bool {
-        matches!(self, CType::Char { .. } | CType::Int { .. } | CType::Long { .. })
+        matches!(self, CType::Char { .. } | CType::Int { .. } | CType::Long { .. } | CType::Enum { .. })
     }
 
     /// `true` for any `Pointer` type.
@@ -122,6 +162,54 @@ impl CType {
         matches!(self, CType::Function { .. })
     }
 
+    /// `true` for `Struct { .. }`.
+    pub fn is_struct(&self) -> bool {
+        matches!(self, CType::Struct { .. })
+    }
+
+    /// `true` for `Union { .. }`.
+    pub fn is_union(&self) -> bool {
+        matches!(self, CType::Union { .. })
+    }
+
+    /// `true` for `Enum { .. }`.
+    pub fn is_enum(&self) -> bool {
+        matches!(self, CType::Enum { .. })
+    }
+
+    /// `true` for `Struct` or `Union`.
+    pub fn is_struct_or_union(&self) -> bool {
+        self.is_struct() || self.is_union()
+    }
+
+    /// Look up a field in a struct or union.
+    ///
+    /// Returns `(byte_offset, field_type)` if found.  For unions the offset
+    /// is always 0.
+    pub fn field_offset(&self, name: &str) -> Option<(usize, CType)> {
+        match self {
+            CType::Struct { members, .. } => {
+                let mut offset = 0usize;
+                for (fname, fty) in members {
+                    if fname == name {
+                        return Some((offset, fty.clone()));
+                    }
+                    offset += fty.size_of().unwrap_or(0);
+                }
+                None
+            }
+            CType::Union { members, .. } => {
+                for (fname, fty) in members {
+                    if fname == name {
+                        return Some((0, fty.clone()));
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
     /// Integer conversion rank used for the usual arithmetic conversions.
     /// Higher rank wins during type promotion.
     ///
@@ -129,7 +217,7 @@ impl CType {
     fn integer_rank(&self) -> Option<u8> {
         match self {
             CType::Char { .. } => Some(1),
-            CType::Int { .. } => Some(2),
+            CType::Int { .. } | CType::Enum { .. } => Some(2),
             CType::Long { .. } => Some(3),
             _ => None,
         }
@@ -261,6 +349,8 @@ fn integer_promote(ty: &CType) -> Option<CType> {
         // signed int can represent the full range of both on 8080.
         CType::Char { .. } => Some(CType::Int { signed: true }),
         CType::Int { .. } | CType::Long { .. } => Some(ty.clone()),
+        // Enum promotes to int.
+        CType::Enum { .. } => Some(CType::Int { signed: true }),
         _ => None,
     }
 }
@@ -336,6 +426,27 @@ impl fmt::Display for CType {
                     write!(f, "{}", p)?;
                 }
                 write!(f, ")")
+            }
+            CType::Struct { tag, .. } => {
+                if tag.is_empty() {
+                    write!(f, "struct <anonymous>")
+                } else {
+                    write!(f, "struct {}", tag)
+                }
+            }
+            CType::Union { tag, .. } => {
+                if tag.is_empty() {
+                    write!(f, "union <anonymous>")
+                } else {
+                    write!(f, "union {}", tag)
+                }
+            }
+            CType::Enum { tag } => {
+                if tag.is_empty() {
+                    write!(f, "enum <anonymous>")
+                } else {
+                    write!(f, "enum {}", tag)
+                }
             }
         }
     }
