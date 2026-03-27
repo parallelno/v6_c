@@ -2,13 +2,13 @@
 //!
 //! Translates the three-address-code IR into Intel 8080 assembly text.
 //! Each IR function becomes a labelled block of 8080 instructions; globals
-//! are emitted as `DB` / `DW` / `DS` directives in a data section.
+//! are emitted as `DB` and `.storage` directives in a data section.
 //!
 //! The module works hand-in-hand with [`crate::regalloc::RegAllocator`] which
 //! tracks physical register assignments, and [`crate::callgraph::CallGraphAnalysis`]
 //! which provides the static memory addresses for non-recursive functions.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::callgraph::CallGraphAnalysis;
 use crate::ir::{IrFunction, IrInstr, IrOp, IrProgram, Label, VReg, Width};
@@ -1312,9 +1312,19 @@ impl CodeGenerator {
 
 impl CodeGenerator {
     fn gen_data_section(&mut self, program: &IrProgram) {
+        let mut emitted_labels: HashSet<String> = HashSet::new();
+
         // Global variables
         for gvar in &program.globals {
-            let label = format!("_g_{}", gvar.name);
+            // IR symbols may already be canonical labels (e.g. `_g_x`, `_l_f_a`).
+            let label = if gvar.name.starts_with('_') {
+                gvar.name.clone()
+            } else {
+                format!("_g_{}", gvar.name)
+            };
+            if !emitted_labels.insert(label.clone()) {
+                continue;
+            }
             self.emit_label(&label);
             let size = gvar.ty.size_of().unwrap_or(2);
             if let Some(init) = &gvar.init {
@@ -1326,12 +1336,15 @@ impl CodeGenerator {
                     self.emit_inst("DB 0");
                 }
             } else {
-                self.emit_inst(&format!("DS {}", size));
+                self.emit_inst(&format!(".storage {}", size));
             }
         }
 
         // String literals
         for slit in &program.strings {
+            if !emitted_labels.insert(slit.label.clone()) {
+                continue;
+            }
             self.emit_label(&slit.label);
             for byte in &slit.data {
                 self.emit_inst(&format!("DB {}", byte));
@@ -1354,22 +1367,32 @@ impl CodeGenerator {
             }
         }
         for label in &spill_labels {
+            if !emitted_labels.insert(label.clone()) {
+                continue;
+            }
             self.emit_label(label);
-            self.emit_inst("DS 2");
+            self.emit_inst(".storage 2");
         }
 
         // Static local/param allocations from the analysis
         let local_labels: Vec<String> = self.analysis.local_allocs.keys().cloned().collect();
         for label in &local_labels {
+            if !emitted_labels.insert(label.clone()) {
+                continue;
+            }
             self.emit_label(label);
-            self.emit_inst("DS 2");
+            self.emit_inst(".storage 2");
         }
 
         // va_base labels for variadic functions
         for func in &program.functions {
             if func.is_variadic {
-                self.emit_label(&format!("__va_base_{}", func.name));
-                self.emit_inst("DS 2");
+                let label = format!("__va_base_{}", func.name);
+                if !emitted_labels.insert(label.clone()) {
+                    continue;
+                }
+                self.emit_label(&label);
+                self.emit_inst(".storage 2");
             }
         }
     }
@@ -1885,7 +1908,7 @@ mod tests {
         let analysis = simple_analysis(&prog);
         let out = generate(&prog, &analysis);
         assert!(has_line(&out, "_g_x:"));
-        assert!(has_line(&out, "DS 2"));
+        assert!(has_line(&out, ".storage 2"));
     }
 
     #[test]

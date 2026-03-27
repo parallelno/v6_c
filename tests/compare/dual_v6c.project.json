@@ -1,0 +1,7 @@
+{
+  "name": "dual_v6c",
+  "asmPath": "dual_v6c.asm",
+  "debugPath": "dual_v6c.debug.json",
+  "romPath": "dual_v6c.rom",
+  "cpu": "i8080"
+}

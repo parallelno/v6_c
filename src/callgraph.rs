@@ -248,7 +248,11 @@ fn allocate_globals(program: &IrProgram, base: u16) -> (HashMap<String, u16>, u1
     let mut addr = base;
 
     for gvar in &program.globals {
-        let label = format!("_g_{}", gvar.name);
+        let label = if gvar.name.starts_with('_') {
+            gvar.name.clone()
+        } else {
+            format!("_g_{}", gvar.name)
+        };
         allocs.insert(label, addr);
 
         let size = gvar.ty.size_of().unwrap_or(2) as u16;
