@@ -276,7 +276,7 @@ __strncmp_eq:
 	RET
 
 __strncmp_cnt:
-	DS 2
+	.storage 2
 
 ; ---------------------------------------------------------------------------
 ; strchr — find first occurrence of char c in string s

@@ -539,10 +539,10 @@ __pf_oct_print1:
 
 ; --- printf static data ---
 __pf_arg:
-	DS 2			; saved first format arg (DE)
+	.storage 2			; saved first format arg (DE)
 __pf_stkptr:
-	DS 2			; pointer to next stack arg
+	.storage 2			; pointer to next stack arg
 __pf_argidx:
-	DS 1			; 0 = next arg from DE, 1+ = from stack
+	.storage 1			; 0 = next arg from DE, 1+ = from stack
 __pf_count:
-	DS 2			; characters written
+	.storage 2			; characters written

@@ -190,6 +190,6 @@ __dm16_next:
 	RET
 
 __dm16_dv:
-	DS 2		; divisor temp
+	.storage 2		; divisor temp
 __dm16_cnt:
-	DS 1		; loop counter
+	.storage 1		; loop counter

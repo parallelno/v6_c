@@ -1,7 +1,0 @@
-{
-  "name": "dual_c8080",
-  "asmPath": "dual_c8080.asm",
-  "debugPath": "dual_c8080.debug.json",
-  "romPath": "dual_c8080.rom",
-  "cpu": "i8080"
-}

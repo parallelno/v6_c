@@ -25,3 +25,5 @@ target
 
 /target
 /references
+/out
+/dependencies

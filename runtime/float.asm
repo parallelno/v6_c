@@ -1200,16 +1200,16 @@ __ftoi_neg_overflow:
 ; Scratch data storage for float operations
 ; =====================================================================
 __fa_s1:
-	DS 1
+	.storage 1
 __fa_e1:
-	DS 1
+	.storage 1
 __fa_m1:
-	DS 4
+	.storage 4
 __fa_s2:
-	DS 1
+	.storage 1
 __fa_e2:
-	DS 1
+	.storage 1
 __fa_m2:
-	DS 4
+	.storage 4
 __fa_tmp:
-	DS 8
+	.storage 8

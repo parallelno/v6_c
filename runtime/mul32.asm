@@ -96,4 +96,4 @@ __mul32_skip:
 	RET
 
 __res32:
-	DS 4		; 32-bit result accumulator
+	.storage 4		; 32-bit result accumulator

@@ -320,16 +320,16 @@ __dm32_next:
 
 ; Temporaries
 __dm32_q:
-	DS 4		; quotient
+	.storage 4		; quotient
 __dm32_r:
-	DS 4		; remainder
+	.storage 4		; remainder
 __dm32_sv:
-	DS 4		; saved remainder for restore
+	.storage 4		; saved remainder for restore
 __dm32_cnt:
-	DS 1		; loop counter
+	.storage 1		; loop counter
 
 ; Shared operand storage (used by mul32, div32, shift32)
 __op1:
-	DS 4
+	.storage 4
 __op2:
-	DS 4
+	.storage 4

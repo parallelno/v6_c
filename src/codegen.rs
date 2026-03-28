@@ -212,8 +212,11 @@ impl CodeGenerator {
     }
 
     /// Format an IR label for assembly output.
-    fn ir_label(label: Label) -> String {
-        format!("L{}", label.0)
+    ///
+    /// Labels are suffixed with the current function name to avoid global
+    /// symbol collisions when multiple functions define their own `L0`, etc.
+    fn ir_label(&self, label: Label) -> String {
+        format!("L{}__{}", label.0, self.current_func)
     }
 
     /// Get the memory label for a W32 vreg (spilling to memory if needed).
@@ -639,7 +642,7 @@ impl CodeGenerator {
             }
             IrOp::Return { value } => self.gen_return(*value),
             IrOp::Label { label } => {
-                self.emit_label(&Self::ir_label(*label));
+                self.emit_label(&self.ir_label(*label));
             }
 
             // -- address-of -----------------------------------------------
@@ -1424,13 +1427,13 @@ impl CodeGenerator {
     // -- Jump -------------------------------------------------------------
 
     fn gen_jump(&mut self, target: Label) {
-        self.emit_inst(&format!("JMP {}", Self::ir_label(target)));
+        self.emit_inst(&format!("JMP {}", self.ir_label(target)));
     }
 
     // -- JumpIfTrue / JumpIfFalse -----------------------------------------
 
     fn gen_jump_if_true(&mut self, cond: VReg, target: Label) {
-        let lbl = Self::ir_label(target);
+        let lbl = self.ir_label(target);
         match cond.width {
             Width::W8 => {
                 self.ensure_a(cond);
@@ -1447,7 +1450,7 @@ impl CodeGenerator {
     }
 
     fn gen_jump_if_false(&mut self, cond: VReg, target: Label) {
-        let lbl = Self::ir_label(target);
+        let lbl = self.ir_label(target);
         match cond.width {
             Width::W8 => {
                 self.ensure_a(cond);
