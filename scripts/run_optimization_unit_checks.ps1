@@ -2,15 +2,21 @@ param(
     [string]$Filter,
     [switch]$NoAutoBuildV6asm,
     [switch]$RequireV6asm,
-    [switch]$AllowAsmFailure
+    [switch]$AllowAsmFailure,
+    [switch]$UseSmall
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$testsDir = Join-Path $repoRoot "tests\unit\optimization"
-$outDir = Join-Path $repoRoot "out\tests\unit\optimization"
+if ($UseSmall) {
+    $testsDir = Join-Path $repoRoot "tests\unit\optimization_small"
+    $outDir = Join-Path $repoRoot "out\tests\unit\optimization_small"
+} else {
+    $testsDir = Join-Path $repoRoot "tests\unit\optimization"
+    $outDir = Join-Path $repoRoot "out\tests\unit\optimization"
+}
 $toolsDir = Join-Path $repoRoot "dependencies\v6asm"
 $v6asmExe = Join-Path $toolsDir "v6asm.exe"
 $v6asmSrcDir = Join-Path $toolsDir "v6_assembler"
