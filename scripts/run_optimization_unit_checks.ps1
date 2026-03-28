@@ -113,6 +113,10 @@ try {
             throw "Missing asm output for $($case.Name): $asmPath"
         }
 
+        if (-not (Test-Path $lstPath)) {
+            throw "Missing v6c lst output for $($case.Name): $lstPath"
+        }
+
         $assembled = $false
         if ($null -ne $v6asmCmd) {
             $innerSavedLocation = (Get-Location).Path
@@ -127,6 +131,16 @@ try {
                 }
                 else {
                     $assembled = $true
+
+                    $romOutput = Join-Path $outDir ($base + ".rom")
+                    $v6asmLstPath = Join-Path $outDir ($base + ".lst")
+
+                    if (-not (Test-Path $romOutput)) {
+                        throw "v6asm did not emit ROM for $($case.Name): $romOutput"
+                    }
+                    if (-not (Test-Path $v6asmLstPath)) {
+                        throw "v6asm did not emit list file for $($case.Name): $v6asmLstPath"
+                    }
                 }
             }
             finally {

@@ -2064,8 +2064,8 @@ mod tests {
         f.push_op(IrOp::jump(lbl));
         f.push_op(IrOp::ret(None));
         let out = gen_single_func(f);
-        assert!(has_line(&out, "JMP L5"));
-        assert!(has_line(&out, "L5:"));
+        assert!(has_line(&out, "JMP L5__test"));
+        assert!(has_line(&out, "L5__test:"));
     }
 
     #[test]
