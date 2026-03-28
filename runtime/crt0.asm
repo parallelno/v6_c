@@ -11,14 +11,12 @@
 ; Memory map (Vector 06C):
 ;   0x0000-0x00FF  System / interrupt vectors
 ;   0x0100-0x7FFF  Program code + data + heap
-;   0x8000-0xEFFF  Variable allocation (callgraph static alloc)
-;   0xF000-0xF7FF  Heap upper limit (configurable)
-;   0xF800-0xFFFF  Stack (grows downward)
+;   0x8000-0xFFFF  Stack (grows downward) / video memory region
 
 ; ---------------------------------------------------------------------------
 ; _start — runtime entry point
 ; ---------------------------------------------------------------------------
 _start:
-	LXI SP,0xF800		; set stack below screen memory
+	LXI SP,0x8000		; set stack to start of video memory region (0x8000)
 	CALL main
 	HLT			; halt after main returns

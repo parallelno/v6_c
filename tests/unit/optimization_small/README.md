@@ -53,6 +53,13 @@ Generated outputs are stored under:
   - `<test>.rom` (v6asm ROM binary output)
   - `<test>.lst` (v6asm listing output)
 
+## Memory map expectations (Vector 06C)
+
+- 0x0000-0x00FF: system/interrupt vectors
+- 0x0100-0x7FFF: program code + data + heap
+- 0x8000-0xFFFF: stack and video memory region
+- runtime CRT0 sets `SP = 0x8000` at startup
+
 ## Inspecting optimized output
 
 1. Confirm v6c produced the expected assembly and label patterns: open `out/tests/unit/optimization_small/<test>.asm`.
