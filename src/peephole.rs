@@ -127,6 +127,9 @@ fn apply_rules(lines: &mut Vec<Line>) -> bool {
     // --- Rule 13: Merge adjacent labels ----------------------------------
     changed |= rule_merge_adjacent_labels(lines);
 
+    // --- Rule 35: Inline main into CRT0 startup --------------------------
+    changed |= rule_inline_main(lines);
+
     // --- Two-instruction window rules ------------------------------------
     changed |= rule_two_window(lines);
 
@@ -438,6 +441,62 @@ fn rule_jump_to_next(lines: &mut Vec<Line>) -> bool {
         i += 1;
     }
     changed
+}
+
+/// Rule 35 – Inline main (special case for CRT0 startup).
+///
+/// Replaces `CALL main` in `_start` with the body of `main` (excluding
+/// trailing `RET`), then keeps `main:` around for compatibility.
+fn rule_inline_main(lines: &mut Vec<Line>) -> bool {
+    // Find main function body markers.
+    let main_label_pos = match lines.iter().position(|line| match line {
+        Line::Label(name) if name == "main" => true,
+        _ => false,
+    }) {
+        Some(i) => i,
+        None => return false,
+    };
+
+    // Find the first label after main that is not a local main label.
+    let mut main_end = lines.len();
+    for i in main_label_pos + 1..lines.len() {
+        if let Line::Label(name) = &lines[i] {
+            if !name.ends_with("__main") {
+                main_end = i;
+                break;
+            }
+        }
+    }
+
+    // Collect main body (skip trailing RET if present).
+    let mut body: Vec<Line> = lines[main_label_pos + 1..main_end]
+        .iter()
+        .filter(|line| !matches!(line, Line::Empty))
+        .cloned()
+        .collect();
+
+    if matches!(body.last(), Some(Line::Instruction { opcode, .. }) if opcode == "RET") {
+        body.pop();
+    }
+
+    // Find the startup call to main.
+    let call_idx = match lines.iter().position(|line| match line {
+        Line::Instruction { opcode, operands } => {
+            opcode == "CALL" && operands.trim() == "main"
+        }
+        _ => false,
+    }) {
+        Some(i) => i,
+        None => return false,
+    };
+
+    // Insert body at call site; remove CALL main.
+    lines.remove(call_idx);
+    for (offset, line) in body.iter().cloned().enumerate() {
+        lines.insert(call_idx + offset, line);
+    }
+
+    true
 }
 
 /// Rule 19 – Conditional branch inversion.

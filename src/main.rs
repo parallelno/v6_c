@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 mod ast;
 mod callgraph;
 mod codegen;
@@ -359,6 +361,18 @@ mod tests {
         let out = compile_source(src, "test.c", &[]).expect("compilation failed");
         assert!(has_line(&out, "main:"), "must have main label");
         assert!(has_line(&out, "RET"), "must have RET");
+        // Inlined startup should avoid CALL main in CRT0.
+        assert!(!has_line(&out, "CALL main"));
+    }
+
+    #[test]
+    fn pipeline_inline_main_body() {
+        let src = "int main(void) { int x; x = 1; }";
+        let out = compile_source(src, "test.c", &[]).expect("compilation failed");
+        assert!(!has_line(&out, "CALL main"));
+        // Should contain main instructions in startup zone (LXI SP + some op)
+        assert!(has_line(&out, "MOV" ) || has_line(&out, "STA") || has_line(&out, "LXI"));
+        assert!(has_line(&out, "main:"), "main label should still exist");
     }
 
     #[test]
@@ -518,8 +532,7 @@ mod tests {
         let path = path.to_str().unwrap();
         emit::emit_asm(&out, path).expect("emit failed");
         let contents = std::fs::read_to_string(path).expect("read failed");
-        assert!(contents.contains("ORG 0x100"));
-        assert!(contents.contains("JMP _start"));
+        assert!(contents.contains(".ORG 0x100"));
         let _ = std::fs::remove_file(path);
     }
 

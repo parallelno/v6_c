@@ -1,8 +1,8 @@
 ; crt0.asm — C runtime startup for Vector 06C (Intel 8080)
 ;
 ; Generated programs are assembled with v6asm (ORG 0x100).
-; The emitter writes ORG 0x100 and JMP _start before including
-; generated code. This module provides:
+; The emitter writes ORG 0x100 before including generated code.
+; This module provides:
 ;   1. Stack initialization
 ;   2. BSS zero-fill (static data clearing)
 ;   3. Call to main()
@@ -17,6 +17,7 @@
 ; _start — runtime entry point
 ; ---------------------------------------------------------------------------
 _start:
+	DI
 	LXI SP,0x8000		; set stack to start of video memory region (0x8000)
 	CALL main
 	HLT			; halt after main returns
