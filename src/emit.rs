@@ -618,9 +618,15 @@ fn extract_main_body(code_lines: &[String]) -> (Vec<String>, Vec<String>) {
 
     let mut main_end = rest.len();
     for i in main_start + 1..rest.len() {
-        if let Some(stripped) = rest[i].trim().strip_suffix(':') {
-            // label marker denotes end of main body, but skip if it's local (e.g. from inner labels).
-            if stripped != "" {
+        let trimmed = rest[i].trim();
+        // Section delimiter comment — end of this function's code region.
+        if trimmed.starts_with("; ---") {
+            main_end = i;
+            break;
+        }
+        if let Some(stripped) = trimmed.strip_suffix(':') {
+            // Internal block labels for main are formatted L{n}__main; skip them.
+            if stripped != "" && !stripped.ends_with("__main") {
                 main_end = i;
                 break;
             }
@@ -634,8 +640,16 @@ fn extract_main_body(code_lines: &[String]) -> (Vec<String>, Vec<String>) {
         }
     }
 
-    // Remove main function from the rest of code.
-    rest.drain(main_start..main_end);
+    // Remove main function from the rest of code, including the preceding
+    // "; function main" comment if present.
+    let drain_start = if main_start > 0
+        && rest[main_start - 1].trim().starts_with("; function")
+    {
+        main_start - 1
+    } else {
+        main_start
+    };
+    rest.drain(drain_start..main_end);
     (rest, main_body)
 }
 

@@ -88,6 +88,7 @@ fn optimize_function(func: &mut IrFunction, profile: OptProfile) {
         match profile {
             OptProfile::Default => {
                 changed |= constant_fold_and_propagate(func);
+                changed |= dead_branch_eliminate(func);
                 changed |= load_store_forwarding(func);
                 changed |= strength_reduce(func);
                 changed |= narrow_byte_ops(func);
@@ -98,6 +99,7 @@ fn optimize_function(func: &mut IrFunction, profile: OptProfile) {
             }
             OptProfile::Benchmark => {
                 changed |= constant_fold_and_propagate(func);
+                changed |= dead_branch_eliminate(func);
                 changed |= load_store_forwarding(func);
                 changed |= cse(func);
                 changed |= narrow_byte_ops(func);
@@ -1406,6 +1408,43 @@ fn get_pure_dst(op: &IrOp) -> Option<VReg> {
     }
 }
 
+/// Get the destination vreg of ANY instruction that writes a vreg, including
+/// those with side effects (LoadGlobal, LoadLocal, LoadPtr, Call, etc.).
+/// Used by dead_branch_eliminate to detect vregs that are mutated.
+fn get_any_dst(op: &IrOp) -> Option<VReg> {
+    match op {
+        IrOp::LoadImm { dst, .. }
+        | IrOp::LoadGlobal { dst, .. }
+        | IrOp::LoadLocal { dst, .. }
+        | IrOp::LoadPtr { dst, .. }
+        | IrOp::Add { dst, .. }
+        | IrOp::Sub { dst, .. }
+        | IrOp::Mul { dst, .. }
+        | IrOp::Div { dst, .. }
+        | IrOp::Mod { dst, .. }
+        | IrOp::And { dst, .. }
+        | IrOp::Or { dst, .. }
+        | IrOp::Xor { dst, .. }
+        | IrOp::Shl { dst, .. }
+        | IrOp::Shr { dst, .. }
+        | IrOp::Eq { dst, .. }
+        | IrOp::Ne { dst, .. }
+        | IrOp::Lt { dst, .. }
+        | IrOp::Le { dst, .. }
+        | IrOp::Gt { dst, .. }
+        | IrOp::Ge { dst, .. }
+        | IrOp::Neg { dst, .. }
+        | IrOp::Not { dst, .. }
+        | IrOp::LogicalNot { dst, .. }
+        | IrOp::Copy { dst, .. }
+        | IrOp::Cast { dst, .. }
+        | IrOp::AddrOfGlobal { dst, .. }
+        | IrOp::PtrAdd { dst, .. } => Some(*dst),
+        IrOp::Call { dst: Some(dst), .. } => Some(*dst),
+        _ => None,
+    }
+}
+
 /// Collect the set of all vreg IDs that are *read* (used as operands).
 fn collect_used_vregs(body: &[IrInstr]) -> HashSet<u32> {
     let mut used = HashSet::new();
@@ -1579,6 +1618,123 @@ fn cse_key(op: &IrOp) -> Option<(CseKey, VReg)> {
 /// When a jump targets a label that is immediately followed by another
 /// unconditional jump, rewrite the first jump to target the final
 /// destination.  Also handles conditional branches.
+// ---------------------------------------------------------------------------
+// Dead branch elimination
+// ---------------------------------------------------------------------------
+
+/// Remove conditional branches whose condition is a compile-time constant.
+///
+/// After `constant_fold_and_propagate` has run, any `LoadImm` whose destination
+/// vreg feeds a `JumpIfTrue`/`JumpIfFalse` gives us a statically-known branch
+/// direction:
+///
+/// * `JumpIfFalse { cond=0 }` → unconditional `Jump` (always taken).
+/// * `JumpIfFalse { cond≠0 }` → removed (never taken, fall-through).
+/// * `JumpIfTrue  { cond≠0 }` → unconditional `Jump`.
+/// * `JumpIfTrue  { cond=0 }` → removed.
+///
+/// The resulting unreachable instructions between a now-unconditional `Jump`
+/// and the next `Label` are cleaned up by the subsequent `dead_code_eliminate`
+/// pass.  Any `LoadImm` that solely fed the removed branch condition will then
+/// be pruned by that same pass's vreg-use scan.
+fn dead_branch_eliminate(func: &mut IrFunction) -> bool {
+    // Build a map of vreg id → constant value from LoadImm instructions.
+    // After constant_fold_and_propagate all constants are already expressed
+    // as LoadImm, so a single linear scan is sufficient.
+    let mut constants: HashMap<u32, i64> = HashMap::new();
+    for instr in &func.body {
+        if let IrOp::LoadImm { dst, value } = &instr.op {
+            constants.insert(dst.id, *value);
+        }
+    }
+
+    // Remove any vreg from the constants map that is also the destination of
+    // a non-LoadImm instruction (i.e. it is mutated, e.g. by an Add in a loop
+    // increment).  Such vregs are not globally constant.
+    for instr in &func.body {
+        match &instr.op {
+            IrOp::LoadImm { .. } => {}  // the source of the constant — keep
+            _ => {
+                // Any other instruction that writes a dst invalidates it.
+                if let Some(dst) = get_any_dst(&instr.op) {
+                    constants.remove(&dst.id);
+                }
+            }
+        }
+    }
+
+    if constants.is_empty() {
+        return false;
+    }
+
+    let mut changed = false;
+    let new_body: Vec<IrInstr> = func
+        .body
+        .iter()
+        .map(|instr| {
+            match &instr.op {
+                IrOp::JumpIfFalse { cond, target } => {
+                    if let Some(&val) = constants.get(&cond.id) {
+                        changed = true;
+                        if val == 0 {
+                            // Condition is always false → branch always taken.
+                            IrInstr { op: IrOp::Jump { target: *target }, line: instr.line }
+                        } else {
+                            instr.clone() // never-taken; stripped in second pass
+                        }
+                    } else {
+                        instr.clone()
+                    }
+                }
+                IrOp::JumpIfTrue { cond, target } => {
+                    if let Some(&val) = constants.get(&cond.id) {
+                        changed = true;
+                        if val != 0 {
+                            // Condition is always true → branch always taken.
+                            IrInstr { op: IrOp::Jump { target: *target }, line: instr.line }
+                        } else {
+                            instr.clone() // never-taken; stripped in second pass
+                        }
+                    } else {
+                        instr.clone()
+                    }
+                }
+                _ => instr.clone(),
+            }
+        })
+        .collect();
+
+    // Second pass: drop conditional jumps that are never taken.
+    let final_body: Vec<IrInstr> = new_body
+        .into_iter()
+        .filter(|instr| {
+            match &instr.op {
+                IrOp::JumpIfFalse { cond, .. } => {
+                    if let Some(&val) = constants.get(&cond.id) {
+                        val == 0  // keep only if it's still the always-taken case
+                    } else {
+                        true
+                    }
+                }
+                IrOp::JumpIfTrue { cond, .. } => {
+                    if let Some(&val) = constants.get(&cond.id) {
+                        val != 0
+                    } else {
+                        true
+                    }
+                }
+                _ => true,
+            }
+        })
+        .collect();
+
+    if func.body.len() != final_body.len() {
+        changed = true;
+    }
+    func.body = final_body;
+    changed
+}
+
 fn jump_threading(func: &mut IrFunction) -> bool {
     // Build map: label → index in body
     let mut label_index: HashMap<u32, usize> = HashMap::new();
