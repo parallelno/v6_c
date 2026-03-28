@@ -100,8 +100,6 @@ try {
         $base = [System.IO.Path]::GetFileNameWithoutExtension($case.Name)
         $asmPath = Join-Path $outDir ($base + ".asm")
         $lstPath = Join-Path $outDir ($base + ".v6c.lst")
-        $projectPath = Join-Path $outDir ($base + ".project.json")
-        $debugPath = $base + ".debug.json"
         $romPath = $base + ".rom"
 
         Write-Host "--- $($case.Name)"
@@ -115,21 +113,12 @@ try {
             throw "Missing asm output for $($case.Name): $asmPath"
         }
 
-        $projectObj = @{
-            name = $base
-            asmPath = ($base + ".asm")
-            debugPath = $debugPath
-            romPath = $romPath
-            cpu = "i8080"
-        }
-        $projectObj | ConvertTo-Json -Depth 4 | Set-Content -Path $projectPath -Encoding ASCII
-
         $assembled = $false
         if ($null -ne $v6asmCmd) {
             $innerSavedLocation = (Get-Location).Path
             Set-Location $outDir
             try {
-                & $v6asmCmd (Split-Path -Leaf $projectPath)
+                & $v6asmCmd (Split-Path -Leaf $asmPath) --lst
                 if ($LASTEXITCODE -ne 0) {
                     if ($strictMode) {
                         throw "v6asm failed for $($case.Name)"
