@@ -176,6 +176,25 @@ impl IrGenerator {
         });
     }
 
+    /// Emit an error if the integer literal `val` cannot be represented in `ty`.
+    fn check_literal_fits_type(&mut self, val: i64, ty: &CType) {
+        let fits = match ty {
+            CType::Char { signed: true }  => val >= -128  && val <= 127,
+            CType::Char { signed: false } => val >= 0     && val <= 255,
+            CType::Int  { signed: true }  => val >= -32768 && val <= 32767,
+            CType::Int  { signed: false } => val >= 0     && val <= 65535,
+            CType::Long { signed: true }  => val >= i32::MIN as i64 && val <= i32::MAX as i64,
+            CType::Long { signed: false } => val >= 0     && val <= u32::MAX as i64,
+            _ => return,
+        };
+        if !fits {
+            self.error(&format!(
+                "constant value {} overflows type '{}'",
+                val, ty
+            ));
+        }
+    }
+
     fn body_ends_with_return(&self) -> bool {
         self.body
             .last()
@@ -1316,6 +1335,10 @@ impl IrGenerator {
             // Simple assignment.
             let lv = self.gen_lvalue(target);
             let ty = self.lvalue_type(&lv);
+            // Check that integer literals fit the target type before narrowing.
+            if let ExprKind::IntLiteral(lit_val) = &value.kind {
+                self.check_literal_fits_type(*lit_val, &ty);
+            }
             let (val, val_ty) = self.gen_expr(value);
             let val = self.maybe_cast(val, &val_ty, &ty);
             self.store_lvalue(&lv, val);
@@ -2992,5 +3015,109 @@ mod tests {
         if let IrOp::Call { dst, .. } = &call_instr.op {
             assert!(dst.is_none());
         }
+    }
+
+    // =====================================================================
+    // Literal overflow / type-range checks
+    // =====================================================================
+
+    /// Helper: build a program assigning `val` to a global of type `ty`.
+    fn overflow_prog(ty: CType, val: i64) -> Program {
+        Program::from_decls(vec![
+            TopLevel::new(
+                TopLevelKind::GlobalVar {
+                    name: "x".into(),
+                    ty: ty.clone(),
+                    storage: None,
+                    init: None,
+                },
+                loc(1),
+            ),
+            TopLevel::new(
+                TopLevelKind::FuncDef {
+                    name: "main".into(),
+                    return_type: CType::Void,
+                    params: vec![],
+                    storage: None,
+                    is_variadic: false,
+                    body: compound(vec![expr_stmt(assign(
+                        AssignOp::Assign,
+                        ident("x"),
+                        int_lit(val),
+                    ))]),
+                },
+                loc(2),
+            ),
+        ])
+    }
+
+    #[test]
+    fn overflow_char_signed_too_large() {
+        let err = generate(&overflow_prog(CType::char_signed(), 128))
+            .expect_err("should fail");
+        assert!(
+            err[0].message.contains("128") && err[0].message.contains("char"),
+            "unexpected error: {}", err[0].message
+        );
+    }
+
+    #[test]
+    fn overflow_char_signed_too_small() {
+        let err = generate(&overflow_prog(CType::char_signed(), -129))
+            .expect_err("should fail");
+        assert!(
+            err[0].message.contains("-129") && err[0].message.contains("char"),
+            "unexpected error: {}", err[0].message
+        );
+    }
+
+    #[test]
+    fn overflow_char_unsigned_too_large() {
+        let err = generate(&overflow_prog(CType::char_unsigned(), 256))
+            .expect_err("should fail");
+        assert!(
+            err[0].message.contains("256") && err[0].message.contains("char"),
+            "unexpected error: {}", err[0].message
+        );
+    }
+
+    #[test]
+    fn overflow_char_unsigned_negative() {
+        let err = generate(&overflow_prog(CType::char_unsigned(), -1))
+            .expect_err("should fail");
+        assert!(
+            err[0].message.contains("-1") && err[0].message.contains("char"),
+            "unexpected error: {}", err[0].message
+        );
+    }
+
+    #[test]
+    fn overflow_int_unsigned_negative() {
+        let err = generate(&overflow_prog(CType::int_unsigned(), -1))
+            .expect_err("should fail");
+        assert!(
+            err[0].message.contains("-1") && err[0].message.contains("int"),
+            "unexpected error: {}", err[0].message
+        );
+    }
+
+    #[test]
+    fn no_overflow_char_signed_boundary() {
+        // 127 and -128 are exactly at the boundary — must succeed.
+        generate(&overflow_prog(CType::char_signed(), 127)).expect("127 fits signed char");
+        generate(&overflow_prog(CType::char_signed(), -128)).expect("-128 fits signed char");
+    }
+
+    #[test]
+    fn no_overflow_char_unsigned_boundary() {
+        // 0 and 255 fit unsigned char.
+        generate(&overflow_prog(CType::char_unsigned(), 0)).expect("0 fits unsigned char");
+        generate(&overflow_prog(CType::char_unsigned(), 255)).expect("255 fits unsigned char");
+    }
+
+    #[test]
+    fn no_overflow_int_signed() {
+        generate(&overflow_prog(CType::int_signed(), 32767)).expect("32767 fits signed int");
+        generate(&overflow_prog(CType::int_signed(), -32768)).expect("-32768 fits signed int");
     }
 }
