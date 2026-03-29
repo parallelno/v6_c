@@ -1363,7 +1363,7 @@ impl CodeGenerator {
                         self.mark(dst, PhysReg::HL);
                         return;
                     }
-                    if !is_right && count <= 3 {
+                    if !is_right && count <= 8 {
                         self.regalloc.free(rhs);
                         self.ensure_hl(lhs);
                         if self.last_use.get(&lhs.id).copied() == Some(self.instr_index) {
@@ -1403,9 +1403,18 @@ impl CodeGenerator {
                     "__shl16"
                 };
                 self.spill_live_before_call(helper);
-                self.ensure(rhs, PhysReg::BC);
-                self.ensure_hl(lhs);
-                self.emit_inst("MOV A,C"); // count: C (low byte of BC) → A
+                // If the shift count is a known immediate, emit MVI A,n directly
+                // rather than loading it into BC and then copying C→A.
+                if let Some(k) = self.known_imm(rhs) {
+                    let count = (k & 0x1f) as u8;
+                    self.regalloc.free(rhs);
+                    self.ensure_hl(lhs);
+                    self.emit_inst(&format!("MVI A,{}", count));
+                } else {
+                    self.ensure(rhs, PhysReg::BC);
+                    self.ensure_hl(lhs);
+                    self.emit_inst("MOV A,C"); // count: C (low byte of BC) → A
+                }
                 self.emit_call_with_effects(helper);
                 self.mark(dst, PhysReg::HL);
             }
@@ -2496,7 +2505,7 @@ mod tests {
         let b = VReg::new(1, Width::W16);
         let c = VReg::new(2, Width::W16);
         f.push_op(IrOp::load_imm(a, 1));
-        f.push_op(IrOp::load_imm(b, 4));
+        f.push_op(IrOp::load_imm(b, 9)); // shift > 8 → must call runtime
         f.push_op(IrOp::Shl { dst: c, lhs: a, rhs: b, width: Width::W16 });
         f.push_op(IrOp::ret(Some(c)));
         let out = gen_single_func(f);
