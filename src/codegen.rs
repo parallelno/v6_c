@@ -666,52 +666,22 @@ impl CodeGenerator {
     fn gen_load_imm(&mut self, dst: VReg, value: i64) {
         match dst.width {
             Width::W8 => {
-                let v = (value & 0xFF) as u8;
-                // Obtain any eviction ops BEFORE emitting the load so that
-                // the old A value is saved (SHLD/STA) prior to the overwrite.
-                let ops = self.regalloc.mark_immediate(dst, PhysReg::A, value);
-                self.emit_moves(&ops);
-                self.emit_inst(&format!("MVI A,{}", v));
+                // Stored as remat-only: MVI A,N is emitted lazily by ensure_a
+                // only when the value is actually needed in A.  This avoids
+                // eagerly evicting A (and spilling its live occupant) when the
+                // immediate will be consumed via ADI/SUI/INR/DCR fast paths.
+                self.regalloc.mark_remat_imm_only(dst, value);
             }
             Width::W16 => {
-                let v = (value & 0xFFFF) as u16;
-                // When HL is already occupied by a live value, prefer DE (then
-                // BC) to avoid evicting (spilling) HL just to load an immediate.
-                // This typically saves a SHLD + LHLD pair for patterns like:
-                //   addr = 32768; addr += 4;  →  LXI D,4 / DAD D
-                // instead of:
-                //   SHLD __spill / LXI H,4 / XCHG / LHLD __spill / DAD D
-                let target = if !self.regalloc.is_free(PhysReg::HL) {
-                    if self.regalloc.is_free(PhysReg::DE) {
-                        PhysReg::DE
-                    } else if self.regalloc.is_free(PhysReg::BC) {
-                        PhysReg::BC
-                    } else {
-                        PhysReg::HL
-                    }
-                } else {
-                    PhysReg::HL
-                };
-                // Any immediate destined for DE/BC is stored as remat-only: no
-                // physical register is eagerly allocated and no LXI is emitted
-                // now.  The LXI is emitted lazily by ensure_de/ensure_bc if the
-                // value is ever actually needed in a register.  This avoids
-                // wasted LXI D,N instructions when the immediate is consumed by
-                // gen_load_ptr's fast path (LHLD addr), gen_add's imm path, or
-                // similar — all of which read the value via known_imm() rather
-                // than through a physical register.
-                if target != PhysReg::HL {
-                    self.regalloc.mark_remat_imm_only(dst, value);
-                    return;
-                }
-                let ops = self.regalloc.mark_immediate(dst, target, value);
-                self.emit_moves(&ops);
-                let lxi = match target {
-                    PhysReg::DE => format!("LXI D,{}", v),
-                    PhysReg::BC => format!("LXI B,{}", v),
-                    _ => format!("LXI H,{}", v),
-                };
-                self.emit_inst(&lxi);
+                // All W16 immediates are stored as remat-only: no physical
+                // register is eagerly allocated and no LXI is emitted now.
+                // The LXI is emitted lazily by ensure_hl/ensure_de/ensure_bc
+                // only if the value is actually needed in a register.
+                // This avoids wasted LXI instructions when the value is
+                // consumed via known_imm() — e.g. gen_add's INX/DCX/DAD paths,
+                // gen_load_ptr's LHLD fast path, gen_add/gen_sub's INR/DCR
+                // fast paths for W8, etc.
+                self.regalloc.mark_remat_imm_only(dst, value);
             }
             Width::W32 => {
                 let lo = (value & 0xFFFF) as u16;
@@ -849,6 +819,26 @@ impl CodeGenerator {
     fn gen_add(&mut self, dst: VReg, lhs: VReg, rhs: VReg, width: Width) {
         match width {
             Width::W8 => {
+                // Fast path: any immediate rhs (or lhs, since add is commutative).
+                let imm = self.known_imm(rhs)
+                    .map(|k| (rhs, lhs, k))
+                    .or_else(|| self.known_imm(lhs).map(|k| (lhs, rhs, k)));
+                if let Some((const_op, var_op, k)) = imm {
+                    self.regalloc.free(const_op);
+                    self.ensure_a(var_op);
+                    if self.last_use.get(&var_op.id).copied() == Some(self.instr_index) {
+                        self.regalloc.free(var_op);
+                    }
+                    let v = (k & 0xFF) as u8;
+                    let inst = match v {
+                        1   => "INR A",
+                        255 => "DCR A", // -1 as u8
+                        _   => { self.emit_inst(&format!("ADI {}", v)); self.mark(dst, PhysReg::A); return; }
+                    };
+                    self.emit_inst(inst);
+                    self.mark(dst, PhysReg::A);
+                    return;
+                }
                 self.ensure_a(lhs);
                 let rhs_loc = self.regalloc.get_location(rhs).cloned();
                 match rhs_loc {
@@ -990,6 +980,36 @@ impl CodeGenerator {
     fn gen_sub(&mut self, dst: VReg, lhs: VReg, rhs: VReg, width: Width) {
         match width {
             Width::W8 => {
+                // Fast path: -1 / +1 → INR A / DCR A (no second operand needed).
+                if let Some(k) = self.known_imm(rhs) {
+                    if k == 1 || k == -1 {
+                        self.regalloc.free(rhs);
+                        self.ensure_a(lhs);
+                        if self.last_use.get(&lhs.id).copied() == Some(self.instr_index) {
+                            self.regalloc.free(lhs);
+                        }
+                        self.emit_inst(if k == 1 { "DCR A" } else { "INR A" });
+                        self.mark(dst, PhysReg::A);
+                        return;
+                    }
+                }
+                // Fast path: any immediate rhs → SUI N / DCR A / INR A.
+                if let Some(k) = self.known_imm(rhs) {
+                    self.regalloc.free(rhs);
+                    self.ensure_a(lhs);
+                    if self.last_use.get(&lhs.id).copied() == Some(self.instr_index) {
+                        self.regalloc.free(lhs);
+                    }
+                    let v = (k & 0xFF) as u8;
+                    let inst = match v {
+                        1   => "DCR A",
+                        255 => "INR A", // sub -1 == add 1
+                        _   => { self.emit_inst(&format!("SUI {}", v)); self.mark(dst, PhysReg::A); return; }
+                    };
+                    self.emit_inst(inst);
+                    self.mark(dst, PhysReg::A);
+                    return;
+                }
                 self.ensure(rhs, PhysReg::BC);
                 self.ensure_a(lhs);
                 self.emit_inst("SUB C");
@@ -1392,7 +1412,7 @@ impl CodeGenerator {
                         return;
                     }
                 }
-                // Use runtime helpers: shift count in A, value in HL
+                // Use runtime helpers: shift count in A (must be > 0), value in HL.
                 let helper = if is_right {
                     if arithmetic {
                         "__shr16s"
@@ -1405,17 +1425,20 @@ impl CodeGenerator {
                 self.spill_live_before_call(helper);
                 // If the shift count is a known immediate, emit MVI A,n directly
                 // rather than loading it into BC and then copying C→A.
+                // Constant counts reaching here are always > 0 (0 is handled by
+                // the fast path above), so no zero guard is needed.
                 if let Some(k) = self.known_imm(rhs) {
                     let count = (k & 0x1f) as u8;
                     self.regalloc.free(rhs);
                     self.ensure_hl(lhs);
                     self.emit_inst(&format!("MVI A,{}", count));
+                    self.emit_call_with_effects(helper);
                 } else {
                     self.ensure(rhs, PhysReg::BC);
                     self.ensure_hl(lhs);
                     self.emit_inst("MOV A,C"); // count: C (low byte of BC) → A
+                    self.emit_call_with_effects(helper);
                 }
-                self.emit_call_with_effects(helper);
                 self.mark(dst, PhysReg::HL);
             }
             Width::W32 => {
@@ -2152,20 +2175,24 @@ mod tests {
 
     #[test]
     fn load_imm_16bit() {
+        // The immediate is lazy (remat-only); LXI is emitted when the value is
+        // actually needed in a register — here via ret which calls ensure_hl.
         let mut f = IrFunction::new("test", CType::Void);
         let dst = VReg::new(0, Width::W16);
         f.push_op(IrOp::load_imm(dst, 42));
-        f.push_op(IrOp::ret(None));
+        f.push_op(IrOp::ret(Some(dst)));
         let out = gen_single_func(f);
         assert!(has_line(&out, "LXI H,42"));
     }
 
     #[test]
     fn load_imm_8bit() {
+        // W8 immediates are lazy; MVI A,N is emitted when the value is
+        // materialized for use — here via ret which calls ensure_a.
         let mut f = IrFunction::new("test", CType::Void);
         let dst = VReg::new(0, Width::W8);
         f.push_op(IrOp::load_imm(dst, 7));
-        f.push_op(IrOp::ret(None));
+        f.push_op(IrOp::ret(Some(dst)));
         let out = gen_single_func(f);
         assert!(has_line(&out, "MVI A,7"));
     }
@@ -2214,6 +2241,8 @@ mod tests {
 
     #[test]
     fn add_8bit() {
+        // Both operands are W8 immediates (3 and 4); the fast path picks the
+        // first immediate as rhs and emits ADI rather than the register ADD.
         let mut f = IrFunction::new("test", CType::Void);
         let a = VReg::new(0, Width::W8);
         let b = VReg::new(1, Width::W8);
@@ -2223,8 +2252,8 @@ mod tests {
         f.push_op(IrOp::add(c, a, b, Width::W8));
         f.push_op(IrOp::ret(None));
         let out = gen_single_func(f);
-        // Should contain an ADD instruction
-        assert!(has_line(&out, "ADD"));
+        // Two W8 immediates → ADI fast path
+        assert!(has_line(&out, "ADI"));
     }
 
     // -- Sub --------------------------------------------------------------

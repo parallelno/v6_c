@@ -4,31 +4,24 @@
 ; __shr16u:  HL = HL >> A  (logical right shift, unsigned)
 ; __shr16s:  HL = HL >> A  (arithmetic right shift, signed)
 ;
-; Entry:  HL = value, A = shift count
+; Entry:  HL = value, A = shift count (must be > 0)
 ; Exit:   HL = shifted result
-; Clobbers: A, B, flags
+; Clobbers: A, flags
 
 ; ---------------------------------------------------------------------------
 ; __shl16 — logical left shift:  HL <<= A
 ; ---------------------------------------------------------------------------
 __shl16:
-	ANI 0x0F		; clamp to 0..15
-	RZ			; shift by 0 → no-op
-	MOV B,A			; B = counter
-__shl16_loop:
 	DAD H			; HL <<= 1
-	DCR B
-	JNZ __shl16_loop
+	DCR A
+	JNZ __shl16
 	RET
 
 ; ---------------------------------------------------------------------------
 ; __shr16u — logical right shift (unsigned):  HL >>= A
 ; ---------------------------------------------------------------------------
 __shr16u:
-	ANI 0x0F
-	RZ
-	MOV B,A			; B = counter
-__shr16u_loop:
+	PUSH PSW		; save counter
 	MOV A,H
 	ORA A			; clear carry (zero into MSB)
 	RAR
@@ -36,18 +29,16 @@ __shr16u_loop:
 	MOV A,L
 	RAR
 	MOV L,A
-	DCR B
-	JNZ __shr16u_loop
+	POP PSW			; restore counter
+	DCR A
+	JNZ __shr16u
 	RET
 
 ; ---------------------------------------------------------------------------
 ; __shr16s — arithmetic right shift (signed):  HL >>= A
 ; ---------------------------------------------------------------------------
 __shr16s:
-	ANI 0x0F
-	RZ
-	MOV B,A			; B = counter
-__shr16s_loop:
+	PUSH PSW		; save counter
 	MOV A,H
 	RAL			; carry = sign bit
 	MOV A,H
@@ -56,6 +47,7 @@ __shr16s_loop:
 	MOV A,L
 	RAR
 	MOV L,A
-	DCR B
-	JNZ __shr16s_loop
+	POP PSW			; restore counter
+	DCR A
+	JNZ __shr16s
 	RET
