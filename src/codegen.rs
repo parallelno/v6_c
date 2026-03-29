@@ -59,6 +59,11 @@ pub struct CodeGenerator {
     /// Width of each spill slot, keyed by label.  Populated when Spill ops are
     /// emitted; used to emit `.storage 1` vs `.storage 2` in the data section.
     spill_widths: HashMap<String, Width>,
+    /// Vregs whose byte value is currently held in memory at the address HL
+    /// points to — a deferred W8 `LoadPtr` that was not materialised into A.
+    /// The immediately following ALU instruction will consume these via `ADD M`
+    /// / `SUB M` etc. without an intermediate register load.
+    pending_m: std::collections::HashSet<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -82,6 +87,7 @@ pub fn generate(program: &IrProgram, analysis: &CallGraphAnalysis) -> Vec<String
         consumed_cmp: HashSet::new(),
         a_mirrors: None,
         spill_widths: HashMap::new(),
+        pending_m: std::collections::HashSet::new(),
     };
 
     cg.emit_comment("--- code section ---");
@@ -533,6 +539,11 @@ impl CodeGenerator {
     /// Returns the low-byte register name (`"C"`, `"E"`, `"L"`) when `rhs` is
     /// already in a physical register pair.
     fn w8_alu_operand(&mut self, rhs: VReg) -> String {
+        // Deferred load: gen_load_ptr already pointed HL at the source address.
+        // No LXI H needed — just use M directly.
+        if self.pending_m.remove(&rhs.id) {
+            return "M".to_string();
+        }
         match self.regalloc.get_location(rhs).cloned() {
             Some(Location::Memory(label)) => {
                 // Spill HL if it holds a live vreg, then load the spill address.
@@ -560,6 +571,50 @@ impl CodeGenerator {
         let ops = self.regalloc.mark_allocated(vreg, reg);
         self.emit_moves(&ops);
     }
+
+    /// Returns `true` when a W8 `LoadPtr` for `load_dst` can be deferred:
+    /// instead of loading the byte into A immediately, the caller should only
+    /// point HL at the source address.  The immediately following ALU
+    /// instruction will then consume the byte via `ADD M` / `SUB M` / `CMP M`
+    /// etc., completely avoiding a spill/reload of the current A value.
+    ///
+    /// Conditions:
+    /// - A is currently occupied by a live value (call it `a_val`).
+    /// - `load_dst` is consumed for the last time by the very next instruction.
+    /// - The next instruction is a W8 binary op where one operand is `a_val`
+    ///   and the other is `load_dst`, arranged so that `ADD M` / `SUB M` /
+    ///   `CMP M` (all of the form `A ← A op M`) yields the correct result.
+    fn can_defer_w8_load_ptr(&self, load_dst: VReg, next_op: Option<&IrOp>) -> bool {
+        let Some(a_id) = self.regalloc.occupant(PhysReg::A) else { return false; };
+        // load_dst must die at the very next instruction.
+        if self.last_use.get(&load_dst.id).copied() != Some(self.instr_index + 1) {
+            return false;
+        }
+        match next_op {
+            // Commutative W8: load_dst may be either operand.
+            Some(IrOp::Add { lhs, rhs, width: Width::W8, .. })
+            | Some(IrOp::And { lhs, rhs, width: Width::W8, .. })
+            | Some(IrOp::Or  { lhs, rhs, width: Width::W8, .. })
+            | Some(IrOp::Xor { lhs, rhs, width: Width::W8, .. }) => {
+                (lhs.id == load_dst.id && rhs.id == a_id)
+                    || (rhs.id == load_dst.id && lhs.id == a_id)
+            }
+            // Non-commutative W8 Sub: load_dst must be rhs (A = A_val - M).
+            Some(IrOp::Sub { lhs, rhs, width: Width::W8, .. }) => {
+                lhs.id == a_id && rhs.id == load_dst.id
+            }
+            // Comparison W8: load_dst must be rhs (CMP M: A vs M).
+            Some(IrOp::Eq { lhs, rhs, width: Width::W8, .. })
+            | Some(IrOp::Ne { lhs, rhs, width: Width::W8, .. })
+            | Some(IrOp::Lt { lhs, rhs, width: Width::W8, .. })
+            | Some(IrOp::Le { lhs, rhs, width: Width::W8, .. })
+            | Some(IrOp::Gt { lhs, rhs, width: Width::W8, .. })
+            | Some(IrOp::Ge { lhs, rhs, width: Width::W8, .. }) => {
+                lhs.id == a_id && rhs.id == load_dst.id
+            }
+            _ => false,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -575,6 +630,7 @@ impl CodeGenerator {
         self.current_c_line = 0;
         self.consumed_cmp.clear();
         self.a_mirrors = None;
+        self.pending_m.clear();
         self.emit_comment(&format!("function {}", func.name));
         self.emit_label(&func.name);
 
@@ -641,7 +697,7 @@ impl CodeGenerator {
             }
             IrOp::LoadLocal { dst, offset } => self.gen_load_local(*dst, *offset),
             IrOp::StoreLocal { offset, src } => self.gen_store_local(*offset, *src),
-            IrOp::LoadPtr { dst, ptr } => self.gen_load_ptr(*dst, *ptr),
+            IrOp::LoadPtr { dst, ptr } => self.gen_load_ptr(*dst, *ptr, next_op),
             IrOp::StorePtr { ptr, src } => self.gen_store_ptr(*ptr, *src),
 
             // -- binary arithmetic ----------------------------------------
@@ -854,9 +910,19 @@ impl CodeGenerator {
 
     // -- LoadPtr / StorePtr -----------------------------------------------
 
-    fn gen_load_ptr(&mut self, dst: VReg, ptr: VReg) {
+    fn gen_load_ptr(&mut self, dst: VReg, ptr: VReg, next_op: Option<&IrOp>) {
         match dst.width {
             Width::W8 => {
+                // Lookahead: if the immediately next instruction is a W8 binary
+                // ALU op that pairs `dst` with the value already in A, skip the
+                // actual MOV A,M.  Just point HL at the source and record `dst`
+                // in `pending_m`.  The ALU op then emits `ADD M` / `SUB M` etc.
+                // directly, saving two instructions and all spill traffic.
+                if self.can_defer_w8_load_ptr(dst, next_op) {
+                    self.ensure_hl(ptr); // HL ← ptr address; A untouched
+                    self.pending_m.insert(dst.id);
+                    return;
+                }
                 self.ensure_hl(ptr);
                 // Evict A's occupant BEFORE MOV A,M overwrites A.
                 // Routing through self.mark clears a_mirrors (A gets a new
@@ -920,6 +986,9 @@ impl CodeGenerator {
     fn gen_add(&mut self, dst: VReg, lhs: VReg, rhs: VReg, width: Width) {
         match width {
             Width::W8 => {
+                // Commutativity: if lhs is a deferred M-operand but rhs is in A,
+                // swap so the standard ensure_a(lhs) / w8_alu_operand(rhs) path works.
+                let (lhs, rhs) = if self.pending_m.contains(&lhs.id) { (rhs, lhs) } else { (lhs, rhs) };
                 // Fast path: any immediate rhs (or lhs, since add is commutative).
                 let imm = self.known_imm(rhs)
                     .map(|k| (rhs, lhs, k))
@@ -1415,6 +1484,8 @@ impl CodeGenerator {
     ) {
         match width {
             Width::W8 => {
+                // Commutativity: if lhs is deferred at M, swap so rhs is the pending one.
+                let (lhs, rhs) = if self.pending_m.contains(&lhs.id) { (rhs, lhs) } else { (lhs, rhs) };
                 self.ensure_a(lhs);
                 let operand = self.w8_alu_operand(rhs);
                 self.emit_inst(&format!("{} {}", reg_op, operand));
