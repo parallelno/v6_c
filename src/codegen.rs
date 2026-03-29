@@ -918,9 +918,21 @@ impl CodeGenerator {
                 // actual MOV A,M.  Just point HL at the source and record `dst`
                 // in `pending_m`.  The ALU op then emits `ADD M` / `SUB M` etc.
                 // directly, saving two instructions and all spill traffic.
+                // This takes priority over the LDA fast path: when A already holds
+                // the paired operand, deferring avoids the instruction entirely,
+                // which is better than LDA (which would evict A's occupant).
                 if self.can_defer_w8_load_ptr(dst, next_op) {
                     self.ensure_hl(ptr); // HL ← ptr address; A untouched
                     self.pending_m.insert(dst.id);
+                    return;
+                }
+                // Fast path: compile-time constant address → LDA addr (1 instruction
+                // vs LXI H,N / MOV A,M).  Reuses gen_load_global which handles
+                // a_mirrors tracking identically to named-global loads.
+                if let Some(addr) = self.known_imm(ptr) {
+                    let addr_str = format!("{}", (addr & 0xFFFF) as u16);
+                    self.regalloc.free(ptr);
+                    self.gen_load_global(dst, &addr_str);
                     return;
                 }
                 self.ensure_hl(ptr);
@@ -959,6 +971,14 @@ impl CodeGenerator {
     fn gen_store_ptr(&mut self, ptr: VReg, src: VReg) {
         match src.width {
             Width::W8 => {
+                // Fast path: compile-time constant address → STA addr (1 instruction
+                // vs LXI H,N / MOV M,A).  Reuses gen_store_global for a_mirrors tracking.
+                if let Some(addr) = self.known_imm(ptr) {
+                    let addr_str = format!("{}", (addr & 0xFFFF) as u16);
+                    self.regalloc.free(ptr);
+                    self.gen_store_global(&addr_str, src);
+                    return;
+                }
                 self.ensure_a(src);
                 self.ensure_hl(ptr);
                 self.emit_inst("MOV M,A");
@@ -2820,7 +2840,9 @@ mod tests {
         f.push_op(IrOp::load_ptr(val, ptr));
         f.push_op(IrOp::ret(None));
         let out = gen_single_func(f);
-        assert!(has_line(&out, "MOV A,M"));
+        // Constant pointer address → LDA addr (1 instruction, not LXI H,N / MOV A,M).
+        assert!(has_line(&out, "LDA 4096"), "expected LDA 4096 but got:\n{}", out.join("\n"));
+        assert!(!out.iter().any(|l| l.trim() == "MOV A,M"), "unexpected MOV A,M in output");
     }
 
     #[test]
