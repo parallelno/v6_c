@@ -1346,9 +1346,17 @@ impl IrGenerator {
         }
 
         // Compound assignment: load, compute, store.
+        // Evaluate the RHS expression *before* loading the current LHS value.
+        // This reduces register pressure on the 8080 where W8 values live in A:
+        // if we loaded the LHS first, computing a non-trivial RHS would spill
+        // the LHS (since both need A).  By computing RHS first, the codegen can
+        // often use the deferred-M mechanism (ADD M / SUB M) for the LHS load,
+        // avoiding the spill entirely.  C permits this: the relative evaluation
+        // order of the two operands is unspecified.
         let lv = self.gen_lvalue(target);
-        let (cur, ty) = self.load_lvalue(&lv);
+        let ty = self.lvalue_type(&lv);
         let (rhs, _) = self.gen_expr(value);
+        let (cur, _) = self.load_lvalue(&lv);
         let w = Width::from_ctype(&ty).unwrap_or(Width::W16);
         let signed = ty.is_signed();
         let result = self.vreg_alloc.alloc(w);

@@ -690,12 +690,12 @@ impl CodeGenerator {
             // -- loads / stores -------------------------------------------
             IrOp::LoadImm { dst, value } => self.gen_load_imm(*dst, *value),
             IrOp::LoadGlobal { dst, addr_label } => {
-                self.gen_load_global(*dst, addr_label);
+                self.gen_load_global(*dst, addr_label, next_op);
             }
             IrOp::StoreGlobal { addr_label, src } => {
                 self.gen_store_global(addr_label, *src);
             }
-            IrOp::LoadLocal { dst, offset } => self.gen_load_local(*dst, *offset),
+            IrOp::LoadLocal { dst, offset } => self.gen_load_local(*dst, *offset, next_op),
             IrOp::StoreLocal { offset, src } => self.gen_store_local(*offset, *src),
             IrOp::LoadPtr { dst, ptr } => self.gen_load_ptr(*dst, *ptr, next_op),
             IrOp::StorePtr { ptr, src } => self.gen_store_ptr(*ptr, *src),
@@ -843,7 +843,7 @@ impl CodeGenerator {
 
     // -- LoadGlobal / StoreGlobal -----------------------------------------
 
-    fn gen_load_global(&mut self, dst: VReg, addr_label: &str) {
+    fn gen_load_global(&mut self, dst: VReg, addr_label: &str, next_op: Option<&IrOp>) {
         match dst.width {
             Width::W8 => {
                 // If A's physical bytes still hold addr's value (STA addr was
@@ -856,6 +856,17 @@ impl CodeGenerator {
                     let ops = self.regalloc.mark_allocated(dst, PhysReg::A);
                     self.emit_moves(&ops); // usually empty after free_dead_vregs
                     // a_mirrors stays valid (A still == addr_label)
+                    return;
+                }
+                // Deferred-M: if the next op is a W8 ALU that pairs dst with
+                // the value already in A, set HL to the label address so the
+                // ALU op can use "M" directly (ADD M, SUB M, etc.), avoiding
+                // the LDA that would evict A and cause a spill.
+                if self.can_defer_w8_load_ptr(dst, next_op) {
+                    let ops = self.regalloc.mark_allocated(dst, PhysReg::HL);
+                    self.emit_moves(&ops);
+                    self.emit_inst(&format!("LXI H,{}", addr_label));
+                    self.pending_m.insert(dst.id);
                     return;
                 }
                 // Evict A's occupant BEFORE LDA overwrites A.
@@ -895,12 +906,12 @@ impl CodeGenerator {
     // In global mode these become loads/stores to the static address
     // allocated by the call-graph analysis.
 
-    fn gen_load_local(&mut self, dst: VReg, offset: i32) {
+    fn gen_load_local(&mut self, dst: VReg, offset: i32, next_op: Option<&IrOp>) {
         // In global mode the offset is really just an index; the actual
         // address is looked up from the analysis.  For simplicity we
         // fall back to a label-based load using a helper address.
         let label = format!("__local_{}_{}", self.current_func, offset);
-        self.gen_load_global(dst, &label);
+        self.gen_load_global(dst, &label, next_op);
     }
 
     fn gen_store_local(&mut self, offset: i32, src: VReg) {
@@ -932,7 +943,7 @@ impl CodeGenerator {
                 if let Some(addr) = self.known_imm(ptr) {
                     let addr_str = format!("{}", (addr & 0xFFFF) as u16);
                     self.regalloc.free(ptr);
-                    self.gen_load_global(dst, &addr_str);
+                    self.gen_load_global(dst, &addr_str, next_op);
                     return;
                 }
                 self.ensure_hl(ptr);
@@ -2066,21 +2077,19 @@ impl CodeGenerator {
         }
 
         match (src_w, dst_w) {
-            // Widen 8 → 16: move A into L, clear/sign-extend H
+            // Widen 8 → 16: move A into L, sign/zero extend H
             (Width::W8, Width::W16) | (Width::W8, Width::W32) => {
                 self.ensure_a(src);
                 self.emit_inst("MOV L,A");
                 if to_type.is_signed() {
-                    // Sign extend: if bit 7 set, H=0xFF, else H=0
-                    let pos_lbl = self.fresh_label();
-                    let done_lbl = self.fresh_label();
-                    self.emit_inst("ORA A");
-                    self.emit_inst(&format!("JP {}", pos_lbl));
-                    self.emit_inst("MVI H,255");
-                    self.emit_inst(&format!("JMP {}", done_lbl));
-                    self.emit_label(&pos_lbl);
-                    self.emit_inst("MVI H,0");
-                    self.emit_label(&done_lbl);
+                    // Sign extend without a branch: ADD A puts bit 7 into
+                    // carry (A = A*2, discarded); SBB A = 0 − CY = 0xFF
+                    // (negative) or 0x00 (positive); MOV H,A.
+                    // 4 straight-line instructions vs the old 5-instruction
+                    // branch, and no pipeline disruption on the 8080.
+                    self.emit_inst("ADD A");   // CY = original bit 7; A = junk
+                    self.emit_inst("SBB A");   // A = 0xFF or 0x00
+                    self.emit_inst("MOV H,A"); // H = sign extension
                 } else {
                     self.emit_inst("MVI H,0");
                 }
