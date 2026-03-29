@@ -337,6 +337,25 @@ fn rule_two_window(lines: &mut Vec<Line>) -> bool {
                 continue;
             }
 
+            // --- Rule 42: LXI r,N1 / LXI r,N2 → LXI r,N2  (dead LXI) ---
+            // When gen_load_imm places a constant in DE (or BC) to avoid
+            // spilling HL, and the very next instruction overwrites the same
+            // register (e.g. gen_sub re-loads DE with the negated value), the
+            // first LXI is dead and can be removed.
+            (
+                Line::Instruction { opcode: op_a, operands: ops_a },
+                Line::Instruction { opcode: op_b, operands: ops_b },
+            ) if op_a == "LXI" && op_b == "LXI" => {
+                let r_a = ops_a.trim().split(',').next().unwrap_or("");
+                let r_b = ops_b.trim().split(',').next().unwrap_or("");
+                if !r_a.is_empty() && r_a == r_b && r_a != "H" {
+                    // First LXI to the same non-HL pair is dead.
+                    lines.remove(i);
+                    changed = true;
+                    continue;
+                }
+            }
+
             // --- Rule 36: MVI A,n / MOV M,A → MVI M,n ------------------
             // MVI M,imm8 stores the immediate directly to (HL) in one
             // instruction (2 bytes) instead of two (MVI A,n = 2 bytes,

@@ -675,11 +675,31 @@ impl CodeGenerator {
             }
             Width::W16 => {
                 let v = (value & 0xFFFF) as u16;
-                // Obtain any eviction ops BEFORE emitting the load so that
-                // the old HL value is saved (SHLD) prior to the overwrite.
-                let ops = self.regalloc.mark_immediate(dst, PhysReg::HL, value);
+                // When HL is already occupied by a live value, prefer DE (then
+                // BC) to avoid evicting (spilling) HL just to load an immediate.
+                // This typically saves a SHLD + LHLD pair for patterns like:
+                //   addr = 32768; addr += 4;  →  LXI D,4 / DAD D
+                // instead of:
+                //   SHLD __spill / LXI H,4 / XCHG / LHLD __spill / DAD D
+                let target = if !self.regalloc.is_free(PhysReg::HL) {
+                    if self.regalloc.is_free(PhysReg::DE) {
+                        PhysReg::DE
+                    } else if self.regalloc.is_free(PhysReg::BC) {
+                        PhysReg::BC
+                    } else {
+                        PhysReg::HL
+                    }
+                } else {
+                    PhysReg::HL
+                };
+                let ops = self.regalloc.mark_immediate(dst, target, value);
                 self.emit_moves(&ops);
-                self.emit_inst(&format!("LXI H,{}", v));
+                let lxi = match target {
+                    PhysReg::DE => format!("LXI D,{}", v),
+                    PhysReg::BC => format!("LXI B,{}", v),
+                    _ => format!("LXI H,{}", v),
+                };
+                self.emit_inst(&lxi);
             }
             Width::W32 => {
                 let lo = (value & 0xFFFF) as u16;
@@ -849,9 +869,48 @@ impl CodeGenerator {
                     }
                     self.mark(dst, PhysReg::HL);
                 } else {
-                    self.ensure_de(rhs);
-                    self.ensure_hl(lhs);
-                    self.emit_inst("DAD D");
+                    // General case: DAD D.
+                    // If one operand is a known immediate, emit LXI D,N / DAD D
+                    // (or LXI B,N / DAD B) directly instead of going through
+                    // ensure_de, which would spill HL if the immediate is there.
+                    let rhs_k = self.known_imm(rhs);
+                    let lhs_k = self.known_imm(lhs);
+                    let imm_info: Option<(VReg, VReg, i64)> = match (rhs_k, lhs_k) {
+                        (Some(k), _) => Some((lhs, rhs, k)),
+                        (_, Some(k)) => Some((rhs, lhs, k)),
+                        _ => None,
+                    };
+                    if let Some((var_op, const_op, k)) = imm_info {
+                        let k16 = (k & 0xFFFF) as u16;
+                        // Check whether gen_load_imm already placed the
+                        // constant in DE or BC (preferred-register logic).
+                        let const_in_de =
+                            self.regalloc.occupant(PhysReg::DE) == Some(const_op.id);
+                        let const_in_bc =
+                            self.regalloc.occupant(PhysReg::BC) == Some(const_op.id);
+                        // Free the constant register to make HL available.
+                        self.regalloc.free(const_op);
+                        self.ensure_hl(var_op);
+                        if self.last_use.get(&var_op.id).copied() == Some(self.instr_index) {
+                            self.regalloc.free(var_op);
+                        }
+                        if const_in_de {
+                            // Already in DE — LXI D,k already emitted by gen_load_imm.
+                            self.emit_inst("DAD D");
+                        } else if const_in_bc {
+                            self.emit_inst("DAD B");
+                        } else if self.regalloc.is_free(PhysReg::DE) {
+                            self.emit_inst(&format!("LXI D,{}", k16));
+                            self.emit_inst("DAD D");
+                        } else {
+                            self.emit_inst(&format!("LXI B,{}", k16));
+                            self.emit_inst("DAD B");
+                        }
+                    } else {
+                        self.ensure_de(rhs);
+                        self.ensure_hl(lhs);
+                        self.emit_inst("DAD D");
+                    }
                     self.mark(dst, PhysReg::HL);
                 }
             }
@@ -884,6 +943,27 @@ impl CodeGenerator {
                         let inst = if k > 0 { "DCX H" } else { "INX H" };
                         for _ in 0..k.abs() {
                             self.emit_inst(inst);
+                        }
+                        self.mark(dst, PhysReg::HL);
+                        return;
+                    }
+                }
+                // General sub with immediate rhs: emit LXI D,(-k) / DAD D
+                // (or LXI B,(-k) / DAD B) to avoid spilling HL.
+                if let Some(k) = self.known_imm(rhs) {
+                    if self.last_use.get(&rhs.id).copied() == Some(self.instr_index) {
+                        let neg = (k.wrapping_neg() & 0xFFFF) as u16;
+                        self.regalloc.free(rhs);
+                        self.ensure_hl(lhs);
+                        if self.last_use.get(&lhs.id).copied() == Some(self.instr_index) {
+                            self.regalloc.free(lhs);
+                        }
+                        if self.regalloc.is_free(PhysReg::DE) {
+                            self.emit_inst(&format!("LXI D,{}", neg));
+                            self.emit_inst("DAD D");
+                        } else {
+                            self.emit_inst(&format!("LXI B,{}", neg));
+                            self.emit_inst("DAD B");
                         }
                         self.mark(dst, PhysReg::HL);
                         return;
@@ -2038,6 +2118,9 @@ mod tests {
 
     #[test]
     fn sub_16bit_uses_complement_and_dad() {
+        // With a known-immediate rhs the optimised path emits LXI D,(-k) / DAD D
+        // instead of the complement-and-DAD sequence.  The complement path is
+        // still exercised via gen_sub's general (non-immediate) fallback.
         let mut f = IrFunction::new("test", CType::Void);
         let a = VReg::new(0, Width::W16);
         let b = VReg::new(1, Width::W16);
@@ -2047,8 +2130,10 @@ mod tests {
         f.push_op(IrOp::sub(c, a, b, Width::W16));
         f.push_op(IrOp::ret(Some(c)));
         let out = gen_single_func(f);
-        assert!(has_line(&out, "CMA"));
-        assert!(has_line(&out, "DAD D"));
+        // Expect the two's-complement equivalent: LXI D,(65536-30)=65506 / DAD D
+        assert!(has_line(&out, "LXI D"), "expected LXI D but got:\n{}", out.join("\n"));
+        assert!(has_line(&out, "DAD D"), "expected DAD D but got:\n{}", out.join("\n"));
+        assert!(!has_line(&out, "CMA"), "unexpected CMA — should use LXI D path");
     }
 
     // -- Mul / Div / Mod --------------------------------------------------
