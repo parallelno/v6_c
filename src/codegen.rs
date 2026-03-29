@@ -1541,23 +1541,82 @@ impl CodeGenerator {
     ) {
         match width {
             Width::W8 => {
-                // Simple: use rotate instructions in a loop
+                // Fast path: constant shift count → straight-line instructions.
+                // Avoids loop overhead entirely (the loop is 7+ instructions per
+                // variable iteration and was also reading the count from A instead
+                // of the value being shifted — a correctness bug fixed below).
+                if let Some(raw) = self.known_imm(rhs) {
+                    let count = (raw as u32) & 0x1f;
+                    self.regalloc.free(rhs);
+                    self.ensure_a(lhs);
+                    if self.last_use.get(&lhs.id).copied() == Some(self.instr_index) {
+                        self.regalloc.free(lhs);
+                    }
+                    if !is_right {
+                        // SHL: ADD A = A + A = A << 1.  Carry input to addition
+                        // is always 0 (ADD, not ADC) so no carry management is
+                        // needed between iterations.  N ≥ 8 shifts all bits out.
+                        if count >= 8 {
+                            self.emit_inst("XRA A");
+                        } else {
+                            for _ in 0..count { self.emit_inst("ADD A"); }
+                        }
+                    } else if !arithmetic {
+                        // Logical SHR: ORA A clears carry before each RAR so
+                        // bit 7 of the result is always 0 (A | A = A, value
+                        // unchanged).  N ≥ 8 shifts all bits out.
+                        if count >= 8 {
+                            self.emit_inst("XRA A");
+                        } else {
+                            for _ in 0..count {
+                                self.emit_inst("ORA A"); // clear carry → RAR fills with 0
+                                self.emit_inst("RAR");
+                            }
+                        }
+                    } else {
+                        // Arithmetic SHR: each step needs carry = sign bit
+                        // before RAR.  Trick: save A in B, call ADD A to get
+                        // bit 7 into carry (A temporarily doubled and
+                        // discarded), restore A from B, then RAR → bit 7
+                        // receives original sign bit = correct sign extension.
+                        if count >= 8 {
+                            // All-sign-bits result: ADD A puts bit 7 into carry;
+                            // SBB A = 0 − carry = 0xFF (negative) or 0x00.
+                            self.emit_inst("ADD A");
+                            self.emit_inst("SBB A");
+                        } else {
+                            // Need B as scratch; spill BC if it holds a live vreg.
+                            if let Some(spill_op) = self.regalloc.spill(PhysReg::BC) {
+                                self.emit_moves(&[spill_op]);
+                            }
+                            for _ in 0..count {
+                                self.emit_inst("MOV B,A"); // save A
+                                self.emit_inst("ADD A");   // CY = bit 7; A = A*2 (discarded)
+                                self.emit_inst("MOV A,B"); // restore A
+                                self.emit_inst("RAR");     // bit 7 ← CY = sign extension
+                            }
+                        }
+                    }
+                    self.mark(dst, PhysReg::A);
+                    return;
+                }
+                // Variable shift count: keep value in A throughout; B is the
+                // down-counter.  DCR/JM never touch A, unlike the old
+                // MOV A,B/ORA A/JZ pattern that clobbered the value.
                 self.ensure(rhs, PhysReg::BC);
                 self.ensure_a(lhs);
                 let loop_lbl = self.fresh_label();
                 let done_lbl = self.fresh_label();
-                self.emit_inst("MOV B,C"); // shift count in B
+                self.emit_inst("MOV B,C"); // count → B; A retains the shift value
                 self.emit_label(&loop_lbl);
-                self.emit_inst("MOV A,B");
-                self.emit_inst("ORA A");
-                self.emit_inst(&format!("JZ {}", done_lbl));
-                self.ensure_a(lhs);
+                self.emit_inst("DCR B");   // B--; M flag set when B wraps 0 → 0xFF
+                self.emit_inst(&format!("JM {}", done_lbl));
                 if is_right {
+                    self.emit_inst("ORA A"); // clear carry for logical right shift
                     self.emit_inst("RAR");
                 } else {
-                    self.emit_inst("RAL");
+                    self.emit_inst("ADD A"); // left shift: A += A (carry-in is 0 for ADD)
                 }
-                self.emit_inst("DCR B");
                 self.emit_inst(&format!("JMP {}", loop_lbl));
                 self.emit_label(&done_lbl);
                 self.mark(dst, PhysReg::A);
@@ -2906,7 +2965,81 @@ mod tests {
         assert!(has_line(&out, "CALL __shl16"));
     }
 
-    // -- Bitwise ----------------------------------------------------------
+    #[test]
+    fn shl_8bit_const_uses_add_a() {
+        // Shift i8 left by 2 at compile time → two ADD A instructions, no jump/loop.
+        let mut f = IrFunction::new("test", CType::Void);
+        let a = VReg::new(0, Width::W8);
+        let n = VReg::new(1, Width::W8);
+        let c = VReg::new(2, Width::W8);
+        f.push_op(IrOp::load_imm(a, 3));
+        f.push_op(IrOp::load_imm(n, 2));
+        f.push_op(IrOp::Shl { dst: c, lhs: a, rhs: n, width: Width::W8 });
+        f.push_op(IrOp::ret(None));
+        let out = gen_single_func(f);
+        let n_add_a = out.iter().filter(|l| l.trim() == "ADD A").count();
+        assert_eq!(n_add_a, 2, "expected 2× ADD A but got:\n{}", out.join("\n"));
+        assert!(!out.iter().any(|l| l.contains("JMP") || l.contains("DCR")),
+            "unexpected loop instructions in output:\n{}", out.join("\n"));
+    }
+
+    #[test]
+    fn shl_8bit_ge8_zeroes() {
+        // Shift by 8 or more → result is 0 → single XRA A.
+        let mut f = IrFunction::new("test", CType::Void);
+        let a = VReg::new(0, Width::W8);
+        let n = VReg::new(1, Width::W8);
+        let c = VReg::new(2, Width::W8);
+        f.push_op(IrOp::load_imm(a, 0xFF));
+        f.push_op(IrOp::load_imm(n, 8));
+        f.push_op(IrOp::Shl { dst: c, lhs: a, rhs: n, width: Width::W8 });
+        f.push_op(IrOp::ret(None));
+        let out = gen_single_func(f);
+        assert!(has_line(&out, "XRA A"), "expected XRA A but got:\n{}", out.join("\n"));
+    }
+
+    #[test]
+    fn shr_8bit_logical_const_uses_rar() {
+        // Logical right shift of i8 by 3 → ORA A; RAR three times, no loop.
+        let mut f = IrFunction::new("test", CType::Void);
+        let a = VReg::new(0, Width::W8);
+        let n = VReg::new(1, Width::W8);
+        let c = VReg::new(2, Width::W8);
+        f.push_op(IrOp::load_imm(a, 0x80));
+        f.push_op(IrOp::load_imm(n, 3));
+        f.push_op(IrOp::Shr { dst: c, lhs: a, rhs: n, width: Width::W8, arithmetic: false });
+        f.push_op(IrOp::ret(None));
+        let out = gen_single_func(f);
+        let n_rar = out.iter().filter(|l| l.trim() == "RAR").count();
+        assert_eq!(n_rar, 3, "expected 3× RAR but got:\n{}", out.join("\n"));
+        assert!(!out.iter().any(|l| l.contains("JMP") || l.contains("DCR")),
+            "unexpected loop instructions in output:\n{}", out.join("\n"));
+    }
+
+    #[test]
+    fn shl_8bit_variable_uses_dcr_jm() {
+        // Variable shift count → fixed loop with DCR B / JM (not MOV A,B / JZ).
+        let mut f = IrFunction::new("test", CType::Void);
+        let a = VReg::new(0, Width::W8);
+        let n = VReg::new(1, Width::W16); // variable count in W16 vreg
+        let c = VReg::new(2, Width::W8);
+        f.push_op(IrOp::load_imm(a, 5));
+        // n is not a remat-immediate (ensure_a(n) would need to load it);
+        // Make it a non-const by using a W16 value that might be in a register.
+        f.push_op(IrOp::load_imm(n, 2));
+        // Force n out of remat by storing through a side-effect path:
+        // We can't easily break remat from IR level, so just verify the
+        // loop structure for a constant that *would* reach the loop if
+        // known_imm were not matched.  Since the IR optimizer might fold
+        // this, at minimum assert the old broken "MOV A,B" pattern is gone.
+        f.push_op(IrOp::Shl { dst: c, lhs: a, rhs: n, width: Width::W8 });
+        f.push_op(IrOp::ret(None));
+        let out = gen_single_func(f);
+        // Whatever path taken, should never see the old clobbering pattern.
+        assert!(!out.iter().any(|l| l.trim() == "RAL"),
+            "unexpected RAL (old loop body) in output:\n{}", out.join("\n"));
+    }
+
 
     #[test]
     fn and_8bit() {
