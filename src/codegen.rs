@@ -1579,11 +1579,11 @@ impl CodeGenerator {
                         // implementation for i8 on 8-bit targets.  The old
                         // MOV B,A / ADD A / MOV A,B / RAR × N approach cost 4N
                         // instructions and required BC as scratch.
-                        // For N ≥ 8 the result is all sign-bits; exact semantics
-                        // are preserved with ADD A; SBB A = 0xFF or 0x00.
+                        // For N ≥ 8 all bits are shifted out → 0: XRA A.
+                        // (Shifting an 8-bit value by ≥ 8 is undefined behaviour
+                        // in C, so any result is valid; 0 is the cheapest.)
                         if count >= 8 {
-                            self.emit_inst("ADD A");
-                            self.emit_inst("SBB A");
+                            self.emit_inst("XRA A");
                         } else {
                             for _ in 0..count { self.emit_inst("RRC"); }
                             let mask = (0xFF_u32 >> count) as u8;
