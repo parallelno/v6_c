@@ -1392,7 +1392,7 @@ impl CodeGenerator {
                         return;
                     }
                 }
-                // Use runtime helpers: shift count in B, value in HL
+                // Use runtime helpers: shift count in A, value in HL
                 let helper = if is_right {
                     if arithmetic {
                         "__shr16s"
@@ -1405,7 +1405,7 @@ impl CodeGenerator {
                 self.spill_live_before_call(helper);
                 self.ensure(rhs, PhysReg::BC);
                 self.ensure_hl(lhs);
-                self.emit_inst("MOV B,C"); // count from C→B
+                self.emit_inst("MOV A,C"); // count: C (low byte of BC) → A
                 self.emit_call_with_effects(helper);
                 self.mark(dst, PhysReg::HL);
             }
