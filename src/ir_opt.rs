@@ -476,8 +476,11 @@ fn load_store_forwarding(func: &mut IrFunction) -> bool {
                 }
             }
             IrOp::StorePtr { .. } | IrOp::LoadPtr { .. } | IrOp::StoreLocal { .. } => {
-                // Unknown memory aliasing invalidates forwarding facts.
-                mem_state.clear();
+                // Unknown memory aliasing may invalidate non-local global
+                // forwarding facts.  Compiler-local _l_ labels (local variable
+                // storage slots) are never reachable via user pointers, so we
+                // keep them.
+                mem_state.retain(|label, _| label.starts_with("_l_"));
                 out.push(instr.clone());
             }
             IrOp::Call { .. } => {
@@ -766,6 +769,12 @@ fn constant_fold_and_propagate(func: &mut IrFunction) -> bool {
     let mut changed = false;
     // Map from VReg id → known constant value
     let mut constants: HashMap<u32, i64> = HashMap::new();
+    // Map from compiler-local label name → known constant value.
+    // Compiler-local labels (_l_ prefix) are internal storage cells for local
+    // variables; they are never accessible via user pointers, so StorePtr
+    // cannot alias them.  This lets us propagate constant values through
+    // StoreGlobal / LoadGlobal pairs across pointer stores.
+    let mut global_consts: HashMap<String, i64> = HashMap::new();
 
     let mut new_body: Vec<IrInstr> = Vec::with_capacity(func.body.len());
 
@@ -1103,6 +1112,7 @@ fn constant_fold_and_propagate(func: &mut IrFunction) -> bool {
             // reached from multiple predecessors.
             IrOp::Label { .. } => {
                 constants.clear();
+                global_consts.clear();
                 new_body.push(instr.clone());
             }
 
@@ -1116,12 +1126,29 @@ fn constant_fold_and_propagate(func: &mut IrFunction) -> bool {
                 if let Some(d) = dst {
                     constants.remove(&d.id);
                 }
+                global_consts.clear();
                 new_body.push(instr.clone());
             }
 
             // Stores/loads from globals — the destination vreg gets an unknown value.
-            IrOp::LoadGlobal { dst, .. }
-            | IrOp::LoadLocal { dst, .. }
+            // Exception: compiler-local _l_ labels are tracked via global_consts.
+            IrOp::LoadGlobal { dst, addr_label } => {
+                if addr_label.starts_with("_l_") {
+                    if let Some(&val) = global_consts.get(addr_label.as_str()) {
+                        // Fold: LoadGlobal → LoadImm (constant known for this label).
+                        constants.insert(dst.id, val);
+                        new_body.push(IrInstr {
+                            op: IrOp::LoadImm { dst: *dst, value: val },
+                            line: instr.line,
+                        });
+                        changed = true;
+                        continue;
+                    }
+                }
+                constants.remove(&dst.id);
+                new_body.push(instr.clone());
+            }
+            IrOp::LoadLocal { dst, .. }
             | IrOp::LoadPtr { dst, .. }
             | IrOp::AddrOfGlobal { dst, .. }
             | IrOp::PtrAdd { dst, .. } => {
@@ -1170,6 +1197,20 @@ fn constant_fold_and_propagate(func: &mut IrFunction) -> bool {
 
             // Everything else: keep the instruction, invalidate dst if any.
             _ => {
+                // Track StoreGlobal to compiler-local labels so subsequent
+                // LoadGlobal from the same label can be constant-folded.
+                if let IrOp::StoreGlobal { addr_label, src } = &instr.op {
+                    if addr_label.starts_with("_l_") {
+                        if let Some(&val) = constants.get(&src.id) {
+                            global_consts.insert(addr_label.clone(), val);
+                        } else {
+                            global_consts.remove(addr_label.as_str());
+                        }
+                    }
+                }
+                if let Some(dst) = get_dst_vreg(&instr.op) {
+                    constants.remove(&dst.id);
+                }
                 new_body.push(instr.clone());
             }
         }
