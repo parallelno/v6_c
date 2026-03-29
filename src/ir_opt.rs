@@ -2510,6 +2510,17 @@ fn loop_invariant_code_motion(func: &mut IrFunction) -> bool {
             if get_pure_dst(op).is_none() {
                 continue;
             }
+            // Never hoist bare LoadImm instructions.  They have an empty
+            // source list, so the loop-invariance check is vacuously true,
+            // but hoisting them is pointless (constants are free to
+            // rematerialise) and harmful: placing a LoadImm before the loop
+            // header label prevents constant_fold_and_propagate from folding
+            // uses inside the loop (the label clears the constant map), so
+            // the loop body materialises a fresh copy via a different register
+            // while the hoisted one becomes dead in the assembly output.
+            if matches!(op, IrOp::LoadImm { .. }) {
+                continue;
+            }
             // Check that all source operands are defined outside the loop.
             let sources = collect_src_vregs(op);
             if sources.iter().all(|s| !loop_defs.contains(s)) {

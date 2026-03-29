@@ -312,6 +312,27 @@ fn rule_two_window(lines: &mut Vec<Line>) -> bool {
                 continue;
             }
 
+            // --- Rule 36: MVI A,n / MOV M,A → MVI M,n ------------------
+            // MVI M,imm8 stores the immediate directly to (HL) in one
+            // instruction (2 bytes) instead of two (MVI A,n = 2 bytes,
+            // MOV M,A = 1 byte, total 3 bytes).
+            (
+                Line::Instruction { opcode: op_a, operands: imm },
+                Line::Instruction { opcode: op_b, operands: ops_b },
+            ) if op_a == "MVI" && op_b == "MOV"
+                && imm.trim().starts_with("A,")
+                && ops_b.trim() == "M,A" =>
+            {
+                let immediate = imm.trim()["A,".len()..].to_string();
+                lines[i] = Line::Instruction {
+                    opcode: "MVI".to_string(),
+                    operands: format!("M,{}", immediate),
+                };
+                lines.remove(i + 1);
+                changed = true;
+                continue;
+            }
+
             _ => {}
         }
 

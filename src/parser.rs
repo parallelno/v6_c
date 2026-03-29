@@ -293,7 +293,16 @@ impl<'t> Parser<'t> {
             }
             match self.parse_top_level() {
                 Some(tl) => decls.push(tl),
-                None => self.synchronize(),
+                None => {
+                    let pos_before = self.pos;
+                    self.synchronize();
+                    if self.pos == pos_before {
+                        // synchronize() made no progress (e.g. stuck on a
+                        // stray `}` which it stops before but doesn't consume).
+                        // Forcibly consume the token to avoid an infinite loop.
+                        self.advance();
+                    }
+                }
             }
         }
         decls
