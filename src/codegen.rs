@@ -809,10 +809,51 @@ impl CodeGenerator {
                 self.mark(dst, PhysReg::A);
             }
             Width::W16 | Width::W32 => {
-                self.ensure_de(rhs);
-                self.ensure_hl(lhs);
-                self.emit_inst("DAD D");
-                self.mark(dst, PhysReg::HL);
+                // Fast path: Add(x, ±k) or Add(±k, x) for small k.
+                // Using INX H / DCX H avoids loading k into DE, which would
+                // otherwise force a spill/reload of lhs (x).
+                let rhs_k = self.known_imm(rhs);
+                let lhs_k = self.known_imm(lhs);
+                let fast: Option<(VReg, VReg, i64)> = match (rhs_k, lhs_k) {
+                    (Some(k), _)
+                        if k != 0
+                            && k.abs() <= 4
+                            && self.last_use.get(&rhs.id).copied()
+                                == Some(self.instr_index) =>
+                    {
+                        Some((lhs, rhs, k)) // var_op, const_op, k
+                    }
+                    (_, Some(k))
+                        if k != 0
+                            && k.abs() <= 4
+                            && self.last_use.get(&lhs.id).copied()
+                                == Some(self.instr_index) =>
+                    {
+                        Some((rhs, lhs, k)) // add is commutative
+                    }
+                    _ => None,
+                };
+                if let Some((var_op, const_op, k)) = fast {
+                    // Release the constant register before loading var_op so
+                    // that HL is available without a detour through spill/reload.
+                    self.regalloc.free(const_op);
+                    self.ensure_hl(var_op);
+                    // Release var_op here too if it dies; prevents a dead spill
+                    // when mark(dst, HL) later evicts the occupant of HL.
+                    if self.last_use.get(&var_op.id).copied() == Some(self.instr_index) {
+                        self.regalloc.free(var_op);
+                    }
+                    let inst = if k > 0 { "INX H" } else { "DCX H" };
+                    for _ in 0..k.abs() {
+                        self.emit_inst(inst);
+                    }
+                    self.mark(dst, PhysReg::HL);
+                } else {
+                    self.ensure_de(rhs);
+                    self.ensure_hl(lhs);
+                    self.emit_inst("DAD D");
+                    self.mark(dst, PhysReg::HL);
+                }
             }
         }
     }
@@ -828,7 +869,27 @@ impl CodeGenerator {
                 self.mark(dst, PhysReg::A);
             }
             Width::W16 | Width::W32 => {
-                // HL = HL - DE  → complement DE, add, increment
+                // Fast path: Sub(x, ±k) for small k — use DCX H / INX H.
+                if let Some(k) = self.known_imm(rhs) {
+                    if k != 0
+                        && k.abs() <= 4
+                        && self.last_use.get(&rhs.id).copied() == Some(self.instr_index)
+                    {
+                        self.regalloc.free(rhs);
+                        self.ensure_hl(lhs);
+                        if self.last_use.get(&lhs.id).copied() == Some(self.instr_index) {
+                            self.regalloc.free(lhs);
+                        }
+                        // lhs - k: DCX H repeated k times (or INX H if k < 0)
+                        let inst = if k > 0 { "DCX H" } else { "INX H" };
+                        for _ in 0..k.abs() {
+                            self.emit_inst(inst);
+                        }
+                        self.mark(dst, PhysReg::HL);
+                        return;
+                    }
+                }
+                // General case: HL = HL - DE  → complement DE, add, increment
                 self.ensure_de(rhs);
                 self.ensure_hl(lhs);
                 // negate DE: complement and increment
