@@ -49,6 +49,13 @@ pub struct CodeGenerator {
     /// `gen_jump_if_false` encounters one of these IDs it is a no-op because
     /// the branch was already emitted.
     consumed_cmp: HashSet<u32>,
+    /// Address whose value is currently in register A, if any.  Set after
+    /// `STA addr` so that a subsequent `LDA addr` can be skipped when A
+    /// hasn't been overwritten since.  Cleared by hooks in `mark` and
+    /// `ensure` whenever A is physically overwritten, and at unconditional
+    /// jumps / calls so that else-body labels and post-call code are always
+    /// safe.
+    a_mirrors: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -70,6 +77,7 @@ pub fn generate(program: &IrProgram, analysis: &CallGraphAnalysis) -> Vec<String
         instr_index: 0,
         current_c_line: 0,
         consumed_cmp: HashSet::new(),
+        a_mirrors: None,
     };
 
     cg.emit_comment("--- code section ---");
@@ -300,6 +308,7 @@ impl CodeGenerator {
         let effects = self.call_effects(func_name);
         let regs: Vec<PhysReg> = effects.clobbers.iter().copied().collect();
         self.regalloc.clobber_regs(&regs);
+        self.a_mirrors = None;
     }
 
     fn emit_call_with_effects(&mut self, func_name: &str) {
@@ -463,6 +472,13 @@ impl CodeGenerator {
 impl CodeGenerator {
     /// Ensure `vreg` is in `target` register, emitting any necessary moves.
     fn ensure(&mut self, vreg: VReg, target: PhysReg) {
+        // If we're about to place a different value in A, A no longer mirrors
+        // the last-stored global address.
+        if target == PhysReg::A
+            && self.regalloc.occupant(PhysReg::A) != Some(vreg.id)
+        {
+            self.a_mirrors = None;
+        }
         let ops = self.regalloc.ensure_in_reg(vreg, target);
         self.emit_moves(&ops);
     }
@@ -484,6 +500,10 @@ impl CodeGenerator {
 
     /// Mark `vreg` as living in `reg` after we've emitted a load ourselves.
     fn mark(&mut self, vreg: VReg, reg: PhysReg) {
+        // A new value is about to occupy A — it no longer mirrors any store.
+        if reg == PhysReg::A {
+            self.a_mirrors = None;
+        }
         let ops = self.regalloc.mark_allocated(vreg, reg);
         self.emit_moves(&ops);
     }
@@ -501,6 +521,7 @@ impl CodeGenerator {
         self.last_use = compute_last_use(&func.body);
         self.current_c_line = 0;
         self.consumed_cmp.clear();
+        self.a_mirrors = None;
         self.emit_comment(&format!("function {}", func.name));
         self.emit_label(&func.name);
 
@@ -716,10 +737,24 @@ impl CodeGenerator {
     fn gen_load_global(&mut self, dst: VReg, addr_label: &str) {
         match dst.width {
             Width::W8 => {
+                // If A's physical bytes still hold addr's value (STA addr was
+                // the last thing that changed A, tracked via a_mirrors), skip
+                // the LDA entirely.  a_mirrors is cleared in the `ensure` and
+                // `mark` hooks whenever A is overwritten, and at unconditional
+                // jumps, so else-body labels never produce a false match.
+                if self.a_mirrors.as_deref() == Some(addr_label) {
+                    // Just claim A for the new dst vreg — no load needed.
+                    let ops = self.regalloc.mark_allocated(dst, PhysReg::A);
+                    self.emit_moves(&ops); // usually empty after free_dead_vregs
+                    // a_mirrors stays valid (A still == addr_label)
+                    return;
+                }
                 // Evict A's occupant BEFORE LDA overwrites A.
-                let ops = self.regalloc.mark_allocated(dst, PhysReg::A);
-                self.emit_moves(&ops);
+                // Routing through self.mark clears a_mirrors, then we restore
+                // it because after LDA addr, A mirrors addr.
+                self.mark(dst, PhysReg::A);
                 self.emit_inst(&format!("LDA {}", addr_label));
+                self.a_mirrors = Some(addr_label.to_string());
             }
             Width::W16 | Width::W32 => {
                 // Evict HL's occupant BEFORE LHLD overwrites HL.
@@ -735,6 +770,10 @@ impl CodeGenerator {
             Width::W8 => {
                 self.ensure_a(src);
                 self.emit_inst(&format!("STA {}", addr_label));
+                // After STA, A's physical bytes equal addr's memory.
+                // The ensure_a above may have cleared a_mirrors (if it had to
+                // move a different value into A), so unconditionally set here.
+                self.a_mirrors = Some(addr_label.to_string());
             }
             Width::W16 | Width::W32 => {
                 self.ensure_hl(src);
@@ -767,8 +806,9 @@ impl CodeGenerator {
             Width::W8 => {
                 self.ensure_hl(ptr);
                 // Evict A's occupant BEFORE MOV A,M overwrites A.
-                let ops = self.regalloc.mark_allocated(dst, PhysReg::A);
-                self.emit_moves(&ops);
+                // Routing through self.mark clears a_mirrors (A gets a new
+                // pointer-derived value unrelated to any named global).
+                self.mark(dst, PhysReg::A);
                 self.emit_inst("MOV A,M");
             }
             Width::W16 | Width::W32 => {
@@ -1868,6 +1908,10 @@ impl CodeGenerator {
 
     fn gen_jump(&mut self, target: Label) {
         self.emit_inst(&format!("JMP {}", self.ir_label(target)));
+        // Unconditional jump ends the current basic block.  An else-body label
+        // (the only predecessor being the conditional branch, not fall-through)
+        // must not inherit stale a_mirrors from the if-body.
+        self.a_mirrors = None;
     }
 
     // -- JumpIfTrue / JumpIfFalse -----------------------------------------
