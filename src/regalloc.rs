@@ -314,10 +314,16 @@ impl RegAllocator {
     /// the code generator has emitted a load itself).
     pub fn mark_allocated(&mut self, vreg: VReg, reg: PhysReg) -> Vec<MoveOp> {
         let mut ops = Vec::new();
-        // Evict current occupant if different.
+        // Evict current occupant if different: prefer a free alternate register
+        // over a memory spill (e.g. move HL → DE rather than SHLD __spill_N).
         if let Some(old_id) = self.occupant(reg) {
             if old_id != vreg.id {
-                if let Some(op) = self.spill(reg) {
+                if let Some(alt) = self.find_free_alternate(reg) {
+                    self.reg_contents.insert(reg, None);
+                    self.reg_contents.insert(alt, Some(old_id));
+                    self.vreg_map.insert(old_id, Location::Reg(alt));
+                    ops.push(MoveOp::RegToReg { src: reg, dst: alt });
+                } else if let Some(op) = self.spill(reg) {
                     ops.push(op);
                 }
             }
@@ -613,11 +619,29 @@ mod tests {
         ra.allocate(v16(0)); // HL
         let ops = ra.mark_allocated(v16(1), PhysReg::HL);
         assert_eq!(ops.len(), 1);
+        // With a free alternate register (DE or BC) available, mark_allocated
+        // should prefer a register-to-register move over a memory spill.
+        match &ops[0] {
+            MoveOp::RegToReg { src, .. } => assert_eq!(*src, PhysReg::HL),
+            other => panic!("expected RegToReg, got {:?}", other),
+        }
+        assert_eq!(ra.occupant(PhysReg::HL), Some(1));
+    }
+
+    #[test]
+    fn mark_allocated_spills_when_no_free_alternate() {
+        let mut ra = RegAllocator::new();
+        // Fill all 16-bit regs so there's no free alternate.
+        ra.allocate(v16(0)); // HL
+        ra.allocate(v16(1)); // DE
+        ra.allocate(v16(2)); // BC
+        let ops = ra.mark_allocated(v16(3), PhysReg::HL);
+        assert_eq!(ops.len(), 1);
         match &ops[0] {
             MoveOp::Spill { src, .. } => assert_eq!(*src, PhysReg::HL),
             other => panic!("expected Spill, got {:?}", other),
         }
-        assert_eq!(ra.occupant(PhysReg::HL), Some(1));
+        assert_eq!(ra.occupant(PhysReg::HL), Some(3));
     }
 
     #[test]

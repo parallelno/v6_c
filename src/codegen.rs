@@ -692,12 +692,15 @@ impl CodeGenerator {
                 } else {
                     PhysReg::HL
                 };
-                // Small constants (|k| ≤3) will be consumed by the INX/DCX fast
-                // path in gen_add/gen_sub via known_imm() — no physical register
-                // is needed.  Store as a remat-only immediate; if the value is
-                // ever needed in a register (e.g. gen_add general path, or the
-                // immediate outlives the Add), ensure_de/ensure_hl emit LXI lazily.
-                if target != PhysReg::HL && value.abs() <= 3 {
+                // Any immediate destined for DE/BC is stored as remat-only: no
+                // physical register is eagerly allocated and no LXI is emitted
+                // now.  The LXI is emitted lazily by ensure_de/ensure_bc if the
+                // value is ever actually needed in a register.  This avoids
+                // wasted LXI D,N instructions when the immediate is consumed by
+                // gen_load_ptr's fast path (LHLD addr), gen_add's imm path, or
+                // similar — all of which read the value via known_imm() rather
+                // than through a physical register.
+                if target != PhysReg::HL {
                     self.regalloc.mark_remat_imm_only(dst, value);
                     return;
                 }
@@ -735,12 +738,16 @@ impl CodeGenerator {
     fn gen_load_global(&mut self, dst: VReg, addr_label: &str) {
         match dst.width {
             Width::W8 => {
+                // Evict A's occupant BEFORE LDA overwrites A.
+                let ops = self.regalloc.mark_allocated(dst, PhysReg::A);
+                self.emit_moves(&ops);
                 self.emit_inst(&format!("LDA {}", addr_label));
-                self.mark(dst, PhysReg::A);
             }
             Width::W16 | Width::W32 => {
+                // Evict HL's occupant BEFORE LHLD overwrites HL.
+                let ops = self.regalloc.mark_allocated(dst, PhysReg::HL);
+                self.emit_moves(&ops);
                 self.emit_inst(&format!("LHLD {}", addr_label));
-                self.mark(dst, PhysReg::HL);
             }
         }
     }
@@ -781,24 +788,32 @@ impl CodeGenerator {
         match dst.width {
             Width::W8 => {
                 self.ensure_hl(ptr);
+                // Evict A's occupant BEFORE MOV A,M overwrites A.
+                let ops = self.regalloc.mark_allocated(dst, PhysReg::A);
+                self.emit_moves(&ops);
                 self.emit_inst("MOV A,M");
-                self.mark(dst, PhysReg::A);
             }
             Width::W16 | Width::W32 => {
                 // Fast path: constant address → LHLD addr (1 instruction).
                 if let Some(addr) = self.known_imm(ptr) {
                     let addr16 = (addr & 0xFFFF) as u16;
                     self.regalloc.free(ptr);
+                    // Evict HL's occupant BEFORE LHLD overwrites HL.
+                    let ops = self.regalloc.mark_allocated(dst, PhysReg::HL);
+                    self.emit_moves(&ops);
                     self.emit_inst(&format!("LHLD {}", addr16));
-                    self.mark(dst, PhysReg::HL);
                     return;
                 }
                 // General path: load 16-bit value from (HL): low byte first.
+                // ensure_hl(ptr) already handles evicting HL's old occupant.
                 self.ensure_hl(ptr);
                 self.emit_inst("MOV E,M");
                 self.emit_inst("INX H");
                 self.emit_inst("MOV D,M");
                 self.emit_inst("XCHG");
+                // ptr was consumed as the address; free it so mark(dst, HL)
+                // doesn't incorrectly try to spill the now-clobbered HL slot.
+                self.regalloc.free(ptr);
                 self.mark(dst, PhysReg::HL);
             }
         }
@@ -933,8 +948,35 @@ impl CodeGenerator {
                             self.emit_inst("DAD B");
                         }
                     } else {
-                        self.ensure_de(rhs);
-                        self.ensure_hl(lhs);
+                        // Addition is commutative.  If lhs is already in DE and
+                        // rhs in HL (the swapped layout produced when gen_load_ptr
+                        // evicted lhs HL→DE to make room for the new load), calling
+                        // ensure_de(rhs) first causes a circular 5-move shuffle:
+                        //   evict lhs DE→BC / XCHG(HL→DE, DE→HL) / MOV H,B;MOV L,C
+                        // Instead, detect and short-circuit: both operands are already
+                        // in HL and DE; free them (both must be dead) so that
+                        // mark(dst, HL) sees a free register and emits nothing.
+                        let lhs_de_rhs_hl =
+                            matches!(self.regalloc.get_location(lhs), Some(Location::Reg(PhysReg::DE)))
+                            && matches!(self.regalloc.get_location(rhs), Some(Location::Reg(PhysReg::HL)));
+                        if lhs_de_rhs_hl
+                            && self.last_use.get(&lhs.id).copied() == Some(self.instr_index)
+                            && self.last_use.get(&rhs.id).copied() == Some(self.instr_index)
+                        {
+                            // HL = rhs + lhs = lhs + rhs ✓  (addition is commutative)
+                            self.regalloc.free(lhs);
+                            self.regalloc.free(rhs);
+                        } else {
+                            self.ensure_de(rhs);
+                            self.ensure_hl(lhs);
+                            // Free lhs if dead: it was placed in HL by ensure_hl,
+                            // but DAD D overwrites HL with the result.  Freeing here
+                            // prevents mark(dst, HL) generating a spurious eviction
+                            // move for a value that is no longer live.
+                            if self.last_use.get(&lhs.id).copied() == Some(self.instr_index) {
+                                self.regalloc.free(lhs);
+                            }
+                        }
                         self.emit_inst("DAD D");
                     }
                     self.mark(dst, PhysReg::HL);
