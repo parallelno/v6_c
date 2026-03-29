@@ -1419,13 +1419,17 @@ fn redundant_store_eliminate(func: &mut IrFunction) -> bool {
 
     // --- Step 2: remove stores to _l_-prefixed locals that are never loaded ---
     //
-    // After full loop unrolling + constant folding, the loop IV (e.g. _l_main_i)
-    // may have all its LoadGlobal instructions replaced by constants, leaving only
-    // orphaned StoreGlobal instructions.  Only safe to remove stores for the
-    // *current function's own* locals (prefix `_l_{name}_`) — other `_l_`-prefixed
-    // slots (e.g. `_l_callee_arg`) are argument-passing slots written here and
-    // read by the callee, so they must NOT be removed.
-    let own_local_prefix = format!("_l_{}_", func.name);
+    // After full loop unrolling + constant folding the loop IV (e.g. _l_main_i)
+    // may have all its LoadGlobal instructions replaced by constants, leaving
+    // only orphaned StoreGlobal instructions.
+    //
+    // Similarly, after inlining a callee the parameter-setup store
+    // (StoreGlobal _l_callee_param) becomes dead when load_store_forwarding has
+    // already forwarded the value through the inlined body, removing the
+    // LoadGlobal.  Because parameter passing uses the Call.args VRegs — never
+    // pre-placed StoreGlobal — any _l_*-prefixed store in this function that
+    // has no matching LoadGlobal can only originate from this function's own
+    // locals/params or from the inlining expansion.  Both are safe to drop.
     let loaded_globals: HashSet<String> = func.body.iter()
         .filter_map(|i| {
             if let IrOp::LoadGlobal { addr_label, .. } = &i.op { Some(addr_label.clone()) }
@@ -1435,7 +1439,7 @@ fn redundant_store_eliminate(func: &mut IrFunction) -> bool {
 
     for (idx, instr) in func.body.iter().enumerate() {
         if let IrOp::StoreGlobal { addr_label, .. } = &instr.op {
-            if addr_label.starts_with(&own_local_prefix) && !loaded_globals.contains(addr_label) {
+            if addr_label.starts_with("_l_") && !loaded_globals.contains(addr_label) {
                 dead.insert(idx);
             }
         }
@@ -1462,14 +1466,36 @@ fn redundant_store_eliminate(func: &mut IrFunction) -> bool {
 fn dead_code_eliminate(func: &mut IrFunction) -> bool {
     let mut changed = false;
 
-    // Pass 1: Remove unreachable code after unconditional jumps.
-    let mut new_body: Vec<IrInstr> = Vec::with_capacity(func.body.len());
+    // Pass 1: Remove unreachable code after unconditional jumps, and remove
+    // trivial fall-through jumps (`Jump L` immediately followed by `Label L`).
+    let body = &func.body;
+    // Pre-compute a set of indices that are trivial fall-through jumps.
+    let fall_through_jumps: HashSet<usize> = body
+        .windows(2)
+        .enumerate()
+        .filter_map(|(i, pair)| {
+            if let (IrOp::Jump { target }, IrOp::Label { label }) =
+                (&pair[0].op, &pair[1].op)
+            {
+                if target.0 == label.0 { Some(i) } else { None }
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let mut new_body: Vec<IrInstr> = Vec::with_capacity(body.len());
     let mut unreachable = false;
-    for instr in &func.body {
+    for (idx, instr) in body.iter().enumerate() {
         match &instr.op {
             IrOp::Jump { .. } => {
-                new_body.push(instr.clone());
-                unreachable = true;
+                if fall_through_jumps.contains(&idx) {
+                    // Trivial jump-to-next-label: skip it entirely.
+                    changed = true;
+                } else {
+                    new_body.push(instr.clone());
+                    unreachable = true;
+                }
             }
             IrOp::Return { .. } => {
                 new_body.push(instr.clone());
@@ -1970,6 +1996,69 @@ fn jump_threading(func: &mut IrFunction) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Dead function removal
+// ---------------------------------------------------------------------------
+
+/// Remove functions that are never called from any remaining function.
+///
+/// After inlining, some functions may have had all their call sites inlined
+/// away.  These functions are dead and should not be emitted.
+///
+/// Reachability is seeded from every function that is never the target of a
+/// `Call` instruction in any other function (i.e., all potential entry points,
+/// not just "main").  This keeps unit-test helper functions (which are also
+/// never called by anyone) alive while still removing fully-inlined callees.
+fn remove_dead_functions(program: &mut IrProgram) {
+    // Build set of function names that appear as Call targets.
+    let called: HashSet<String> = program
+        .functions
+        .iter()
+        .flat_map(|f| f.body.iter())
+        .filter_map(|instr| {
+            if let IrOp::Call { func_name, .. } = &instr.op {
+                Some(func_name.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Build a call-graph adjacency list (caller → callees) indexed by name.
+    let func_map: HashMap<String, usize> = program
+        .functions
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.name.clone(), i))
+        .collect();
+
+    // Seed live set with all functions that are not called by anyone.
+    let mut live: HashSet<String> = HashSet::new();
+    let mut worklist: Vec<String> = program
+        .functions
+        .iter()
+        .filter(|f| !called.contains(&f.name))
+        .map(|f| f.name.clone())
+        .collect();
+
+    while let Some(name) = worklist.pop() {
+        if !live.insert(name.clone()) {
+            continue; // already visited
+        }
+        if let Some(&idx) = func_map.get(&name) {
+            for instr in &program.functions[idx].body {
+                if let IrOp::Call { func_name, .. } = &instr.op {
+                    if !live.contains(func_name) {
+                        worklist.push(func_name.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    program.functions.retain(|f| live.contains(&f.name));
+}
+
+// ---------------------------------------------------------------------------
 // Inline expansion
 // ---------------------------------------------------------------------------
 
@@ -2041,6 +2130,26 @@ fn inline_expand(program: &mut IrProgram) {
         })
         .collect();
 
+    // Record which inline candidates actually had at least one call site.
+    // Only these can become "fully inlined away" — a function with no original
+    // callers is an entry point and must NOT be removed.
+    let had_callers: HashSet<String> = program
+        .functions
+        .iter()
+        .flat_map(|f| f.body.iter())
+        .filter_map(|instr| {
+            if let IrOp::Call { func_name, .. } = &instr.op {
+                if inline_candidates.contains(func_name) {
+                    Some(func_name.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .collect();
+
     // Process each function and inline call sites.
     for func in &mut program.functions {
         let mut new_body: Vec<IrInstr> = Vec::with_capacity(func.body.len());
@@ -2067,6 +2176,31 @@ fn inline_expand(program: &mut IrProgram) {
             func.body = new_body;
         }
     }
+
+    // Remove inline candidates that now have no remaining call sites.
+    // After inlining, a small function that was fully inlined everywhere has
+    // no more callers and should not be emitted.  We only remove functions
+    // that were in inline_candidates (small, non-recursive) — larger functions
+    // (not eligible for inlining) are intentionally kept regardless of whether
+    // they are still called, because their removal may be surprising or break
+    // external linkage assumptions.
+    let still_called: HashSet<String> = program
+        .functions
+        .iter()
+        .flat_map(|f| f.body.iter())
+        .filter_map(|instr| {
+            if let IrOp::Call { func_name, .. } = &instr.op {
+                Some(func_name.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    program.functions.retain(|f| {
+        !inline_candidates.contains(&f.name)
+            || !had_callers.contains(&f.name)
+            || still_called.contains(&f.name)
+    });
 }
 
 /// Check if a function calls itself (direct recursion).
@@ -2141,10 +2275,28 @@ fn inline_call_site(
         rv
     });
 
-    // Step 1: Store arguments to callee's parameter labels.
-    // The callee body starts with StoreGlobal instructions for params,
-    // but the IR gen already did that at the call site. We need to
-    // write the actual argument vregs to the callee's param labels.
+    // Step 1: Seed vreg_map with callee param vregs → caller arg vregs.
+    // After load_store_forwarding runs on the callee, LoadGlobal _l_param
+    // instructions become Copy vreg_x, vreg_param, so the body may reference
+    // the parameter vreg directly.  If we don't pre-seed the mapping those
+    // references get fresh ids disconnected from the actual argument values,
+    // blocking constant propagation.
+    for (i, param) in callee.params.iter().enumerate() {
+        if i < call_args.len() {
+            vreg_map.insert(param.vreg.id, call_args[i].id);
+        }
+    }
+
+    // Step 2: Store arguments to callee's parameter labels.
+    // This keeps correctness for any path where the callee body still accesses
+    // the parameter via LoadGlobal _l_callee_param (e.g. unoptimised callees or
+    // callees whose param slot is written to inside the body).
+    let param_labels: std::collections::HashSet<String> = callee
+        .params
+        .iter()
+        .map(|p| format!("_l_{}_{}", callee.name, p.name))
+        .collect();
+
     for (i, param) in callee.params.iter().enumerate() {
         if i < call_args.len() {
             let label = format!("_l_{}_{}", callee.name, param.name);
@@ -2155,10 +2307,25 @@ fn inline_call_site(
         }
     }
 
-    // Step 2: Copy the callee body with remapped vregs/labels.
-    // Skip the initial parameter stores (StoreGlobal for _l_callee_param).
-    let skip_prefix = callee.params.len();
-    for instr in callee.body.iter().skip(skip_prefix) {
+    // Step 3: Copy the callee body with remapped vregs/labels.
+    // Skip leading StoreGlobal instructions for parameter labels (the param
+    // preamble).  We detect this dynamically instead of using a fixed
+    // skip_prefix count because redundant_store_eliminate may have already
+    // removed some or all of those stores from the callee before we get here.
+    let body_start = {
+        let mut n = 0;
+        for instr in &callee.body {
+            if let IrOp::StoreGlobal { addr_label, .. } = &instr.op {
+                if param_labels.contains(addr_label) {
+                    n += 1;
+                    continue;
+                }
+            }
+            break;
+        }
+        n
+    };
+    for instr in callee.body.iter().skip(body_start) {
         // Handle Return specially: it needs to produce Copy + Jump.
         if let IrOp::Return { value } = &instr.op {
             if let (Some(v), Some(rv_dst)) = (value, ret_vreg) {
@@ -2183,10 +2350,10 @@ fn inline_call_site(
         result.push(IrInstr { op: new_op, line: instr.line });
     }
 
-    // Step 3: Emit merge label.
+    // Step 4: Emit merge label.
     result.push(IrInstr::bare(IrOp::Label { label: merge_label }));
 
-    // Step 4: Copy return value to the call's destination.
+    // Step 5: Copy return value to the call's destination.
     if let (Some(dst), Some(rv)) = (call_dst, ret_vreg) {
         result.push(IrInstr::bare(IrOp::Copy { dst: *dst, src: rv }));
     }
@@ -3561,10 +3728,11 @@ mod tests {
 
     #[test]
     fn cse_cleared_at_label() {
-        // A label that IS jumped-to must clear the CSE table, because the label
-        // can be reached from multiple predecessors with different values.
-        // Dead (unreferenced) labels are removed by remove_dead_labels before CSE
-        // runs, so this test uses a live label with a preceding Jump.
+        // A label that IS reached from two different paths (a real merge point)
+        // must clear the CSE table, because the label can be reached with
+        // different values in flight.  We construct this with a conditional jump:
+        // the label is the target of a JumpIfTrue, so it is NOT a trivial
+        // fall-through label and is preserved by remove_dead_labels.
         let body = vec![
             IrInstr::bare(IrOp::LoadGlobal {
                 dst: VReg::new(0, Width::W16),
@@ -3580,10 +3748,15 @@ mod tests {
                 rhs: VReg::new(1, Width::W16),
                 width: Width::W16,
             }),
-            // Unconditional jump makes Label(0) a live (referenced) label.
-            IrInstr::bare(IrOp::Jump { target: Label::new(0) }),
+            // Conditional jump makes Label(0) a real merge point (two predecessors:
+            // the JumpIfTrue path and the fall-through path).
+            IrInstr::bare(IrOp::JumpIfTrue {
+                cond: VReg::new(0, Width::W16),
+                target: Label::new(0),
+            }),
             IrInstr::bare(IrOp::Label { label: Label::new(0) }),
-            // Same computation after a live label — should NOT be CSE'd
+            // Same computation after a live label — should NOT be CSE'd because
+            // the label is a real merge point (CSE table cleared at Label).
             IrInstr::bare(IrOp::Add {
                 dst: VReg::new(3, Width::W16),
                 lhs: VReg::new(0, Width::W16),
@@ -3601,7 +3774,7 @@ mod tests {
             IrInstr::bare(IrOp::ret(None)),
         ];
         let result = opt_body(body);
-        // After a live label, CSE is cleared, so the second Add should remain.
+        // After a real convergence label, CSE is cleared, so the second Add should remain.
         let add_count = result.iter().filter(|i| matches!(&i.op, IrOp::Add { .. })).count();
         assert_eq!(add_count, 2);
     }
