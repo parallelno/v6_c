@@ -817,7 +817,7 @@ impl CodeGenerator {
                 let fast: Option<(VReg, VReg, i64)> = match (rhs_k, lhs_k) {
                     (Some(k), _)
                         if k != 0
-                            && k.abs() <= 4
+                            && k.abs() <= 3
                             && self.last_use.get(&rhs.id).copied()
                                 == Some(self.instr_index) =>
                     {
@@ -825,7 +825,7 @@ impl CodeGenerator {
                     }
                     (_, Some(k))
                         if k != 0
-                            && k.abs() <= 4
+                            && k.abs() <= 3
                             && self.last_use.get(&lhs.id).copied()
                                 == Some(self.instr_index) =>
                     {
@@ -872,7 +872,7 @@ impl CodeGenerator {
                 // Fast path: Sub(x, ±k) for small k — use DCX H / INX H.
                 if let Some(k) = self.known_imm(rhs) {
                     if k != 0
-                        && k.abs() <= 4
+                        && k.abs() <= 3
                         && self.last_use.get(&rhs.id).copied() == Some(self.instr_index)
                     {
                         self.regalloc.free(rhs);
