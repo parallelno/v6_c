@@ -160,6 +160,9 @@ fn apply_rules(lines: &mut Vec<Line>) -> bool {
     // --- Rule 37 & 38: Redundant LXI H,N / LHLD when HL already holds value ---
     changed |= rule_elim_redundant_lxi_h(lines);
 
+    // --- Rule 43: LXI H,N / MOV E,M / INX H / MOV D,M / XCHG → LHLD N ---
+    changed |= rule_lxi_w16_load_to_lhld(lines);
+
     // --- Rule 40: Remove dead spill stores (__spill_ labels never read) --
     changed |= rule_elim_dead_spills(lines);
 
@@ -851,6 +854,52 @@ fn rule_jump_threading(lines: &mut Vec<Line>) -> bool {
 ///   local variable via `SHLD` and then reloads it with `LHLD` even though
 ///   HL was never overwritten in between.
 ///
+/// Rule 43 — `LXI H,N / MOV E,M / INX H / MOV D,M / XCHG` → `LHLD N`.
+///
+/// When a 16-bit big-little-endian load is performed via HL at a literal
+/// address N, the five-instruction sequence is equivalent to one `LHLD N`
+/// instruction (L ← (N), H ← (N+1)).  This is the safety-net counterpart
+/// to the codegen fast path in gen_load_ptr; it also fires for any such
+/// patterns left over by other transformations.
+fn rule_lxi_w16_load_to_lhld(lines: &mut Vec<Line>) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+    while i + 4 < lines.len() {
+        // Collect the next 5 items; any of them may be a label or blank.
+        // We need 5 consecutive *instructions* (no intervening labels).
+        let window: Vec<&Line> = lines[i..i + 5].iter().collect();
+        let instrs: Vec<(&str, &str)> = window
+            .iter()
+            .filter_map(|l| {
+                if let Line::Instruction { opcode, operands } = l {
+                    Some((opcode.as_str(), operands.trim()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if instrs.len() == 5 {
+            let matches = instrs[0].0 == "LXI"  && instrs[0].1.starts_with("H,")
+                       && instrs[1] == ("MOV", "E,M")
+                       && instrs[2] == ("INX", "H")
+                       && instrs[3] == ("MOV", "D,M")
+                       && instrs[4] == ("XCHG", "");
+            if matches {
+                let addr = instrs[0].1["H,".len()..].to_string();
+                lines.splice(i..i + 5, [Line::Instruction {
+                    opcode: "LHLD".to_string(),
+                    operands: format!(" {}", addr),
+                }]);
+                changed = true;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    changed
+}
+
 /// HL-clobbering instructions (clear all HL state):
 ///   MOV H/L, MVI H/L, DAD, INX H, DCX H, XCHG, POP H,
 ///   any CALL/return opcode, and labels (unknown HL state at join points).

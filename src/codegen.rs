@@ -769,14 +769,23 @@ impl CodeGenerator {
     // -- LoadPtr / StorePtr -----------------------------------------------
 
     fn gen_load_ptr(&mut self, dst: VReg, ptr: VReg) {
-        self.ensure_hl(ptr);
         match dst.width {
             Width::W8 => {
+                self.ensure_hl(ptr);
                 self.emit_inst("MOV A,M");
                 self.mark(dst, PhysReg::A);
             }
             Width::W16 | Width::W32 => {
-                // Load 16-bit value from (HL): low byte first.
+                // Fast path: constant address → LHLD addr (1 instruction).
+                if let Some(addr) = self.known_imm(ptr) {
+                    let addr16 = (addr & 0xFFFF) as u16;
+                    self.regalloc.free(ptr);
+                    self.emit_inst(&format!("LHLD {}", addr16));
+                    self.mark(dst, PhysReg::HL);
+                    return;
+                }
+                // General path: load 16-bit value from (HL): low byte first.
+                self.ensure_hl(ptr);
                 self.emit_inst("MOV E,M");
                 self.emit_inst("INX H");
                 self.emit_inst("MOV D,M");
@@ -794,6 +803,14 @@ impl CodeGenerator {
                 self.emit_inst("MOV M,A");
             }
             Width::W16 | Width::W32 => {
+                // Fast path: constant address → SHLD addr (cheaper than MOV M,E / INX H / MOV M,D).
+                if let Some(addr) = self.known_imm(ptr) {
+                    let addr16 = (addr & 0xFFFF) as u16;
+                    self.regalloc.free(ptr);
+                    self.ensure_hl(src);
+                    self.emit_inst(&format!("SHLD {}", addr16));
+                    return;
+                }
                 self.ensure_de(src);
                 self.ensure_hl(ptr);
                 self.emit_inst("MOV M,E");
@@ -2348,8 +2365,8 @@ mod tests {
         f.push_op(IrOp::store_ptr(ptr, val));
         f.push_op(IrOp::ret(None));
         let out = gen_single_func(f);
-        assert!(has_line(&out, "MOV M,E"));
-        assert!(has_line(&out, "MOV M,D"));
+        // With a constant ptr address, codegen uses SHLD instead of MOV M,E/D.
+        assert!(has_line(&out, "SHLD"), "expected SHLD but got:\n{}", out.join("\n"));
     }
 
     // -- PtrAdd -----------------------------------------------------------
