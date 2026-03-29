@@ -90,6 +90,8 @@ fn optimize_function(func: &mut IrFunction, profile: OptProfile) {
                 changed |= constant_fold_and_propagate(func);
                 changed |= dead_branch_eliminate(func);
                 changed |= load_store_forwarding(func);
+                changed |= redundant_store_eliminate(func);
+                changed |= remove_dead_labels(func);
                 changed |= strength_reduce(func);
                 changed |= narrow_byte_ops(func);
                 changed |= dead_code_eliminate(func);
@@ -101,6 +103,8 @@ fn optimize_function(func: &mut IrFunction, profile: OptProfile) {
                 changed |= constant_fold_and_propagate(func);
                 changed |= dead_branch_eliminate(func);
                 changed |= load_store_forwarding(func);
+                changed |= redundant_store_eliminate(func);
+                changed |= remove_dead_labels(func);
                 changed |= cse(func);
                 changed |= narrow_byte_ops(func);
                 changed |= strength_reduce(func);
@@ -1318,6 +1322,139 @@ fn strength_reduce(func: &mut IrFunction) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Dead label removal
+// ---------------------------------------------------------------------------
+
+/// Remove IR Label instructions that are never targeted by any jump.
+///
+/// After full loop unrolling, continuation labels (L1, L3, …) inside the
+/// unrolled body are not jumped to by anything, but they still act as
+/// basic-block boundaries — clearing the constants map in
+/// `constant_fold_and_propagate` and the forwarding map in
+/// `load_store_forwarding`.  Removing them lets those passes propagate values
+/// across iteration boundaries, enabling full constant folding of the loop.
+fn remove_dead_labels(func: &mut IrFunction) -> bool {
+    let mut referenced: HashSet<u32> = HashSet::new();
+    for instr in &func.body {
+        match &instr.op {
+            IrOp::Jump { target } => { referenced.insert(target.0); }
+            IrOp::JumpIfTrue { target, .. } | IrOp::JumpIfFalse { target, .. } => {
+                referenced.insert(target.0);
+            }
+            _ => {}
+        }
+    }
+    let old_len = func.body.len();
+    func.body.retain(|instr| {
+        if let IrOp::Label { label } = &instr.op {
+            referenced.contains(&label.0)
+        } else {
+            true
+        }
+    });
+    func.body.len() != old_len
+}
+
+// ---------------------------------------------------------------------------
+// Redundant store elimination
+// ---------------------------------------------------------------------------
+
+/// Remove stores to global/local slots that are overwritten before being read.
+///
+/// Scans forward.  When a second `StoreGlobal(L)` is seen while `L` still has
+/// a pending (unread) store, the pending store is removed.  Basic-block
+/// boundaries (labels, jumps, calls, pointer operations) conservatively flush
+/// the pending-store table to avoid incorrect removal across control flow.
+///
+/// A second step removes all stores to `_l_`-prefixed labels (function-local
+/// variables promoted to globals by the code-generator) when those labels have
+/// no `LoadGlobal` anywhere in the function body — these are dead IV slots
+/// left behind after full loop unrolling.
+fn redundant_store_eliminate(func: &mut IrFunction) -> bool {
+    // --- Step 1: remove overwritten-before-read stores ---
+    // Maps global label → index of pending (not-yet-consumed) StoreGlobal.
+    let mut pending_global: HashMap<String, usize> = HashMap::new();
+    // Maps local offset → index of pending StoreLocal.
+    let mut pending_local: HashMap<i32, usize> = HashMap::new();
+    // Indices of instructions to remove.
+    let mut dead: HashSet<usize> = HashSet::new();
+
+    for (idx, instr) in func.body.iter().enumerate() {
+        match &instr.op {
+            IrOp::StoreGlobal { addr_label, .. } => {
+                if let Some(prev_idx) = pending_global.insert(addr_label.clone(), idx) {
+                    dead.insert(prev_idx);
+                }
+            }
+            IrOp::LoadGlobal { addr_label, .. } => {
+                pending_global.remove(addr_label);
+            }
+            IrOp::StoreLocal { offset, .. } => {
+                if let Some(prev_idx) = pending_local.insert(*offset, idx) {
+                    dead.insert(prev_idx);
+                }
+            }
+            IrOp::LoadLocal { offset, .. } => {
+                pending_local.remove(offset);
+            }
+            // Control-flow boundaries: flush everything.
+            IrOp::Label { .. }
+            | IrOp::Jump { .. }
+            | IrOp::JumpIfTrue { .. }
+            | IrOp::JumpIfFalse { .. }
+            | IrOp::Return { .. } => {
+                pending_global.clear();
+                pending_local.clear();
+            }
+            // Calls and pointer stores may alias any global.
+            IrOp::Call { .. }
+            | IrOp::StorePtr { .. }
+            | IrOp::LoadPtr { .. } => {
+                pending_global.clear();
+                pending_local.clear();
+            }
+            _ => {}
+        }
+    }
+
+    // --- Step 2: remove stores to _l_-prefixed locals that are never loaded ---
+    //
+    // After full loop unrolling + constant folding, the loop IV (e.g. _l_main_i)
+    // may have all its LoadGlobal instructions replaced by constants, leaving only
+    // orphaned StoreGlobal instructions.  Only safe to remove stores for the
+    // *current function's own* locals (prefix `_l_{name}_`) — other `_l_`-prefixed
+    // slots (e.g. `_l_callee_arg`) are argument-passing slots written here and
+    // read by the callee, so they must NOT be removed.
+    let own_local_prefix = format!("_l_{}_", func.name);
+    let loaded_globals: HashSet<String> = func.body.iter()
+        .filter_map(|i| {
+            if let IrOp::LoadGlobal { addr_label, .. } = &i.op { Some(addr_label.clone()) }
+            else { None }
+        })
+        .collect();
+
+    for (idx, instr) in func.body.iter().enumerate() {
+        if let IrOp::StoreGlobal { addr_label, .. } = &instr.op {
+            if addr_label.starts_with(&own_local_prefix) && !loaded_globals.contains(addr_label) {
+                dead.insert(idx);
+            }
+        }
+    }
+
+    if dead.is_empty() {
+        return false;
+    }
+    let old_len = func.body.len();
+    let mut i = 0;
+    func.body.retain(|_| {
+        let keep = !dead.contains(&i);
+        i += 1;
+        keep
+    });
+    func.body.len() != old_len
+}
+
+// ---------------------------------------------------------------------------
 // Dead-code elimination
 // ---------------------------------------------------------------------------
 
@@ -1733,6 +1870,33 @@ fn dead_branch_eliminate(func: &mut IrFunction) -> bool {
     }
     func.body = final_body;
     changed
+}
+
+/// Helper for loop_unrolling: find the Add/Sub in `body[start..end]` that defines
+/// `target_id`, returning `(stride, lhs_vreg_id)` if the rhs is a known constant.
+fn find_add_stride(
+    body: &[IrInstr],
+    start: usize,
+    end: usize,
+    target_id: u32,
+    constants: &HashMap<u32, i64>,
+) -> Option<(i64, u32)> {
+    let add_pos = body[start..end]
+        .iter()
+        .rposition(|instr| match &instr.op {
+            IrOp::Add { dst, .. } | IrOp::Sub { dst, .. } => dst.id == target_id,
+            _ => false,
+        })?;
+    let add_idx = start + add_pos;
+    match &body[add_idx].op {
+        IrOp::Add { rhs, lhs, .. } => {
+            Some((constants.get(&rhs.id).copied()?, lhs.id))
+        }
+        IrOp::Sub { rhs, lhs, .. } => {
+            Some((-constants.get(&rhs.id).copied()?, lhs.id))
+        }
+        _ => None,
+    }
 }
 
 fn jump_threading(func: &mut IrFunction) -> bool {
@@ -2646,84 +2810,183 @@ fn loop_unrolling(func: &mut IrFunction) -> bool {
             continue; // Too small to be a real loop.
         }
 
-        // Expect the first instruction after the header label to be a
-        // comparison, and the next to be a JumpIfFalse (exit).
-        let cmp_idx = lp.header_idx + 1;
-        let exit_idx = lp.header_idx + 2;
-        if exit_idx >= lp.back_edge_idx {
-            continue;
-        }
+        // --- Find the exit JumpIfFalse by scanning from header+1 ---
+        // The header block may contain LoadLocal/LoadImm before the comparison,
+        // so we cannot assume a fixed offset.
+        let exit_idx = match func.body[lp.header_idx + 1..lp.back_edge_idx]
+            .iter()
+            .position(|i| matches!(&i.op, IrOp::JumpIfFalse { .. }))
+        {
+            Some(rel) => lp.header_idx + 1 + rel,
+            None => continue,
+        };
 
-        // Parse the comparison.
-        let (cmp_dst_id, iv_id, limit_val, is_lt, is_signed) =
-            match &func.body[cmp_idx].op {
-                IrOp::Lt { dst, lhs, rhs, width: _, signed } => {
-                    if let Some(&lim) = constants.get(&rhs.id) {
-                        (dst.id, lhs.id, lim, true, *signed)
-                    } else {
-                        continue;
-                    }
-                }
-                IrOp::Le { dst, lhs, rhs, width: _, signed } => {
-                    // `iv <= limit` is equivalent to `iv < limit + 1`
-                    if let Some(&lim) = constants.get(&rhs.id) {
-                        (dst.id, lhs.id, lim + 1, true, *signed)
-                    } else {
-                        continue;
-                    }
-                }
-                IrOp::Gt { dst, lhs, rhs, width: _, signed } => {
-                    // `iv > limit` ⇒ iterate while > limit, i.e. count down
-                    if let Some(&lim) = constants.get(&rhs.id) {
-                        (dst.id, lhs.id, lim, false, *signed)
-                    } else {
-                        continue;
-                    }
-                }
-                IrOp::Ge { dst, lhs, rhs, width: _, signed } => {
-                    if let Some(&lim) = constants.get(&rhs.id) {
-                        (dst.id, lhs.id, lim - 1, false, *signed)
-                    } else {
-                        continue;
-                    }
-                }
-                _ => continue,
-            };
-
-        // Verify the JumpIfFalse uses this comparison result.
-        let exit_label = match &func.body[exit_idx].op {
-            IrOp::JumpIfFalse { cond, target } if cond.id == cmp_dst_id => target.0,
+        let (cond_id, exit_label) = match &func.body[exit_idx].op {
+            IrOp::JumpIfFalse { cond, target } => (cond.id, target.0),
             _ => continue,
         };
 
-        // Find the IV increment: `iv = iv + stride` just before the back-edge.
-        let inc_idx = lp.back_edge_idx - 1;
-        let stride = match &func.body[inc_idx].op {
-            IrOp::Add { dst, lhs, rhs, .. } if dst.id == iv_id && lhs.id == iv_id => {
-                if let Some(&c) = constants.get(&rhs.id) { c } else { continue }
+        // --- Find the comparison that defines cond_id ---
+        // Search backward from exit_idx within the header block.
+        let cmp_idx = match func.body[lp.header_idx + 1..exit_idx]
+            .iter()
+            .rposition(|i| matches!(&i.op,
+                IrOp::Lt { .. } | IrOp::Le { .. } | IrOp::Gt { .. } | IrOp::Ge { .. }))
+        {
+            Some(rel) => lp.header_idx + 1 + rel,
+            None => continue,
+        };
+
+        // Parse the comparison; limit must be a known constant.
+        let (iv_vreg_id, limit_val, is_lt, is_signed) = match &func.body[cmp_idx].op {
+            IrOp::Lt { dst, lhs, rhs, signed, .. } if dst.id == cond_id => {
+                if let Some(&lim) = constants.get(&rhs.id) { (lhs.id, lim, true, *signed) }
+                else { continue; }
             }
-            IrOp::Sub { dst, lhs, rhs, .. } if dst.id == iv_id && lhs.id == iv_id => {
-                if let Some(&c) = constants.get(&rhs.id) { -c } else { continue }
+            IrOp::Le { dst, lhs, rhs, signed, .. } if dst.id == cond_id => {
+                if let Some(&lim) = constants.get(&rhs.id) { (lhs.id, lim + 1, true, *signed) }
+                else { continue; }
+            }
+            IrOp::Gt { dst, lhs, rhs, signed, .. } if dst.id == cond_id => {
+                if let Some(&lim) = constants.get(&rhs.id) { (lhs.id, lim, false, *signed) }
+                else { continue; }
+            }
+            IrOp::Ge { dst, lhs, rhs, signed, .. } if dst.id == cond_id => {
+                if let Some(&lim) = constants.get(&rhs.id) { (lhs.id, lim - 1, false, *signed) }
+                else { continue; }
             }
             _ => continue,
+        };
+
+        // --- Determine IV initial value ---
+        // Case A: iv_vreg_id is a LoadImm constant (SSA-style IV).
+        // Case B: iv_vreg_id is a LoadLocal result (stack-local IV).
+        // Case C: iv_vreg_id is a LoadGlobal result (local promoted to global).
+
+        enum IvKind { Ssa, Local(i32), Global(String) }
+
+        let (init_val, iv_kind): (i64, IvKind) =
+            if let Some(&v) = constants.get(&iv_vreg_id) {
+                // SSA case: verify the LoadImm is before the loop header.
+                let defined_before = func.body[..lp.header_idx]
+                    .iter()
+                    .any(|instr| matches!(&instr.op, IrOp::LoadImm { dst, .. } if dst.id == iv_vreg_id));
+                if !defined_before { continue; }
+                (v, IvKind::Ssa)
+            } else {
+                // Memory-resident case: iv_vreg_id must come from a load in the
+                // header block (between header label and comparison).
+                let source = func.body[lp.header_idx + 1..cmp_idx]
+                    .iter()
+                    .rev()
+                    .find_map(|instr| match &instr.op {
+                        IrOp::LoadLocal { dst, offset } if dst.id == iv_vreg_id =>
+                            Some(IvKind::Local(*offset)),
+                        IrOp::LoadGlobal { dst, addr_label } if dst.id == iv_vreg_id =>
+                            Some(IvKind::Global(addr_label.clone())),
+                        _ => None,
+                    });
+                match source {
+                    None => continue,
+                    Some(IvKind::Local(offset)) => {
+                        let init = func.body[..lp.header_idx]
+                            .iter().rev()
+                            .find_map(|instr| {
+                                if let IrOp::StoreLocal { offset: o, src } = &instr.op {
+                                    if *o == offset { return constants.get(&src.id).copied(); }
+                                }
+                                None
+                            });
+                        match init { Some(v) => (v, IvKind::Local(offset)), None => continue }
+                    }
+                    Some(IvKind::Global(ref label)) => {
+                        let label = label.clone();
+                        let init = func.body[..lp.header_idx]
+                            .iter().rev()
+                            .find_map(|instr| {
+                                if let IrOp::StoreGlobal { addr_label, src } = &instr.op {
+                                    if addr_label == &label { return constants.get(&src.id).copied(); }
+                                }
+                                None
+                            });
+                        match init { Some(v) => (v, IvKind::Global(label)), None => continue }
+                    }
+                    Some(IvKind::Ssa) => unreachable!(),
+                }
+            };
+
+        // --- Find the IV increment before the back edge ---
+        // Case A (SSA IV): `Add/Sub { dst=iv_id, lhs=iv_id }` at back_edge_idx - 1.
+        // Case B/C (memory IV): scan backward for the store back to the IV slot, trace
+        //   it through the Add/Sub to find stride and increment range start.
+        let (stride, inc_start_idx): (i64, usize) = match &iv_kind {
+            IvKind::Ssa => {
+                let inc_idx = lp.back_edge_idx - 1;
+                let s = match &func.body[inc_idx].op {
+                    IrOp::Add { dst, lhs, rhs, .. } if dst.id == iv_vreg_id && lhs.id == iv_vreg_id => {
+                        if let Some(&c) = constants.get(&rhs.id) { c } else { continue }
+                    }
+                    IrOp::Sub { dst, lhs, rhs, .. } if dst.id == iv_vreg_id && lhs.id == iv_vreg_id => {
+                        if let Some(&c) = constants.get(&rhs.id) { -c } else { continue }
+                    }
+                    _ => continue,
+                };
+                (s, inc_idx)
+            }
+            IvKind::Local(local_offset) => {
+                let local_offset = *local_offset;
+                let store_pos = func.body[exit_idx + 1..lp.back_edge_idx]
+                    .iter()
+                    .rposition(|instr| {
+                        matches!(&instr.op, IrOp::StoreLocal { offset, .. } if *offset == local_offset)
+                    });
+                let store_idx = match store_pos {
+                    Some(rel) => exit_idx + 1 + rel, None => continue,
+                };
+                let v_inc_id = match &func.body[store_idx].op {
+                    IrOp::StoreLocal { src, .. } => src.id, _ => continue,
+                };
+                let (stride_val, lhs_id) = match find_add_stride(&func.body, exit_idx + 1, store_idx, v_inc_id, &constants) {
+                    Some(v) => v, None => continue,
+                };
+                let load_pos = func.body[exit_idx + 1..store_idx + 1]
+                    .iter()
+                    .rposition(|instr| {
+                        matches!(&instr.op, IrOp::LoadLocal { dst, offset }
+                            if dst.id == lhs_id && *offset == local_offset)
+                    });
+                let inc_start = load_pos.map(|rel| exit_idx + 1 + rel).unwrap_or(store_idx);
+                (stride_val, inc_start)
+            }
+            IvKind::Global(iv_label) => {
+                let iv_label = iv_label.clone();
+                let store_pos = func.body[exit_idx + 1..lp.back_edge_idx]
+                    .iter()
+                    .rposition(|instr| {
+                        matches!(&instr.op, IrOp::StoreGlobal { addr_label, .. } if addr_label == &iv_label)
+                    });
+                let store_idx = match store_pos {
+                    Some(rel) => exit_idx + 1 + rel, None => continue,
+                };
+                let v_inc_id = match &func.body[store_idx].op {
+                    IrOp::StoreGlobal { src, .. } => src.id, _ => continue,
+                };
+                let (stride_val, lhs_id) = match find_add_stride(&func.body, exit_idx + 1, store_idx, v_inc_id, &constants) {
+                    Some(v) => v, None => continue,
+                };
+                let load_pos = func.body[exit_idx + 1..store_idx + 1]
+                    .iter()
+                    .rposition(|instr| {
+                        matches!(&instr.op, IrOp::LoadGlobal { dst, addr_label }
+                            if dst.id == lhs_id && addr_label == &iv_label)
+                    });
+                let inc_start = load_pos.map(|rel| exit_idx + 1 + rel).unwrap_or(store_idx);
+                (stride_val, inc_start)
+            }
         };
 
         if stride == 0 {
             continue; // Infinite loop, don't touch.
-        }
-
-        // Find the initial value of the IV (must be a known constant defined
-        // before the loop).
-        let init_val = match constants.get(&iv_id) {
-            Some(&v) => v,
-            None => continue,
-        };
-        // Make sure the IV is initialised before the header, not inside.
-        let iv_init_before = func.body[..lp.header_idx]
-            .iter()
-            .any(|instr| matches!(&instr.op, IrOp::LoadImm { dst, .. } if dst.id == iv_id));
-        if !iv_init_before {
-            continue;
         }
 
         // Compute trip count.
@@ -2754,9 +3017,9 @@ fn loop_unrolling(func: &mut IrFunction) -> bool {
             continue;
         }
 
-        // Check body size (from after exit_idx to before inc_idx).
+        // Body: instructions from after the exit JumpIfFalse to before the increment.
         let body_start = exit_idx + 1;
-        let body_end = inc_idx; // exclusive
+        let body_end = inc_start_idx; // exclusive
         if body_end <= body_start {
             continue;
         }
@@ -2785,8 +3048,25 @@ fn loop_unrolling(func: &mut IrFunction) -> bool {
             }
         }
 
-        // Collect the body instructions to replicate.
+        // Collect the body and increment instructions to replicate.
         let body_instrs: Vec<IrInstr> = func.body[body_start..body_end].to_vec();
+        // Increment range: from inc_start_idx to back_edge (exclusive).
+        let inc_instrs: Vec<IrInstr> = func.body[inc_start_idx..lp.back_edge_idx].to_vec();
+
+        // Compute vregs that are defined WITHIN the loop region (body + inc).
+        // Vregs defined outside (e.g. the stride constant from a pre-loop LoadImm,
+        // or the limit value) are "external" and must keep their original IDs across
+        // all iterations so constant folding can still resolve them.
+        let internally_defined: HashSet<u32> = body_instrs.iter()
+            .chain(inc_instrs.iter())
+            .filter_map(|i| get_any_dst(&i.op).map(|v| v.id))
+            .collect();
+
+        let external_live_vregs: HashSet<u32> = body_instrs.iter()
+            .chain(inc_instrs.iter())
+            .flat_map(|i| collect_src_vregs(&i.op))
+            .filter(|id| !internally_defined.contains(id))
+            .collect();
 
         let mut new_body: Vec<IrInstr> = Vec::with_capacity(func.body.len());
 
@@ -2798,20 +3078,29 @@ fn loop_unrolling(func: &mut IrFunction) -> bool {
         // Emit the unrolled copies.
         for iter_no in 0..trip_count {
             if iter_no == 0 {
-                // First iteration uses the original vregs.
-                for instr in &body_instrs {
+                // First iteration uses the original instructions unchanged.
+                for instr in body_instrs.iter().chain(inc_instrs.iter()) {
                     new_body.push(instr.clone());
                 }
             } else {
-                // Subsequent iterations get remapped vregs/labels.
+                // Subsequent iterations get fresh vregs/labels for internally-defined
+                // vregs to avoid SSA definition conflicts.  External vregs (stride,
+                // limit, etc.) keep their original IDs so constant folding sees them.
                 let mut vreg_map: HashMap<u32, u32> = HashMap::new();
                 let mut label_map: HashMap<u32, u32> = HashMap::new();
 
-                // Map the IV to itself (it is threaded across iterations
-                // via the emitted increment).
-                vreg_map.insert(iv_id, iv_id);
+                for &vid in &external_live_vregs {
+                    vreg_map.insert(vid, vid);
+                }
 
-                for instr in &body_instrs {
+                // For SSA-style IV, the IV vreg itself threads values across iterations.
+                if matches!(iv_kind, IvKind::Ssa) {
+                    vreg_map.insert(iv_vreg_id, iv_vreg_id);
+                }
+
+                // Body and increment share the same vreg_map within one iteration
+                // so any vreg defined in the body is available to the increment.
+                for instr in body_instrs.iter().chain(inc_instrs.iter()) {
                     let new_op = remap_op(
                         &instr.op,
                         &mut vreg_map,
@@ -2822,10 +3111,6 @@ fn loop_unrolling(func: &mut IrFunction) -> bool {
                     new_body.push(IrInstr { op: new_op, line: instr.line });
                 }
             }
-
-            // Emit the IV increment (use original vreg — it accumulates).
-            let inc_instr = &func.body[inc_idx];
-            new_body.push(inc_instr.clone());
         }
 
         // Emit the exit label and everything after it.
@@ -3276,6 +3561,10 @@ mod tests {
 
     #[test]
     fn cse_cleared_at_label() {
+        // A label that IS jumped-to must clear the CSE table, because the label
+        // can be reached from multiple predecessors with different values.
+        // Dead (unreferenced) labels are removed by remove_dead_labels before CSE
+        // runs, so this test uses a live label with a preceding Jump.
         let body = vec![
             IrInstr::bare(IrOp::LoadGlobal {
                 dst: VReg::new(0, Width::W16),
@@ -3291,8 +3580,10 @@ mod tests {
                 rhs: VReg::new(1, Width::W16),
                 width: Width::W16,
             }),
+            // Unconditional jump makes Label(0) a live (referenced) label.
+            IrInstr::bare(IrOp::Jump { target: Label::new(0) }),
             IrInstr::bare(IrOp::Label { label: Label::new(0) }),
-            // Same computation after a label — should NOT be CSE'd
+            // Same computation after a live label — should NOT be CSE'd
             IrInstr::bare(IrOp::Add {
                 dst: VReg::new(3, Width::W16),
                 lhs: VReg::new(0, Width::W16),
@@ -3310,7 +3601,7 @@ mod tests {
             IrInstr::bare(IrOp::ret(None)),
         ];
         let result = opt_body(body);
-        // After a label, CSE is cleared, so the second Add should remain
+        // After a live label, CSE is cleared, so the second Add should remain.
         let add_count = result.iter().filter(|i| matches!(&i.op, IrOp::Add { .. })).count();
         assert_eq!(add_count, 2);
     }
@@ -3670,14 +3961,15 @@ mod tests {
             "Fully unrolled loop should not have a back-edge jump"
         );
 
-        // Should have 4 StoreGlobal instructions (one per unrolled iteration).
+        // After unrolling + redundant-store elimination only the last store to
+        // _g_x remains (the first 3 are overwritten before being read).
         let store_count = result
             .iter()
             .filter(|i| matches!(&i.op, IrOp::StoreGlobal { addr_label, .. } if addr_label == "_g_x"))
             .count();
         assert_eq!(
-            store_count, 4,
-            "Expected 4 unrolled stores, got {}", store_count
+            store_count, 1,
+            "Expected 1 remaining store (last value), got {}", store_count
         );
     }
 

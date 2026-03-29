@@ -385,8 +385,11 @@ mod tests {
 
     #[test]
     fn pipeline_function_call() {
-        // Use a function large enough to not be inlined.
+        // Use a function large enough to not be inlined.  The return value is
+        // stored to a true global (`arg1`) so the call is never tail-called away
+        // and always appears as a CALL or specialised CALL in the output.
         let src = r#"
+            int arg1;
             int compute(int a, int b) {
                 int x;
                 int y;
@@ -401,7 +404,7 @@ mod tests {
                 }
                 return z;
             }
-            void main(void) { int r; r = compute(3, 4); }
+            void main(void) { arg1 = compute(arg1, 4); }
         "#;
         let out = compile_source(src, "test.c", &[]).expect("compilation failed");
         assert!(has_line(&out, "compute:"), "must have compute function");

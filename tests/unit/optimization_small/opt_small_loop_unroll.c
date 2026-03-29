@@ -9,6 +9,7 @@ int sum;
 
 void main(void) {
     sum = 0;
+#pragma unroll
     for (int i = 0; i < 3; i++) {
         sum += i;
     }

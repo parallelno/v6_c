@@ -1659,6 +1659,25 @@ impl CodeGenerator {
             })
             .collect();
 
+        // Build the set of labels actually referenced in the code section so far.
+        // _l_-prefixed locals that are never loaded or stored (because all their
+        // uses were constant-folded away) can be omitted from the data section.
+        let referenced_in_code: HashSet<String> = self.output.iter()
+            .flat_map(|line| {
+                let mut refs = Vec::new();
+                let mut rest = line.as_str();
+                while let Some(pos) = rest.find('_') {
+                    let tail = &rest[pos..];
+                    let end = tail
+                        .find(|c: char| c.is_whitespace() || c == ',' || c == '+' || c == ';')
+                        .unwrap_or(tail.len());
+                    refs.push(tail[..end].to_string());
+                    rest = &tail[1..];
+                }
+                refs
+            })
+            .collect();
+
         // Global variables
         for gvar in &program.globals {
             // IR symbols may already be canonical labels (e.g. `_g_x`, `_l_f_a`).
@@ -1668,6 +1687,11 @@ impl CodeGenerator {
                 format!("_g_{}", gvar.name)
             };
             if self.analysis.local_allocs.contains_key(&label) {
+                continue;
+            }
+            // Skip _l_-prefixed function-local slots that are never referenced
+            // in the generated code (e.g. loop IVs fully folded to constants).
+            if label.starts_with("_l_") && !referenced_in_code.contains(&label) {
                 continue;
             }
             if !emitted_labels.insert(label.clone()) {

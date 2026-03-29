@@ -5,12 +5,10 @@
 // Example:
 //   z = (a + b) * (a + b); // compute a+b once
 
-int a;
-int b;
 int z;
 
 void main(void) {
-    a = 3;
-    b = 4;
+    int a = 3;
+    int b = 4;
     z = (a + b) * (a + b);
 }
