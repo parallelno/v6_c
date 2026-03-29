@@ -163,6 +163,9 @@ fn apply_rules(lines: &mut Vec<Line>) -> bool {
     // --- Rule 40: Remove dead spill stores (__spill_ labels never read) --
     changed |= rule_elim_dead_spills(lines);
 
+    // --- Rule 41: Remove unused _l_ / __spill_ .STORAGE declarations ----
+    changed |= rule_elim_unused_storage(lines);
+
     // --- Rule 32: Jump threading (resolve JMP chains) --------------------
     changed |= rule_jump_threading(lines);
 
@@ -932,26 +935,28 @@ fn clobbers_hl_value(opcode: &str, ops: &str) -> bool {
 /// We only touch labels that start with `__spill_` to avoid removing
 /// legitimate user-visible globals.
 fn rule_elim_dead_spills(lines: &mut Vec<Line>) -> bool {
-    // Collect every __spill_ label that is read.
-    let mut live_spills: std::collections::HashSet<String> =
+    // Collect every compiler-local label that is READ (load operations).
+    // A label is compiler-local if it starts with `__spill_` (a register-spill
+    // slot) or `_l_` (a function-local variable).
+    let mut live: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     for line in lines.iter() {
         if let Line::Instruction { opcode, operands } = line {
             if matches!(opcode.as_str(), "LHLD" | "LDA" | "LDAX") {
                 let label = operands.trim();
-                if label.starts_with("__spill_") {
-                    live_spills.insert(label.to_string());
+                if is_compiler_local_label(label) {
+                    live.insert(label.to_string());
                 }
             }
         }
     }
-    // Remove write-only spill stores.
+    // Remove write-only stores to compiler-local labels.
     let before = lines.len();
     lines.retain(|line| {
         if let Line::Instruction { opcode, operands } = line {
             if matches!(opcode.as_str(), "SHLD" | "STA") {
                 let label = operands.trim();
-                if label.starts_with("__spill_") && !live_spills.contains(label) {
+                if is_compiler_local_label(label) && !live.contains(label) {
                     return false;
                 }
             }
@@ -959,6 +964,83 @@ fn rule_elim_dead_spills(lines: &mut Vec<Line>) -> bool {
         true
     });
     lines.len() != before
+}
+
+/// Rule 41 – Remove unused compiler-local `.STORAGE` declarations.
+///
+/// After Rule 40 removes all dead SHLD/STA stores, and Rule 38 removes
+/// redundant LHLD reloads, a compiler-local label (`_l_*` or `__spill_*`)
+/// may be completely unreferenced in any instruction operand.  In that case
+/// the label declaration and its `.STORAGE N` are wasted bytes and can be
+/// removed.
+///
+/// A label is considered referenced if it (or a `label+offset` variant)
+/// appears in any instruction operand anywhere in the file.
+fn rule_elim_unused_storage(lines: &mut Vec<Line>) -> bool {
+    // Collect all label strings that appear in instruction operands.
+    let mut referenced: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for line in lines.iter() {
+        if let Line::Instruction { operands, .. } = line {
+            let trimmed = operands.trim();
+            if !trimmed.is_empty() {
+                referenced.insert(trimmed.to_string());
+            }
+        }
+    }
+
+    // Helper: returns true if `name` is referenced as itself or as `name+N`.
+    let is_referenced = |name: &str| {
+        referenced.contains(name)
+            || referenced
+                .iter()
+                .any(|r| r.starts_with(&format!("{}+", name)))
+    };
+
+    // Walk lines and drop [Label + .STORAGE] pairs for unreferenced
+    // compiler-local labels.
+    let mut to_remove: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if let Line::Label(name) = &lines[i] {
+            if is_compiler_local_label(name) && !is_referenced(name) {
+                // Look ahead: if the next non-empty/non-comment line is .STORAGE, kill both.
+                let mut j = i + 1;
+                while j < lines.len() {
+                    match &lines[j] {
+                        Line::Comment(_) | Line::Empty => { j += 1; }
+                        Line::Instruction { opcode, .. }
+                            if opcode == ".STORAGE" || opcode == "DS" =>
+                        {
+                            to_remove.insert(i);
+                            to_remove.insert(j);
+                            break;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+
+    if to_remove.is_empty() {
+        return false;
+    }
+    let mut idx = 0;
+    lines.retain(|_| {
+        let keep = !to_remove.contains(&idx);
+        idx += 1;
+        keep
+    });
+    true
+}
+
+/// Returns `true` if the label is a compiler-generated local (safe to
+/// eliminate when unused): register-spill slots or function-local variables.
+fn is_compiler_local_label(name: &str) -> bool {
+    name.starts_with("__spill_") || name.starts_with("_l_")
 }
 
 fn rule_remove_unreferenced_labels(lines: &mut Vec<Line>) -> bool {
