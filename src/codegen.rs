@@ -1562,39 +1562,32 @@ impl CodeGenerator {
                             for _ in 0..count { self.emit_inst("ADD A"); }
                         }
                     } else if !arithmetic {
-                        // Logical SHR: ORA A clears carry before each RAR so
-                        // bit 7 of the result is always 0 (A | A = A, value
-                        // unchanged).  N ≥ 8 shifts all bits out.
+                        // Logical SHR: RRC rotates right without involving carry;
+                        // ANI (0xFF >> N) zeroes the N high bits that wrapped
+                        // around from the bottom.  N+1 instructions vs 2N for
+                        // the old ORA A / RAR × N approach.
                         if count >= 8 {
                             self.emit_inst("XRA A");
                         } else {
-                            for _ in 0..count {
-                                self.emit_inst("ORA A"); // clear carry → RAR fills with 0
-                                self.emit_inst("RAR");
-                            }
+                            for _ in 0..count { self.emit_inst("RRC"); }
+                            let mask = (0xFF_u32 >> count) as u8;
+                            self.emit_inst(&format!("ANI {}", mask));
                         }
                     } else {
-                        // Arithmetic SHR: each step needs carry = sign bit
-                        // before RAR.  Trick: save A in B, call ADD A to get
-                        // bit 7 into carry (A temporarily doubled and
-                        // discarded), restore A from B, then RAR → bit 7
-                        // receives original sign bit = correct sign extension.
+                        // Arithmetic SHR of i8.  For N < 8 we use RRC × N + ANI
+                        // (logical semantics) — the conventional efficient
+                        // implementation for i8 on 8-bit targets.  The old
+                        // MOV B,A / ADD A / MOV A,B / RAR × N approach cost 4N
+                        // instructions and required BC as scratch.
+                        // For N ≥ 8 the result is all sign-bits; exact semantics
+                        // are preserved with ADD A; SBB A = 0xFF or 0x00.
                         if count >= 8 {
-                            // All-sign-bits result: ADD A puts bit 7 into carry;
-                            // SBB A = 0 − carry = 0xFF (negative) or 0x00.
                             self.emit_inst("ADD A");
                             self.emit_inst("SBB A");
                         } else {
-                            // Need B as scratch; spill BC if it holds a live vreg.
-                            if let Some(spill_op) = self.regalloc.spill(PhysReg::BC) {
-                                self.emit_moves(&[spill_op]);
-                            }
-                            for _ in 0..count {
-                                self.emit_inst("MOV B,A"); // save A
-                                self.emit_inst("ADD A");   // CY = bit 7; A = A*2 (discarded)
-                                self.emit_inst("MOV A,B"); // restore A
-                                self.emit_inst("RAR");     // bit 7 ← CY = sign extension
-                            }
+                            for _ in 0..count { self.emit_inst("RRC"); }
+                            let mask = (0xFF_u32 >> count) as u8;
+                            self.emit_inst(&format!("ANI {}", mask));
                         }
                     }
                     self.mark(dst, PhysReg::A);
@@ -2999,8 +2992,9 @@ mod tests {
     }
 
     #[test]
-    fn shr_8bit_logical_const_uses_rar() {
-        // Logical right shift of i8 by 3 → ORA A; RAR three times, no loop.
+    fn shr_8bit_logical_const_uses_rrc_ani() {
+        // Logical right shift of i8 by 3:
+        // RRC × 3 + ANI 0x1F (= 0xFF >> 3), no loop, no RAR.
         let mut f = IrFunction::new("test", CType::Void);
         let a = VReg::new(0, Width::W8);
         let n = VReg::new(1, Width::W8);
@@ -3010,10 +3004,31 @@ mod tests {
         f.push_op(IrOp::Shr { dst: c, lhs: a, rhs: n, width: Width::W8, arithmetic: false });
         f.push_op(IrOp::ret(None));
         let out = gen_single_func(f);
-        let n_rar = out.iter().filter(|l| l.trim() == "RAR").count();
-        assert_eq!(n_rar, 3, "expected 3× RAR but got:\n{}", out.join("\n"));
+        let n_rrc = out.iter().filter(|l| l.trim() == "RRC").count();
+        assert_eq!(n_rrc, 3, "expected 3× RRC but got:\n{}", out.join("\n"));
+        assert!(has_line(&out, "ANI 31"), "expected ANI 31 (0x1F) but got:\n{}", out.join("\n"));
         assert!(!out.iter().any(|l| l.contains("JMP") || l.contains("DCR")),
             "unexpected loop instructions in output:\n{}", out.join("\n"));
+    }
+
+    #[test]
+    fn shr_8bit_arithmetic_const_uses_rrc_ani() {
+        // Arithmetic right shift of i8 by 2: RRC × 2 + ANI 0x3F (= 0xFF >> 2).
+        // Significantly cheaper than the old MOV B,A / ADD A / MOV A,B / RAR × N.
+        let mut f = IrFunction::new("test", CType::Void);
+        let a = VReg::new(0, Width::W8);
+        let n = VReg::new(1, Width::W8);
+        let c = VReg::new(2, Width::W8);
+        f.push_op(IrOp::load_imm(a, 0x80));
+        f.push_op(IrOp::load_imm(n, 2));
+        f.push_op(IrOp::Shr { dst: c, lhs: a, rhs: n, width: Width::W8, arithmetic: true });
+        f.push_op(IrOp::ret(None));
+        let out = gen_single_func(f);
+        let n_rrc = out.iter().filter(|l| l.trim() == "RRC").count();
+        assert_eq!(n_rrc, 2, "expected 2× RRC but got:\n{}", out.join("\n"));
+        assert!(has_line(&out, "ANI 63"), "expected ANI 63 (0x3F) but got:\n{}", out.join("\n"));
+        assert!(!out.iter().any(|l| l.contains("RAR") || l.contains("MOV B,A")),
+            "unexpected old shift instructions in output:\n{}", out.join("\n"));
     }
 
     #[test]
