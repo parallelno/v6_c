@@ -797,25 +797,34 @@ fn rule_jump_threading(lines: &mut Vec<Line>) -> bool {
 ///
 /// Internal labels (starting with `L`, `__cg_`, or `__cmp_done_`) that are
 /// never referenced in any operand can be safely removed.
-/// Rule 37 – Remove redundant `LXI H,N` when HL already holds N.
+/// Rules 37 & 38 – Remove redundant HL loads.
 ///
-/// After an `LXI H,N` or `SHLD addr` and other HL-preserving instructions,
-/// a second `LXI H,N` with the same immediate is dead if HL already holds N.
-/// This commonly arises when load-store forwarding converts a LoadGlobal to a
-/// Copy, and constant-folding recreates a fresh `LoadImm` for the same value.
+/// **Rule 37** – `LXI H,N` when HL already holds N:
+///   A second `LXI H,N` is dead if nothing has changed HL since the last
+///   `LXI H,N` or `SHLD addr` (which leaves HL intact).
 ///
-/// HL-clobbering instructions (clear the tracked value):
-///   LHLD, MOV H/L, MVI H/L, DAD, INX H, DCX H, XCHG, POP H,
-///   any CALL/return opcode, and labels (unknown HL at join points).
+/// **Rule 38** – `LHLD addr` when HL already holds the content of `addr`:
+///   After `SHLD addr` (and any number of HL-preserving instructions),
+///   a subsequent `LHLD addr` is dead because HL still holds the same value
+///   that was stored there.  This commonly occurs when regalloc spills a
+///   local variable via `SHLD` and then reloads it with `LHLD` even though
+///   HL was never overwritten in between.
+///
+/// HL-clobbering instructions (clear all HL state):
+///   MOV H/L, MVI H/L, DAD, INX H, DCX H, XCHG, POP H,
+///   any CALL/return opcode, and labels (unknown HL state at join points).
+///   LHLD is handled explicitly below (it sets a new `hl_from_addr`).
 fn rule_elim_redundant_lxi_h(lines: &mut Vec<Line>) -> bool {
     let mut changed = false;
-    let mut hl_known: Option<String> = None;
+    let mut hl_numeric: Option<String> = None;   // HL = this immediate (from LXI H,N)
+    let mut hl_from_addr: Option<String> = None; // HL = content-of(this label) (from SHLD/LHLD)
     let mut i = 0;
     while i < lines.len() {
         match &lines[i] {
             Line::Label(_) => {
                 // Control-flow join point — HL state is unknown.
-                hl_known = None;
+                hl_numeric = None;
+                hl_from_addr = None;
             }
             Line::Instruction { opcode, operands } => {
                 let opcode = opcode.clone();
@@ -823,17 +832,38 @@ fn rule_elim_redundant_lxi_h(lines: &mut Vec<Line>) -> bool {
                 let ops = operands.trim();
                 if opcode == "LXI" && ops.starts_with("H,") {
                     let imm = ops["H,".len()..].trim();
-                    if hl_known.as_deref() == Some(imm) {
-                        // HL already holds this value — remove the redundant LXI.
+                    if hl_numeric.as_deref() == Some(imm) {
+                        // Rule 37: HL already holds this immediate — drop LXI.
                         lines.remove(i);
                         changed = true;
                         continue;
                     }
-                    hl_known = Some(imm.to_string());
+                    hl_numeric = Some(imm.to_string());
+                    hl_from_addr = None; // New numeric value, not yet stored anywhere.
+                } else if opcode == "SHLD" {
+                    // SHLD stores HL to memory but does NOT change HL.
+                    // Record that HL now mirrors the content of `ops`.
+                    hl_from_addr = Some(ops.to_string());
+                    // hl_numeric remains valid (HL value is unchanged).
+                } else if opcode == "LHLD" {
+                    if hl_from_addr.as_deref() == Some(ops) {
+                        // Rule 38: HL already holds the content of `ops` — drop LHLD.
+                        lines.remove(i);
+                        changed = true;
+                        continue;
+                    }
+                    // HL is now loaded from memory; numeric value unknown.
+                    hl_numeric = None;
+                    hl_from_addr = Some(ops.to_string());
+                } else if opcode == "STA" && hl_from_addr.as_deref() == Some(ops) {
+                    // A byte-level write to our tracked label may corrupt the
+                    // low byte of the stored 16-bit value — invalidate.
+                    hl_from_addr = None;
                 } else if clobbers_hl_value(&opcode, ops) {
-                    hl_known = None;
+                    hl_numeric = None;
+                    hl_from_addr = None;
                 }
-                // Instructions not matched above preserve HL — no change to hl_known.
+                // Other instructions do not affect HL — both trackers stay valid.
             }
             _ => {}
         }
@@ -848,8 +878,8 @@ fn rule_elim_redundant_lxi_h(lines: &mut Vec<Line>) -> bool {
 /// misoptimizations.
 fn clobbers_hl_value(opcode: &str, ops: &str) -> bool {
     match opcode {
-        // Explicit HL loads
-        "LHLD" => true,
+        // Note: LHLD is handled explicitly in rule_elim_redundant_lxi_h;
+        // it is NOT listed here to avoid double-clearing the hl_from_addr state.
         // Partial writes to H or L
         "MOV" | "MVI" => ops.starts_with("H,") || ops.starts_with("L,"),
         // Double-add writes result back into HL

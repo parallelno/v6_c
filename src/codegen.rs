@@ -667,15 +667,19 @@ impl CodeGenerator {
         match dst.width {
             Width::W8 => {
                 let v = (value & 0xFF) as u8;
-                self.emit_inst(&format!("MVI A,{}", v));
+                // Obtain any eviction ops BEFORE emitting the load so that
+                // the old A value is saved (SHLD/STA) prior to the overwrite.
                 let ops = self.regalloc.mark_immediate(dst, PhysReg::A, value);
                 self.emit_moves(&ops);
+                self.emit_inst(&format!("MVI A,{}", v));
             }
             Width::W16 => {
                 let v = (value & 0xFFFF) as u16;
-                self.emit_inst(&format!("LXI H,{}", v));
+                // Obtain any eviction ops BEFORE emitting the load so that
+                // the old HL value is saved (SHLD) prior to the overwrite.
                 let ops = self.regalloc.mark_immediate(dst, PhysReg::HL, value);
                 self.emit_moves(&ops);
+                self.emit_inst(&format!("LXI H,{}", v));
             }
             Width::W32 => {
                 let lo = (value & 0xFFFF) as u16;
