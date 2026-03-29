@@ -1091,19 +1091,34 @@ impl CodeGenerator {
             Width::W16 => {
                 if let Some(k) = self.known_imm(rhs).or_else(|| self.known_imm(lhs)) {
                     let var = if self.known_imm(rhs).is_some() { lhs } else { rhs };
+                    let const_op = if self.known_imm(rhs).is_some() { rhs } else { lhs };
                     match k {
                         0 => {
+                            // x * 0 == 0: neither operand is needed.
+                            self.regalloc.free(var);
+                            self.regalloc.free(const_op);
                             self.emit_inst("LXI H,0");
                             self.mark(dst, PhysReg::HL);
                             return;
                         }
                         1 => {
+                            self.regalloc.free(const_op);
                             self.ensure_hl(var);
+                            // Free var before mark so mark(dst,HL) doesn't evict it.
+                            if self.last_use.get(&var.id).copied() == Some(self.instr_index) {
+                                self.regalloc.free(var);
+                            }
                             self.mark(dst, PhysReg::HL);
                             return;
                         }
                         2 | 4 | 8 => {
+                            self.regalloc.free(const_op);
                             self.ensure_hl(var);
+                            // Free var before DAD H sequence so mark(dst,HL) doesn't
+                            // evict it with a spurious XCHG after the shifts.
+                            if self.last_use.get(&var.id).copied() == Some(self.instr_index) {
+                                self.regalloc.free(var);
+                            }
                             let shifts = match k {
                                 2 => 1,
                                 4 => 2,
@@ -1116,11 +1131,20 @@ impl CodeGenerator {
                             return;
                         }
                         3 => {
+                            self.regalloc.free(const_op);
                             self.ensure_hl(var);
+                            // MOV D,H; MOV E,L clobbers DE — invalidate it in the
+                            // allocator so any value previously tracked there is not
+                            // spuriously spilled or used.
+                            self.regalloc.clobber(PhysReg::DE);
                             self.emit_inst("MOV D,H");
                             self.emit_inst("MOV E,L");
                             self.emit_inst("DAD H");
                             self.emit_inst("DAD D");
+                            // Free var before mark for the same reason as above.
+                            if self.last_use.get(&var.id).copied() == Some(self.instr_index) {
+                                self.regalloc.free(var);
+                            }
                             self.mark(dst, PhysReg::HL);
                             return;
                         }
@@ -1331,12 +1355,20 @@ impl CodeGenerator {
                 if let Some(raw) = self.known_imm(rhs) {
                     let count = (raw & 0x1f) as u32;
                     if count == 0 {
+                        self.regalloc.free(rhs);
                         self.ensure_hl(lhs);
+                        if self.last_use.get(&lhs.id).copied() == Some(self.instr_index) {
+                            self.regalloc.free(lhs);
+                        }
                         self.mark(dst, PhysReg::HL);
                         return;
                     }
                     if !is_right && count <= 3 {
+                        self.regalloc.free(rhs);
                         self.ensure_hl(lhs);
+                        if self.last_use.get(&lhs.id).copied() == Some(self.instr_index) {
+                            self.regalloc.free(lhs);
+                        }
                         for _ in 0..count {
                             self.emit_inst("DAD H");
                         }
@@ -1344,7 +1376,11 @@ impl CodeGenerator {
                         return;
                     }
                     if is_right && !arithmetic && count == 1 {
+                        self.regalloc.free(rhs);
                         self.ensure_hl(lhs);
+                        if self.last_use.get(&lhs.id).copied() == Some(self.instr_index) {
+                            self.regalloc.free(lhs);
+                        }
                         self.emit_inst("MOV A,H");
                         self.emit_inst("ORA A");
                         self.emit_inst("RAR");
