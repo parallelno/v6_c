@@ -523,6 +523,34 @@ impl CodeGenerator {
         self.ensure(vreg, PhysReg::A);
     }
 
+    /// Prepare a W8 `rhs` operand for an 8080 ALU instruction.
+    ///
+    /// Must be called AFTER `ensure_a(lhs)` — this function never touches A.
+    ///
+    /// Returns `"M"` when `rhs` lives in a spill slot: HL is loaded with the
+    /// slot's address so the caller can emit e.g. `ADD M` instead of the
+    /// slower `LXI H,label / MOV C,M / ADD C` sequence.
+    /// Returns the low-byte register name (`"C"`, `"E"`, `"L"`) when `rhs` is
+    /// already in a physical register pair.
+    fn w8_alu_operand(&mut self, rhs: VReg) -> String {
+        match self.regalloc.get_location(rhs).cloned() {
+            Some(Location::Memory(label)) => {
+                // Spill HL if it holds a live vreg, then load the spill address.
+                if let Some(spill_op) = self.regalloc.spill(PhysReg::HL) {
+                    self.emit_moves(&[spill_op]);
+                }
+                self.emit_inst(&format!("LXI H,{}", label));
+                self.regalloc.free(rhs); // consumed from memory
+                "M".to_string()
+            }
+            Some(Location::Reg(r)) => low_byte_name(r).to_string(),
+            _ => {
+                self.ensure(rhs, PhysReg::BC);
+                "C".to_string()
+            }
+        }
+    }
+
     /// Mark `vreg` as living in `reg` after we've emitted a load ourselves.
     fn mark(&mut self, vreg: VReg, reg: PhysReg) {
         // A new value is about to occupy A — it no longer mirrors any store.
@@ -923,11 +951,10 @@ impl CodeGenerator {
                         self.emit_inst(&format!("ADD {}", reg_name));
                     }
                     _ => {
-                        self.ensure_a(lhs);
-                        // rhs must be reloaded; use B as temp
-                        self.ensure(rhs, PhysReg::BC);
-                        self.ensure_a(lhs);
-                        self.emit_inst("ADD C");
+                        // w8_alu_operand returns "M" (and points HL at the spill slot)
+                        // or a low-byte reg name.  A is untouched either way.
+                        let operand = self.w8_alu_operand(rhs);
+                        self.emit_inst(&format!("ADD {}", operand));
                     }
                 }
                 self.mark(dst, PhysReg::A);
@@ -1083,9 +1110,9 @@ impl CodeGenerator {
                     self.mark(dst, PhysReg::A);
                     return;
                 }
-                self.ensure(rhs, PhysReg::BC);
                 self.ensure_a(lhs);
-                self.emit_inst("SUB C");
+                let operand = self.w8_alu_operand(rhs);
+                self.emit_inst(&format!("SUB {}", operand));
                 self.mark(dst, PhysReg::A);
             }
             Width::W16 | Width::W32 => {
@@ -1388,9 +1415,9 @@ impl CodeGenerator {
     ) {
         match width {
             Width::W8 => {
-                self.ensure(rhs, PhysReg::BC);
                 self.ensure_a(lhs);
-                self.emit_inst(&format!("{} C", reg_op));
+                let operand = self.w8_alu_operand(rhs);
+                self.emit_inst(&format!("{} {}", reg_op, operand));
                 self.mark(dst, PhysReg::A);
             }
             Width::W16 | Width::W32 => {
@@ -1711,9 +1738,9 @@ impl CodeGenerator {
 
         match width {
             Width::W8 => {
-                self.ensure(rhs, PhysReg::BC);
                 self.ensure_a(lhs);
-                self.emit_inst("CMP C");
+                let operand = self.w8_alu_operand(rhs);
+                self.emit_inst(&format!("CMP {}", operand));
             }
             Width::W16 | Width::W32 => {
                 // Subtract: HL - DE, check flags
