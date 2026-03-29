@@ -548,12 +548,19 @@ fn load_store_forwarding(func: &mut IrFunction) -> bool {
 
     for instr in &func.body {
         match &instr.op {
+            // Unconditional control flow and join points: any path can reach
+            // what follows, so we conservatively clear the forwarding map.
             IrOp::Label { .. }
             | IrOp::Jump { .. }
-            | IrOp::JumpIfTrue { .. }
-            | IrOp::JumpIfFalse { .. }
             | IrOp::Return { .. } => {
                 mem_state.clear();
+                out.push(instr.clone());
+            }
+            // Conditional branches: the fall-through path still sees every
+            // store that preceded the branch, so the forwarding map remains
+            // valid.  The map will be cleared when the join-point Label is
+            // reached below.
+            IrOp::JumpIfTrue { .. } | IrOp::JumpIfFalse { .. } => {
                 out.push(instr.clone());
             }
             IrOp::StoreGlobal { addr_label, src } => {

@@ -388,21 +388,27 @@ mod tests {
         // Use a function large enough to not be inlined.  The return value is
         // stored to a true global (`arg1`) so the call is never tail-called away
         // and always appears as a CALL or specialised CALL in the output.
+        // Extra locals (w, v) keep the IR count above INLINE_THRESHOLD even
+        // after load-store forwarding eliminates redundant reloads.
         let src = r#"
             int arg1;
             int compute(int a, int b) {
                 int x;
                 int y;
                 int z;
+                int w;
+                int v;
                 x = a + b;
                 y = a - b;
                 z = x + y;
-                if (z > 0) {
-                    z = z + x;
+                w = x - y;
+                v = z + w;
+                if (v > 0) {
+                    v = v + x;
                 } else {
-                    z = z - y;
+                    v = v - y;
                 }
-                return z;
+                return v;
             }
             void main(void) { arg1 = compute(arg1, 4); }
         "#;
