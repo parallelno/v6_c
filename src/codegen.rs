@@ -692,6 +692,15 @@ impl CodeGenerator {
                 } else {
                     PhysReg::HL
                 };
+                // Small constants (|k| ≤3) will be consumed by the INX/DCX fast
+                // path in gen_add/gen_sub via known_imm() — no physical register
+                // is needed.  Store as a remat-only immediate; if the value is
+                // ever needed in a register (e.g. gen_add general path, or the
+                // immediate outlives the Add), ensure_de/ensure_hl emit LXI lazily.
+                if target != PhysReg::HL && value.abs() <= 3 {
+                    self.regalloc.mark_remat_imm_only(dst, value);
+                    return;
+                }
                 let ops = self.regalloc.mark_immediate(dst, target, value);
                 self.emit_moves(&ops);
                 let lxi = match target {

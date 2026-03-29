@@ -335,6 +335,17 @@ impl RegAllocator {
         ops
     }
 
+    /// Record `vreg` as a rematerializable immediate WITHOUT allocating a
+    /// physical register.  Use this when the value is small enough that the
+    /// INX/DCX fast path will consume it directly from `known_imm()` rather
+    /// than from a register, so no LXI instruction needs to be emitted eagerly.
+    /// `ensure_de`/`ensure_hl` will emit the load lazily if the register is
+    /// ever actually needed.
+    pub fn mark_remat_imm_only(&mut self, vreg: VReg, value: i64) {
+        self.vreg_map.insert(vreg.id, Location::RematImm(value));
+        self.remat_imm.insert(vreg.id, value);
+    }
+
     /// Return the tracked immediate value for a vreg when rematerialization
     /// is available.
     pub fn immediate_of(&self, vreg: VReg) -> Option<i64> {

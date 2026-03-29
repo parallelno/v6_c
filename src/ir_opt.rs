@@ -90,6 +90,7 @@ fn optimize_function(func: &mut IrFunction, profile: OptProfile) {
                 changed |= constant_fold_and_propagate(func);
                 changed |= dead_branch_eliminate(func);
                 changed |= load_store_forwarding(func);
+                changed |= copy_propagate(func);
                 changed |= redundant_store_eliminate(func);
                 changed |= remove_dead_labels(func);
                 changed |= strength_reduce(func);
@@ -103,6 +104,7 @@ fn optimize_function(func: &mut IrFunction, profile: OptProfile) {
                 changed |= constant_fold_and_propagate(func);
                 changed |= dead_branch_eliminate(func);
                 changed |= load_store_forwarding(func);
+                changed |= copy_propagate(func);
                 changed |= redundant_store_eliminate(func);
                 changed |= remove_dead_labels(func);
                 changed |= cse(func);
@@ -422,6 +424,115 @@ fn maybe_rewrite_local_label(label: &str, old_prefix: &str, new_prefix: &str) ->
 struct MemValue {
     version: u32,
     src: VReg,
+}
+
+/// Substitute source-vreg occurrences through `Copy` and width-preserving
+/// `Cast` definitions within a basic block.
+///
+/// When `Copy { dst: v2, src: v1 }` is seen, all subsequent uses of `v2`
+/// are rewritten to `v1`.  Combined with DCE this eliminates the copy
+/// instruction entirely, and prevents the codegen from allocating a
+/// separate physical register for what is logically the same value.
+///
+/// Width-preserving `Cast` instructions are treated the same way because
+/// on 8080 all pointer types are the same (16-bit) representation.
+fn copy_propagate(func: &mut IrFunction) -> bool {
+    let mut changed = false;
+    // Maps vreg-id → the canonical vreg it was aliased to within this block.
+    let mut subs: HashMap<u32, VReg> = HashMap::new();
+
+    for instr in &mut func.body {
+        // Block boundaries: aliases must not flow across control-flow edges.
+        match &instr.op {
+            IrOp::Label { .. }
+            | IrOp::Jump { .. }
+            | IrOp::JumpIfTrue { .. }
+            | IrOp::JumpIfFalse { .. } => {
+                subs.clear();
+            }
+            _ => {}
+        }
+
+        // Apply current substitutions to all SOURCE operands of this op.
+        if !subs.is_empty() {
+            subst_vreg_in_op(&mut instr.op, &subs, &mut changed);
+        }
+
+        // Record new alias facts (after applying existing subs so chains
+        // are flattened: v3→v2→v1 becomes v3→v1 directly).
+        match &instr.op {
+            IrOp::Copy { dst, src } => {
+                subs.insert(dst.id, *src);
+            }
+            IrOp::Cast { dst, src, .. } if dst.width == src.width => {
+                subs.insert(dst.id, *src);
+            }
+            _ => {}
+        }
+    }
+
+    changed
+}
+
+/// Apply `subs` (vreg-id → vreg alias) to every *source* vreg in `op`.
+fn subst_vreg_in_op(op: &mut IrOp, subs: &HashMap<u32, VReg>, changed: &mut bool) {
+    fn sub1(v: &mut VReg, subs: &HashMap<u32, VReg>, changed: &mut bool) {
+        if let Some(&s) = subs.get(&v.id) {
+            if s.id != v.id {
+                *v = s;
+                *changed = true;
+            }
+        }
+    }
+    match op {
+        IrOp::Copy { src, .. } | IrOp::Cast { src, .. } => sub1(src, subs, changed),
+        IrOp::StoreGlobal { src, .. } | IrOp::StoreLocal { src, .. } => sub1(src, subs, changed),
+        IrOp::LoadPtr { ptr, .. } => sub1(ptr, subs, changed),
+        IrOp::StorePtr { ptr, src } => {
+            sub1(ptr, subs, changed);
+            sub1(src, subs, changed);
+        }
+        IrOp::PtrAdd { ptr, offset, .. } => {
+            sub1(ptr, subs, changed);
+            sub1(offset, subs, changed);
+        }
+        IrOp::Neg { src, .. } | IrOp::Not { src, .. } | IrOp::LogicalNot { src, .. } => {
+            sub1(src, subs, changed);
+        }
+        IrOp::Add { lhs, rhs, .. }
+        | IrOp::Sub { lhs, rhs, .. }
+        | IrOp::Mul { lhs, rhs, .. }
+        | IrOp::Div { lhs, rhs, .. }
+        | IrOp::Mod { lhs, rhs, .. }
+        | IrOp::And { lhs, rhs, .. }
+        | IrOp::Or { lhs, rhs, .. }
+        | IrOp::Xor { lhs, rhs, .. }
+        | IrOp::Shl { lhs, rhs, .. }
+        | IrOp::Shr { lhs, rhs, .. }
+        | IrOp::Eq { lhs, rhs, .. }
+        | IrOp::Ne { lhs, rhs, .. }
+        | IrOp::Lt { lhs, rhs, .. }
+        | IrOp::Le { lhs, rhs, .. }
+        | IrOp::Gt { lhs, rhs, .. }
+        | IrOp::Ge { lhs, rhs, .. } => {
+            sub1(lhs, subs, changed);
+            sub1(rhs, subs, changed);
+        }
+        IrOp::JumpIfTrue { cond, .. } | IrOp::JumpIfFalse { cond, .. } => {
+            sub1(cond, subs, changed);
+        }
+        IrOp::Return { value } => {
+            if let Some(v) = value {
+                sub1(v, subs, changed);
+            }
+        }
+        IrOp::Call { args, .. } => {
+            for a in args.iter_mut() {
+                sub1(a, subs, changed);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Forward known values for static/global memory locations within a block.
@@ -3773,9 +3884,15 @@ mod tests {
             IrInstr::bare(IrOp::ret(None)),
         ];
         let result = opt_body(body);
-        // The second Add should be replaced with a Copy from vreg 2
-        assert!(result.iter().any(|i| matches!(&i.op,
-            IrOp::Copy { dst, src } if dst.id == 3 && src.id == 2)));
+        // CSE replaces the second Add with Copy { dst:3, src:2 }.  copy_propagate
+        // then substitutes v3→v2 in StoreGlobal "_g_d" and DCE removes the Copy.
+        // Accept either form: the Copy is still present, or _g_d already uses v2.
+        assert!(result.iter().any(|i| {
+            matches!(&i.op,
+                IrOp::Copy { dst, src } if dst.id == 3 && src.id == 2)
+            || matches!(&i.op,
+                IrOp::StoreGlobal { addr_label, src } if addr_label == "_g_d" && src.id == 2)
+        }));
     }
 
     #[test]
@@ -4115,13 +4232,19 @@ mod tests {
             "Mul inside the loop should be replaced by IV opt"
         );
 
-        // Should have a Copy for the replaced Mul destination.
+        // Should have a Copy for the replaced Mul destination, OR copy_propagate
+        // already propagated the derived-IV value into the StoreGlobal so the
+        // Copy was eliminated.  Either way, the _g_x store must not use the
+        // original Mul destination vreg (v2) directly.
         let has_copy = result[label_pos..]
             .iter()
             .any(|i| matches!(&i.op, IrOp::Copy { dst, .. } if dst.id == 2));
+        let store_avoids_mul_dst = !result[label_pos..]
+            .iter()
+            .any(|i| matches!(&i.op, IrOp::StoreGlobal { addr_label, src } if addr_label == "_g_x" && src.id == 2));
         assert!(
-            has_copy,
-            "Mul should be replaced with a Copy from the derived IV"
+            has_copy || store_avoids_mul_dst,
+            "Mul should be replaced with a Copy from the derived IV (or the derived IV used directly)"
         );
     }
 
@@ -4303,6 +4426,9 @@ mod tests {
         ];
 
         let result = opt_body(body);
+        // load_store_forwarding replaces the LoadGlobal with Copy { dst:1, src:0 }.
+        // copy_propagate then substitutes v1→v0 in all uses and DCE removes the
+        // Copy.  Either form is correct; accept both.
         assert!(result.iter().any(|i| {
             matches!(
                 &i.op,
@@ -4310,6 +4436,10 @@ mod tests {
             ) || matches!(
                 &i.op,
                 IrOp::LoadImm { dst, value: 42 } if dst.id == 1
+            ) || matches!(
+                // copy_propagate propagated v1→v0; Return now references v0 directly.
+                &i.op,
+                IrOp::Return { value: Some(v) } if v.id == 0
             )
         }));
     }
