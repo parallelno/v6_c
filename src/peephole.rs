@@ -157,6 +157,9 @@ fn apply_rules(lines: &mut Vec<Line>) -> bool {
     // --- Rule 28/29: Remove redundant LDA/STA pairs ----------------------
     changed |= rule_lda_sta_pairs(lines);
 
+    // --- Rule 37: Remove redundant LXI H,N (HL already holds N) ---------
+    changed |= rule_elim_redundant_lxi_h(lines);
+
     // --- Rule 32: Jump threading (resolve JMP chains) --------------------
     changed |= rule_jump_threading(lines);
 
@@ -794,6 +797,79 @@ fn rule_jump_threading(lines: &mut Vec<Line>) -> bool {
 ///
 /// Internal labels (starting with `L`, `__cg_`, or `__cmp_done_`) that are
 /// never referenced in any operand can be safely removed.
+/// Rule 37 – Remove redundant `LXI H,N` when HL already holds N.
+///
+/// After an `LXI H,N` or `SHLD addr` and other HL-preserving instructions,
+/// a second `LXI H,N` with the same immediate is dead if HL already holds N.
+/// This commonly arises when load-store forwarding converts a LoadGlobal to a
+/// Copy, and constant-folding recreates a fresh `LoadImm` for the same value.
+///
+/// HL-clobbering instructions (clear the tracked value):
+///   LHLD, MOV H/L, MVI H/L, DAD, INX H, DCX H, XCHG, POP H,
+///   any CALL/return opcode, and labels (unknown HL at join points).
+fn rule_elim_redundant_lxi_h(lines: &mut Vec<Line>) -> bool {
+    let mut changed = false;
+    let mut hl_known: Option<String> = None;
+    let mut i = 0;
+    while i < lines.len() {
+        match &lines[i] {
+            Line::Label(_) => {
+                // Control-flow join point — HL state is unknown.
+                hl_known = None;
+            }
+            Line::Instruction { opcode, operands } => {
+                let opcode = opcode.clone();
+                let operands = operands.clone();
+                let ops = operands.trim();
+                if opcode == "LXI" && ops.starts_with("H,") {
+                    let imm = ops["H,".len()..].trim();
+                    if hl_known.as_deref() == Some(imm) {
+                        // HL already holds this value — remove the redundant LXI.
+                        lines.remove(i);
+                        changed = true;
+                        continue;
+                    }
+                    hl_known = Some(imm.to_string());
+                } else if clobbers_hl_value(&opcode, ops) {
+                    hl_known = None;
+                }
+                // Instructions not matched above preserve HL — no change to hl_known.
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    changed
+}
+
+/// Returns `true` if the instruction may write to the HL register pair.
+///
+/// Conservative: when in doubt, return `true` (clear tracking) to avoid
+/// misoptimizations.
+fn clobbers_hl_value(opcode: &str, ops: &str) -> bool {
+    match opcode {
+        // Explicit HL loads
+        "LHLD" => true,
+        // Partial writes to H or L
+        "MOV" | "MVI" => ops.starts_with("H,") || ops.starts_with("L,"),
+        // Double-add writes result back into HL
+        "DAD" => true,
+        // Increment / decrement HL
+        "INX" | "DCX" => ops == "H",
+        // Swap HL ↔ DE
+        "XCHG" => true,
+        // Pop into HL
+        "POP" => ops == "H",
+        // Calls: callee may clobber HL
+        "CALL" | "CZ" | "CNZ" | "CC" | "CNC" | "CPE" | "CPO" | "CM" | "CP" => true,
+        // Returns: HL state at the call site is unknown after a potential call
+        // (this branch is never reached in a straight-line sequence, but keep
+        // for completeness).
+        "RET" | "RZ" | "RNZ" | "RC" | "RNC" | "RPE" | "RPO" | "RM" | "RP" => true,
+        _ => false,
+    }
+}
+
 fn rule_remove_unreferenced_labels(lines: &mut Vec<Line>) -> bool {
     // Collect all operand references.
     let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
