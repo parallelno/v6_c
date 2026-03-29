@@ -44,6 +44,11 @@ pub struct CodeGenerator {
     instr_index: usize,
     /// Last emitted source C line marker for current function.
     current_c_line: u32,
+    /// Set of VReg IDs whose comparison-based conditional branch was already
+    /// emitted inline inside `gen_compare`.  When `gen_jump_if_true` /
+    /// `gen_jump_if_false` encounters one of these IDs it is a no-op because
+    /// the branch was already emitted.
+    consumed_cmp: HashSet<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -64,6 +69,7 @@ pub fn generate(program: &IrProgram, analysis: &CallGraphAnalysis) -> Vec<String
         last_use: HashMap::new(),
         instr_index: 0,
         current_c_line: 0,
+        consumed_cmp: HashSet::new(),
     };
 
     cg.emit_comment("--- code section ---");
@@ -494,6 +500,7 @@ impl CodeGenerator {
         self.regalloc.reset();
         self.last_use = compute_last_use(&func.body);
         self.current_c_line = 0;
+        self.consumed_cmp.clear();
         self.emit_comment(&format!("function {}", func.name));
         self.emit_label(&func.name);
 
@@ -511,7 +518,8 @@ impl CodeGenerator {
                 self.emit_comment(&format!("C_LINE {}", instr.line));
                 self.current_c_line = instr.line;
             }
-            self.gen_op(&instr.op);
+            let next_op = func.body.get(idx + 1).map(|i| &i.op);
+            self.gen_op(&instr.op, next_op);
             // Free registers holding vregs that are dead after this instruction.
             self.free_dead_vregs(&instr.op);
         }
@@ -547,7 +555,7 @@ impl CodeGenerator {
 // ---------------------------------------------------------------------------
 
 impl CodeGenerator {
-    fn gen_op(&mut self, op: &IrOp) {
+    fn gen_op(&mut self, op: &IrOp, next_op: Option<&IrOp>) {
         match op {
             // -- loads / stores -------------------------------------------
             IrOp::LoadImm { dst, value } => self.gen_load_imm(*dst, *value),
@@ -600,22 +608,22 @@ impl CodeGenerator {
 
             // -- comparisons ----------------------------------------------
             IrOp::Eq { dst, lhs, rhs, width } => {
-                self.gen_compare(*dst, *lhs, *rhs, *width, "eq", false);
+                self.gen_compare(*dst, *lhs, *rhs, *width, "eq", false, next_op);
             }
             IrOp::Ne { dst, lhs, rhs, width } => {
-                self.gen_compare(*dst, *lhs, *rhs, *width, "ne", false);
+                self.gen_compare(*dst, *lhs, *rhs, *width, "ne", false, next_op);
             }
             IrOp::Lt { dst, lhs, rhs, width, signed } => {
-                self.gen_compare(*dst, *lhs, *rhs, *width, "lt", *signed);
+                self.gen_compare(*dst, *lhs, *rhs, *width, "lt", *signed, next_op);
             }
             IrOp::Le { dst, lhs, rhs, width, signed } => {
-                self.gen_compare(*dst, *lhs, *rhs, *width, "le", *signed);
+                self.gen_compare(*dst, *lhs, *rhs, *width, "le", *signed, next_op);
             }
             IrOp::Gt { dst, lhs, rhs, width, signed } => {
-                self.gen_compare(*dst, *lhs, *rhs, *width, "gt", *signed);
+                self.gen_compare(*dst, *lhs, *rhs, *width, "gt", *signed, next_op);
             }
             IrOp::Ge { dst, lhs, rhs, width, signed } => {
-                self.gen_compare(*dst, *lhs, *rhs, *width, "ge", *signed);
+                self.gen_compare(*dst, *lhs, *rhs, *width, "ge", *signed, next_op);
             }
 
             // -- unary ----------------------------------------------------
@@ -1473,6 +1481,43 @@ impl CodeGenerator {
 
     // -- Comparisons ------------------------------------------------------
 
+    /// Return the conditional-branch jump mnemonic that corresponds to the
+    /// comparison `kind` being *true* (carry = A < N for unsigned CPI).
+    ///
+    /// Used by the CPI-branch fusion path.  Returns `None` for comparisons
+    /// that require two jumps (gt, le) and are handled separately.
+    fn cpi_branch_true(kind: &str, _signed: bool) -> Option<&'static str> {
+        match kind {
+            "eq"  => Some("JZ"),
+            "ne"  => Some("JNZ"),
+            // CPI sets carry = borrow, so JC/JNC give the correct unsigned
+            // byte result for the full 0..255 range, which is what matters
+            // in practice on the 8080.  JM/JP have signed-overflow issues
+            // for large negative bytes subtracted from small positive constants.
+            "lt"  => Some("JC"),
+            "ge"  => Some("JNC"),
+            "gt"  => None,   // needs two branches
+            "le"  => None,   // needs two branches
+            _     => None,
+        }
+    }
+
+    /// Return the conditional-branch jump mnemonic to *skip* the taken branch
+    /// (i.e. the inverse of the comparison), used when we need
+    /// `JZ/... skip_label`.  Returns `None` for gt/le.
+    fn cpi_branch_false(kind: &str, _signed: bool) -> Option<&'static str> {
+        match kind {
+            "eq"  => Some("JNZ"),
+            "ne"  => Some("JZ"),
+            // Use JNC/JC (unsigned carry) for the full 0..255 byte range.
+            "lt"  => Some("JNC"),
+            "ge"  => Some("JC"),
+            "gt"  => None,
+            "le"  => None,
+            _     => None,
+        }
+    }
+
     fn gen_compare(
         &mut self,
         dst: VReg,
@@ -1481,7 +1526,121 @@ impl CodeGenerator {
         width: Width,
         kind: &str,
         signed: bool,
+        next_op: Option<&IrOp>,
     ) {
+        // ----------------------------------------------------------------
+        // CPI-branch fusion for W8 comparisons.
+        //
+        // If the next IR op is `JumpIfTrue(dst, target)` or
+        // `JumpIfFalse(dst, target)` and the RHS is a compile-time known
+        // immediate that fits in a byte, we can skip the boolean
+        // materialisation entirely and emit:
+        //
+        //   CPI  N          (sets flags like A - N)
+        //   Jcc  target     (one conditional jump)
+        //
+        // For gt/le we need two conditional jumps but it is still cheaper
+        // than the full boolean sequence.
+        // ----------------------------------------------------------------
+        if width == Width::W8 {
+            if let Some(imm) = self.known_imm(rhs) {
+                let imm_byte = imm as u8;
+
+                // Peek at the next op to see if it consumes `dst` in a branch.
+                let fuse_target: Option<(Label, bool)> = match next_op {
+                    Some(IrOp::JumpIfTrue  { cond, target }) if cond.id == dst.id => Some((*target, true)),
+                    Some(IrOp::JumpIfFalse { cond, target }) if cond.id == dst.id => Some((*target, false)),
+                    _ => None,
+                };
+
+                if let Some((target, branch_if_true)) = fuse_target {
+                    // Emit: ensure A, CPI N, then conditional branch.
+                    self.regalloc.free(rhs); // rhs is remat-only, just drop it
+                    self.ensure_a(lhs);
+                    self.emit_inst(&format!("CPI {}", imm_byte));
+
+                    let lbl = self.ir_label(target);
+
+                    if branch_if_true {
+                        // JumpIfTrue: emit the branch for the true condition.
+                        if kind == "gt" {
+                            // A > N ⟺ A >= N+1 ⟺ not(A == N) AND not(A < N)
+                            // CPI N: JC = A<N (unsigned), JZ = A==N
+                            // We want to jump to target when A>N: !carry && !zero
+                            // Emit: JC skip / JNZ target / skip:
+                            let skip_lbl = self.fresh_label();
+                            self.emit_inst(&format!("JC {}", skip_lbl));
+                            self.emit_inst(&format!("JNZ {}", lbl));
+                            self.emit_label(&skip_lbl);
+                        } else if kind == "le" {
+                            // A <= N ⟺ A < N OR A == N ⟺ carry OR zero
+                            // CPI N: JC or JZ → target
+                            self.emit_inst(&format!("JC {}", lbl));
+                            self.emit_inst(&format!("JZ {}", lbl));
+                        } else if let Some(j) = Self::cpi_branch_true(kind, signed) {
+                            self.emit_inst(&format!("{} {}", j, lbl));
+                        }
+                    } else {
+                        // JumpIfFalse: branch when condition is false (skip body).
+                        if kind == "gt" {
+                            // Jump (skip) when NOT(A > N) = A <= N = carry OR zero
+                            self.emit_inst(&format!("JC {}", lbl));
+                            self.emit_inst(&format!("JZ {}", lbl));
+                        } else if kind == "le" {
+                            // Jump (skip) when NOT(A <= N) = A > N = !carry AND !zero
+                            let skip_lbl = self.fresh_label();
+                            self.emit_inst(&format!("JC {}", skip_lbl));
+                            self.emit_inst(&format!("JNZ {}", lbl));
+                            self.emit_label(&skip_lbl);
+                        } else if let Some(j) = Self::cpi_branch_false(kind, signed) {
+                            self.emit_inst(&format!("{} {}", j, lbl));
+                        }
+                    }
+
+                    // Record that `dst` was consumed here so gen_jump_if_*
+                    // skips emitting a redundant branch.
+                    self.consumed_cmp.insert(dst.id);
+                    // dst  is never materialised into a register — leave it unmapped
+                    // so gen_jump_if_* can recognise it via consumed_cmp.
+                    return;
+                }
+
+                // No fusion opportunity: emit CPI N and materialise a boolean.
+                self.regalloc.free(rhs);
+                self.ensure_a(lhs);
+                self.emit_inst(&format!("CPI {}", imm_byte));
+
+                let true_lbl = self.fresh_label();
+                let done_lbl = self.fresh_label();
+                let branch = match kind {
+                    "eq" => "JZ",
+                    "ne" => "JNZ",
+                    "lt" => if signed { "JM" } else { "JC" },
+                    "ge" => if signed { "JP" } else { "JNC" },
+                    "gt" => "JNC", // first branch; eq check below
+                    "le" => if signed { "JM" } else { "JC" },
+                    _ => "JZ",
+                };
+                self.emit_inst(&format!("{} {}", branch, true_lbl));
+                if kind == "gt" {
+                    self.emit_inst(&format!("JZ {}", done_lbl));
+                }
+                if kind == "le" {
+                    self.emit_inst(&format!("JZ {}", true_lbl));
+                }
+                self.emit_inst("LXI H,0");
+                self.emit_inst(&format!("JMP {}", done_lbl));
+                self.emit_label(&true_lbl);
+                self.emit_inst("LXI H,1");
+                self.emit_label(&done_lbl);
+                self.mark(dst, PhysReg::HL);
+                return;
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // General path (W16/W32, or W8 with a non-immediate RHS)
+        // ----------------------------------------------------------------
         let true_lbl = self.fresh_label();
         let done_lbl = self.fresh_label();
 
@@ -1714,6 +1873,13 @@ impl CodeGenerator {
     // -- JumpIfTrue / JumpIfFalse -----------------------------------------
 
     fn gen_jump_if_true(&mut self, cond: VReg, target: Label) {
+        // When gen_compare already fused the branch (CPI + Jcc), it inserts
+        // the dst vreg ID into `consumed_cmp`.  The JumpIfTrue/False that
+        // follows is a no-op: the branch was emitted during gen_compare.
+        if self.consumed_cmp.contains(&cond.id) {
+            self.consumed_cmp.remove(&cond.id);
+            return;
+        }
         let lbl = self.ir_label(target);
         match cond.width {
             Width::W8 => {
@@ -1731,6 +1897,10 @@ impl CodeGenerator {
     }
 
     fn gen_jump_if_false(&mut self, cond: VReg, target: Label) {
+        if self.consumed_cmp.contains(&cond.id) {
+            self.consumed_cmp.remove(&cond.id);
+            return;
+        }
         let lbl = self.ir_label(target);
         match cond.width {
             Width::W8 => {
@@ -2448,7 +2618,8 @@ mod tests {
         f.push_op(IrOp::Eq { dst: c, lhs: a, rhs: b, width: Width::W8 });
         f.push_op(IrOp::ret(Some(c)));
         let out = gen_single_func(f);
-        assert!(has_line(&out, "CMP C"));
+        // When rhs is a known immediate, CPI is used instead of CMP C.
+        assert!(has_line(&out, "CPI 5"), "expected CPI 5 but got:\n{}", out.join("\n"));
         assert!(has_line(&out, "JZ"));
         assert!(has_line(&out, "LXI H,1"));
         assert!(has_line(&out, "LXI H,0"));

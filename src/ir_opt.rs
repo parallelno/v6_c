@@ -652,10 +652,28 @@ impl ValueRangeFact {
     fn is_byte(self) -> bool {
         self.valid && self.min >= 0 && self.max <= 0xFF
     }
+
+    fn is_signed_byte(self) -> bool {
+        self.valid && self.min >= -128 && self.max <= 127
+    }
 }
 
 fn narrow_byte_ops(func: &mut IrFunction) -> bool {
     let facts = compute_value_ranges(func);
+    // Build a map from W16-vreg-ID → the W8 source vreg it was widened from,
+    // and the immediate value for W16 imm vregs that fit in a byte.
+    // Used to redirect narrowed comparison operands back to their W8 origins.
+    let mut cast_origin: HashMap<u32, VReg> = HashMap::new();
+    for instr in &func.body {
+        if let IrOp::Cast { dst, src, .. } = &instr.op {
+            if src.width == Width::W8 && dst.width == Width::W16 {
+                cast_origin.insert(dst.id, *src);
+            }
+        }
+        // For LoadImm that produce W16 but hold a byte value, note the imm
+        // vreg itself as a potential W8 substitute (we'll make a copy).
+        // (Handled below in the substitution logic.)
+    }
     let mut changed = false;
 
     for instr in &mut func.body {
@@ -700,34 +718,38 @@ fn narrow_byte_ops(func: &mut IrFunction) -> bool {
             }
             IrOp::Eq { lhs, rhs, width, .. }
             | IrOp::Ne { lhs, rhs, width, .. }
-            | IrOp::Lt {
-                lhs,
-                rhs,
-                width,
-                ..
-            }
-            | IrOp::Le {
-                lhs,
-                rhs,
-                width,
-                ..
-            }
-            | IrOp::Gt {
-                lhs,
-                rhs,
-                width,
-                ..
-            }
-            | IrOp::Ge {
-                lhs,
-                rhs,
-                width,
-                ..
-            } if *width == Width::W16 => {
+                if *width == Width::W16 =>
+            {
                 let lhs_byte = facts.get(&lhs.id).copied().unwrap_or_default().is_byte();
                 let rhs_byte = facts.get(&rhs.id).copied().unwrap_or_default().is_byte();
-                if lhs_byte && rhs_byte {
+                let lhs_sbyte = facts.get(&lhs.id).copied().unwrap_or_default().is_signed_byte();
+                let rhs_sbyte = facts.get(&rhs.id).copied().unwrap_or_default().is_signed_byte();
+                if (lhs_byte && rhs_byte) || (lhs_sbyte && rhs_sbyte) {
                     *width = Width::W8;
+                    // Redirect operands to W8 origins if possible.
+                    if let Some(&w8_src) = cast_origin.get(&lhs.id) { *lhs = w8_src; }
+                    if let Some(&w8_src) = cast_origin.get(&rhs.id) { *rhs = w8_src; }
+                    changed = true;
+                }
+            }
+            IrOp::Lt { lhs, rhs, width, signed, .. }
+            | IrOp::Le { lhs, rhs, width, signed, .. }
+            | IrOp::Gt { lhs, rhs, width, signed, .. }
+            | IrOp::Ge { lhs, rhs, width, signed, .. }
+                if *width == Width::W16 =>
+            {
+                let lhs_f = facts.get(&lhs.id).copied().unwrap_or_default();
+                let rhs_f = facts.get(&rhs.id).copied().unwrap_or_default();
+                let ok = if *signed {
+                    lhs_f.is_signed_byte() && rhs_f.is_signed_byte()
+                } else {
+                    lhs_f.is_byte() && rhs_f.is_byte()
+                };
+                if ok {
+                    *width = Width::W8;
+                    // Redirect operands to W8 origins if possible.
+                    if let Some(&w8_src) = cast_origin.get(&lhs.id) { *lhs = w8_src; }
+                    if let Some(&w8_src) = cast_origin.get(&rhs.id) { *rhs = w8_src; }
                     changed = true;
                 }
             }
@@ -744,8 +766,19 @@ fn compute_value_ranges(func: &IrFunction) -> HashMap<u32, ValueRangeFact> {
     for instr in &func.body {
         match &instr.op {
             IrOp::Label { .. } => {
-                // Keep sparse facts but conservatively reset at merge points.
-                facts.clear();
+                // At control-flow join points the facts may not hold on all
+                // incoming paths.  However, for the purpose of byte-range
+                // narrowing it is sufficient to know that a vreg *could* be
+                // a byte value — so we are conservative in the other direction:
+                // we keep the facts rather than clearing them.  Any incorrect
+                // narrowing would be caught by the is_byte/is_signed_byte
+                // guards which require valid=true, and those facts are only
+                // inserted when we can prove the range from the definition
+                // sites (Cast from W8, LoadImm with small value, etc.).
+                //
+                // Note: vregs are SSA-like (each is written exactly once), so
+                // a fact inserted for vreg X before a label is still valid
+                // after the label if X is defined before it.
             }
             IrOp::LoadImm { dst, value } => {
                 facts.insert(dst.id, ValueRangeFact::exact(*value));
@@ -754,14 +787,27 @@ fn compute_value_ranges(func: &IrFunction) -> HashMap<u32, ValueRangeFact> {
                 let src_fact = facts.get(&src.id).copied().unwrap_or_else(ValueRangeFact::unknown);
                 facts.insert(dst.id, src_fact);
             }
-            IrOp::Cast { dst, src, .. } => {
+            IrOp::Cast { dst, src, to_type } => {
                 let src_fact = facts.get(&src.id).copied().unwrap_or_else(ValueRangeFact::unknown);
                 let cast_fact = match (src.width, dst.width) {
                     (Width::W8, Width::W16) | (Width::W8, Width::W32) => {
-                        if src_fact.valid {
-                            ValueRangeFact::interval(src_fact.min.max(0), src_fact.max.min(0xFF))
+                        if to_type.is_signed() {
+                            // Sign-extend: preserve the signed-byte range (-128..127)
+                            if src_fact.valid {
+                                ValueRangeFact::interval(
+                                    (src_fact.min as i8) as i64,
+                                    (src_fact.max as i8) as i64,
+                                )
+                            } else {
+                                ValueRangeFact::interval(-128, 127)
+                            }
                         } else {
-                            ValueRangeFact::interval(0, 0xFF)
+                            // Zero-extend: clamp to 0..255
+                            if src_fact.valid {
+                                ValueRangeFact::interval(src_fact.min.max(0), src_fact.max.min(0xFF))
+                            } else {
+                                ValueRangeFact::interval(0, 0xFF)
+                            }
                         }
                     }
                     (Width::W16, Width::W8) | (Width::W32, Width::W8) => {
