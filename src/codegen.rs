@@ -56,6 +56,9 @@ pub struct CodeGenerator {
     /// jumps / calls so that else-body labels and post-call code are always
     /// safe.
     a_mirrors: Option<String>,
+    /// Width of each spill slot, keyed by label.  Populated when Spill ops are
+    /// emitted; used to emit `.storage 1` vs `.storage 2` in the data section.
+    spill_widths: HashMap<String, Width>,
 }
 
 // ---------------------------------------------------------------------------
@@ -78,6 +81,7 @@ pub fn generate(program: &IrProgram, analysis: &CallGraphAnalysis) -> Vec<String
         current_c_line: 0,
         consumed_cmp: HashSet::new(),
         a_mirrors: None,
+        spill_widths: HashMap::new(),
     };
 
     cg.emit_comment("--- code section ---");
@@ -356,7 +360,10 @@ impl CodeGenerator {
     fn emit_moves(&mut self, ops: &[MoveOp]) {
         for op in ops {
             match op {
-                MoveOp::Spill { src, label } => {
+                MoveOp::Spill { src, label, width } => {
+                    // Record the value's width so the data section can emit the
+                    // right .storage size for this spill slot.
+                    self.spill_widths.insert(label.clone(), *width);
                     match src {
                         PhysReg::HL => self.emit_inst(&format!("SHLD {}", label)),
                         PhysReg::A => self.emit_inst(&format!("STA {}", label)),
@@ -373,15 +380,33 @@ impl CodeGenerator {
                         }
                     }
                 }
-                MoveOp::Reload { dst, label } => {
-                    match dst {
-                        PhysReg::HL => self.emit_inst(&format!("LHLD {}", label)),
-                        PhysReg::A => self.emit_inst(&format!("LDA {}", label)),
-                        PhysReg::DE => {
+                MoveOp::Reload { dst, label, width } => {
+                    match (dst, width) {
+                        (PhysReg::A, _) => self.emit_inst(&format!("LDA {}", label)),
+                        // W8 reload into HL: LXI H,label; MOV L,M
+                        // Only L is ever read for an 8-bit value; H is never touched.
+                        (PhysReg::HL, Width::W8) => {
+                            self.emit_inst(&format!("LXI H,{}", label));
+                            self.emit_inst("MOV L,M");
+                        }
+                        // W8 reload into BC: LXI H,label; MOV C,M
+                        // Only C is read (e.g. ADD C); B is never consumed.
+                        (PhysReg::BC, Width::W8) => {
+                            self.emit_inst(&format!("LXI H,{}", label));
+                            self.emit_inst("MOV C,M");
+                        }
+                        // W8 reload into DE: LXI H,label; MOV E,M
+                        // Only E is read; D is never consumed.
+                        (PhysReg::DE, Width::W8) => {
+                            self.emit_inst(&format!("LXI H,{}", label));
+                            self.emit_inst("MOV E,M");
+                        }
+                        (PhysReg::HL, _) => self.emit_inst(&format!("LHLD {}", label)),
+                        (PhysReg::DE, _) => {
                             self.emit_inst(&format!("LHLD {}", label));
                             self.emit_inst("XCHG");
                         }
-                        PhysReg::BC => {
+                        (PhysReg::BC, _) => {
                             self.emit_inst(&format!("LHLD {}", label));
                             self.emit_inst("MOV B,H");
                             self.emit_inst("MOV C,L");
@@ -2237,8 +2262,13 @@ impl CodeGenerator {
             if !emitted_labels.insert(label.clone()) {
                 continue;
             }
+            let storage_bytes = match self.spill_widths.get(label.as_str()).copied() {
+                Some(Width::W8) => 1,
+                Some(Width::W32) => 4,
+                _ => 2, // W16 or unknown
+            };
             self.emit_label(label);
-            self.emit_inst(".storage 2");
+            self.emit_inst(&format!(".storage {}", storage_bytes));
         }
 
         // Static local/param allocations from the analysis.

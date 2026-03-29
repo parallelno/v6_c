@@ -89,9 +89,12 @@ pub enum Location {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MoveOp {
     /// Store the contents of `src` to the named memory location.
-    Spill { src: PhysReg, label: String },
+    /// `width` is the natural width of the value (determined by `src.width()`).
+    Spill { src: PhysReg, label: String, width: Width },
     /// Load from the named memory location into `dst`.
-    Reload { dst: PhysReg, label: String },
+    /// `width` is the width of the stored value (may differ from `dst.width()`
+    /// when a narrow value is zero-extended into a wider register pair).
+    Reload { dst: PhysReg, label: String, width: Width },
     /// Materialize an immediate constant directly in `dst`.
     LoadImm { dst: PhysReg, value: i64, width: Width },
     /// Register-to-register move.
@@ -175,7 +178,7 @@ impl RegAllocator {
             let label = self.fresh_spill_label();
             self.vreg_map.insert(vreg_id, Location::Memory(label.clone()));
             self.reg_contents.insert(reg, None);
-            Some(MoveOp::Spill { src: reg, label })
+            Some(MoveOp::Spill { src: reg, label, width: reg.width() })
         } else {
             None
         }
@@ -193,6 +196,7 @@ impl RegAllocator {
             Some(MoveOp::Spill {
                 src: reg,
                 label: label.to_string(),
+                width: reg.width(),
             })
         } else {
             None
@@ -280,9 +284,18 @@ impl RegAllocator {
         }
 
         if let Some(Location::Memory(label)) = self.vreg_map.get(&vreg.id).cloned() {
+            // Reloading a W8 value into a pair register uses "LXI H,label; MOV r,M"
+            // which temporarily clobbers HL. Pre-spill HL now so the allocator
+            // state stays consistent with what emit_moves will actually emit.
+            if vreg.width == Width::W8 && matches!(target, PhysReg::BC | PhysReg::DE) {
+                if let Some(spill_op) = self.spill(PhysReg::HL) {
+                    ops.push(spill_op);
+                }
+            }
             ops.push(MoveOp::Reload {
                 dst: target,
                 label,
+                width: vreg.width,
             });
         } else if let Some(Location::RematImm(value)) = self.vreg_map.get(&vreg.id).cloned() {
             ops.push(MoveOp::LoadImm {
@@ -412,6 +425,7 @@ impl RegAllocator {
             ops.push(MoveOp::Reload {
                 dst: reg,
                 label: label.clone(),
+                width: vreg.width,
             });
         } else if let Some(Location::RematImm(value)) = self.vreg_map.get(&vreg.id) {
             ops.push(MoveOp::LoadImm {
@@ -507,7 +521,7 @@ mod tests {
         assert_eq!(reg, PhysReg::BC);
         assert_eq!(ops.len(), 1);
         match &ops[0] {
-            MoveOp::Spill { src, label } => {
+            MoveOp::Spill { src, label, .. } => {
                 assert_eq!(*src, PhysReg::BC);
                 assert!(label.starts_with("__spill_"));
             }
@@ -581,7 +595,7 @@ mod tests {
             other => panic!("expected Spill, got {:?}", other),
         }
         match &ops[1] {
-            MoveOp::Reload { dst, label } => {
+            MoveOp::Reload { dst, label, .. } => {
                 assert_eq!(*dst, PhysReg::DE);
                 assert!(label.starts_with("__spill_"));
             }
@@ -654,6 +668,7 @@ mod tests {
             Some(MoveOp::Spill {
                 src: PhysReg::HL,
                 label: "_my_var".to_string(),
+                width: Width::W16,
             })
         );
         assert_eq!(

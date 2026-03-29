@@ -1016,6 +1016,17 @@ fn rule_elim_dead_spills(lines: &mut Vec<Line>) -> bool {
                     live.insert(label.to_string());
                 }
             }
+            // LXI H,label followed by MOV r,M is a byte-load pattern emitted
+            // for W8 spill reloads into pair registers.  Treat the label as read.
+            if opcode == "LXI" {
+                let operands = operands.trim();
+                if let Some(rest) = operands.strip_prefix("H,") {
+                    let label = rest.trim();
+                    if is_compiler_local_label(label) {
+                        live.insert(label.to_string());
+                    }
+                }
+            }
         }
     }
     // Remove write-only stores to compiler-local labels.
