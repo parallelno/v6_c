@@ -187,15 +187,55 @@ fn build_callees(program: &IrProgram) -> HashMap<String, HashSet<String>> {
 
     for func in &program.functions {
         for instr in &func.body {
-            if let IrOp::Call { func_name, .. } = &instr.op {
-                map.entry(func.name.clone())
-                    .or_default()
-                    .insert(func_name.clone());
+            match &instr.op {
+                IrOp::Call { func_name, .. } => {
+                    map.entry(func.name.clone())
+                        .or_default()
+                        .insert(func_name.clone());
+                }
+                IrOp::InlineAsm { code, .. } => {
+                    for callee in scan_asm_calls(code) {
+                        map.entry(func.name.clone())
+                            .or_default()
+                            .insert(callee);
+                    }
+                }
+                _ => {}
             }
         }
     }
 
     map
+}
+
+/// Scan raw assembly text for `CALL label` instructions and return the set of
+/// callee names.  Recognises `CALL`, `CC`, `CNC`, `CZ`, `CNZ`, `CP`, `CM`,
+/// `CPE`, `CPO` (all i8080 call mnemonics).
+fn scan_asm_calls(asm_code: &str) -> Vec<String> {
+    let mut callees = Vec::new();
+    for line in asm_code.lines() {
+        let trimmed = line.trim();
+        // strip trailing comment
+        let code_part = trimmed.split(';').next().unwrap_or("").trim();
+        // Split on whitespace: first token is mnemonic, second is operand.
+        let mut parts = code_part.split_whitespace();
+        let Some(mnemonic) = parts.next() else { continue };
+        let upper = mnemonic.to_uppercase();
+        let is_call = matches!(
+            upper.as_str(),
+            "CALL" | "CC" | "CNC" | "CZ" | "CNZ" | "CP" | "CM" | "CPE" | "CPO"
+        );
+        if is_call {
+            if let Some(operand) = parts.next() {
+                // Strip trailing comma or whitespace artefacts.
+                let label = operand.trim_end_matches(',').trim();
+                if !label.is_empty() {
+                    callees.push(label.to_string());
+                }
+            }
+        }
+    }
+    callees
 }
 
 // ---------------------------------------------------------------------------
@@ -385,6 +425,46 @@ fn build_frame_layouts(
             continue;
         }
 
+        // Full-body asm functions manage their own memory — skip allocation.
+        if func.is_asm_body {
+            // Scan for equates that explicitly request storage.  Parameters
+            // declared as `_l_func_param = 0` or `_l_func_param = * + 1` are
+            // handled by the asm code itself, so they need no allocation.
+            // We still emit a zero-size frame so the function exists in the
+            // layout map (required by allocate_frame_bases).
+            let asm_equates = collect_asm_equate_labels(func);
+            let mut offsets = HashMap::new();
+            let mut next_offset = 0u16;
+
+            // Allocate only params/locals NOT covered by an asm equate.
+            for param in &func.params {
+                let label = format!("_l_{}_{}", func.name, param.name);
+                if asm_equates.contains(&label) {
+                    continue;
+                }
+                offsets.insert(label, next_offset);
+                next_offset = next_offset.wrapping_add(param_size(&param.ty));
+            }
+
+            for (name, ty, _offset) in &func.locals {
+                let label = format!("_l_{}_{}", func.name, name);
+                if offsets.contains_key(&label) || asm_equates.contains(&label) {
+                    continue;
+                }
+                offsets.insert(label, next_offset);
+                next_offset = next_offset.wrapping_add(var_size(ty));
+            }
+
+            layouts.insert(
+                func.name.clone(),
+                FunctionFrameLayout {
+                    size: next_offset,
+                    offsets,
+                },
+            );
+            continue;
+        }
+
         let mut offsets = HashMap::new();
         let mut next_offset = 0u16;
 
@@ -413,6 +493,34 @@ fn build_frame_layouts(
     }
 
     layouts
+}
+
+/// Collect labels declared via equates (`label = expr`) in inline asm code.
+/// These are parameter/local labels that the asm code manages itself, so the
+/// compiler should skip allocating static memory for them.
+fn collect_asm_equate_labels(func: &IrFunction) -> HashSet<String> {
+    let mut labels = HashSet::new();
+    let prefix = format!("_l_{}_", func.name);
+    for instr in &func.body {
+        if let IrOp::InlineAsm { code, .. } = &instr.op {
+            for line in code.lines() {
+                let trimmed = line.trim();
+                // Match `_l_func_var = expr` (assembler equate)
+                if let Some(eq_pos) = trimmed.find('=') {
+                    let lhs = trimmed[..eq_pos].trim();
+                    if lhs.starts_with(&prefix) && is_valid_label(lhs) {
+                        labels.insert(lhs.to_string());
+                    }
+                }
+            }
+        }
+    }
+    labels
+}
+
+/// Check that a string looks like a valid assembler label (alphanumeric + _).
+fn is_valid_label(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 fn compute_reachability(graph: &CallGraph) -> HashMap<String, HashSet<String>> {
@@ -606,6 +714,12 @@ fn scan_direct_effects(func: &IrFunction) -> DirectEffects {
                 effects.reads_nonlocal_memory = true;
             }
             IrOp::StorePtr { .. } | IrOp::StoreLocal { .. } => {
+                effects.writes_nonlocal_memory = true;
+            }
+            // Inline asm can do anything — conservatively assume it
+            // reads and writes nonlocal memory.
+            IrOp::InlineAsm { .. } => {
+                effects.reads_nonlocal_memory = true;
                 effects.writes_nonlocal_memory = true;
             }
             IrOp::LoadLocal { .. } => {}
