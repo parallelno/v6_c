@@ -177,8 +177,10 @@ impl Preprocessor {
             ));
         }
 
-        // Splice line continuations first.
-        let source = splice_line_continuations(source);
+        // Strip block comments first (handles multi-line /* */ correctly),
+        // then splice line continuations.
+        let source = strip_block_comments(source);
+        let source = splice_line_continuations(&source);
 
         let mut output = String::with_capacity(source.len());
         let mut cond_stack: Vec<CondState> = Vec::new();
@@ -947,6 +949,76 @@ fn splice_line_continuations(source: &str) -> String {
             result.push(bytes[i] as char);
             i += 1;
         }
+    }
+    result
+}
+
+/// Strip all `/* ... */` block comments from source, replacing comment content
+/// with spaces while preserving newlines so line numbers stay correct.
+/// This handles multi-line block comments that the per-line expansion cannot.
+fn strip_block_comments(source: &str) -> String {
+    let mut result = String::with_capacity(source.len());
+    let bytes = source.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        // Don't strip inside string literals.
+        if bytes[i] == b'"' {
+            result.push('"');
+            i += 1;
+            while i < len && bytes[i] != b'"' {
+                if bytes[i] == b'\\' && i + 1 < len {
+                    result.push(bytes[i] as char);
+                    result.push(bytes[i + 1] as char);
+                    i += 2;
+                } else {
+                    result.push(bytes[i] as char);
+                    i += 1;
+                }
+            }
+            if i < len {
+                result.push('"');
+                i += 1;
+            }
+            continue;
+        }
+        // Don't strip inside character literals.
+        if bytes[i] == b'\'' {
+            result.push('\'');
+            i += 1;
+            while i < len && bytes[i] != b'\'' {
+                if bytes[i] == b'\\' && i + 1 < len {
+                    result.push(bytes[i] as char);
+                    result.push(bytes[i + 1] as char);
+                    i += 2;
+                } else {
+                    result.push(bytes[i] as char);
+                    i += 1;
+                }
+            }
+            if i < len {
+                result.push('\'');
+                i += 1;
+            }
+            continue;
+        }
+        // Block comment: replace with space, preserve newlines.
+        if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                if bytes[i] == b'\n' {
+                    result.push('\n');
+                }
+                i += 1;
+            }
+            if i + 1 < len {
+                i += 2; // skip */
+            }
+            result.push(' '); // replace comment with a single space
+            continue;
+        }
+        result.push(bytes[i] as char);
+        i += 1;
     }
     result
 }
@@ -2152,6 +2224,41 @@ mod tests {
         assert!(result.contains("int"));
         assert!(result.contains("x;"));
         assert!(!result.contains("hello"));
+    }
+
+    #[test]
+    fn multiline_block_comment() {
+        let mut p = pp();
+        let src = "int x; /* this\nspans\nlines */ int y;";
+        let result = run(&mut p, src).unwrap();
+        assert!(result.contains("int x;"));
+        assert!(result.contains("int y;"));
+        assert!(!result.contains("this"));
+        assert!(!result.contains("spans"));
+    }
+
+    #[test]
+    fn multiline_block_comment_with_apostrophes() {
+        let mut p = pp();
+        let src = "int a;\n/* don't panic\n   it's fine\n   can't fail */\nint b;";
+        let result = run(&mut p, src).unwrap();
+        assert!(result.contains("int a;"));
+        assert!(result.contains("int b;"));
+        assert!(!result.contains("don't"));
+        assert!(!result.contains("it's"));
+    }
+
+    #[test]
+    fn multiline_block_comment_preserves_line_count() {
+        let mut p = pp();
+        let src = "int a;\n/* line1\nline2\nline3 */\nint b;";
+        let result = run(&mut p, src).unwrap();
+        // The comment replacement should preserve newlines so line numbers stay correct.
+        // "int a;" on line 1, comment spans lines 2-4, "int b;" on line 5.
+        let lines: Vec<&str> = result.lines().collect();
+        assert!(lines.last().unwrap().contains("int b;"));
+        // There should be at least 5 lines (empty lines where comment was).
+        assert!(lines.len() >= 5, "expected >= 5 lines, got {}", lines.len());
     }
 
     // -- Macro expansion in string literals (should NOT happen) ----------
