@@ -331,7 +331,7 @@ impl CodeGenerator {
             Some(Location::Reg(r)) if *r == target => 0,
             Some(Location::Reg(_)) => 1,
             Some(Location::Memory(_)) => 2,
-            Some(Location::RematImm(_)) => 1,
+            Some(Location::RematImm(_)) | Some(Location::RematLabel(_)) => 1,
             None => 3,
         }
     }
@@ -349,6 +349,23 @@ impl CodeGenerator {
                 self.emit_inst("PUSH H");
             }
             Width::W16 | Width::W32 => {
+                // For remat values (immediates or labels), use LXI B / PUSH B
+                // to avoid clobbering HL (which often holds arg0 for the call).
+                let hl_occupied = self.regalloc.occupant(PhysReg::HL).is_some();
+                if hl_occupied {
+                    if let Some(imm) = self.known_imm(arg) {
+                        self.regalloc.free(arg);
+                        self.emit_inst(&format!("LXI B,{}", (imm & 0xFFFF) as u16));
+                        self.emit_inst("PUSH B");
+                        return;
+                    }
+                    if let Some(lbl) = self.regalloc.label_of(arg).map(|s| s.to_string()) {
+                        self.regalloc.free(arg);
+                        self.emit_inst(&format!("LXI B,{}", lbl));
+                        self.emit_inst("PUSH B");
+                        return;
+                    }
+                }
                 self.ensure_hl(arg);
                 self.emit_inst("PUSH H");
             }
@@ -435,6 +452,17 @@ impl CodeGenerator {
                         }
                         (PhysReg::DE, _) => self.emit_inst(&format!("LXI D,{}", imm16)),
                         (PhysReg::BC, _) => self.emit_inst(&format!("LXI B,{}", imm16)),
+                    }
+                }
+                MoveOp::LoadLabel { dst, label } => {
+                    match dst {
+                        PhysReg::HL => self.emit_inst(&format!("LXI H,{}", label)),
+                        PhysReg::DE => self.emit_inst(&format!("LXI D,{}", label)),
+                        PhysReg::BC => self.emit_inst(&format!("LXI B,{}", label)),
+                        PhysReg::A => {
+                            self.emit_inst(&format!("LXI H,{}", label));
+                            self.emit_inst("MOV A,L");
+                        }
                     }
                 }
                 MoveOp::RegToReg { src, dst } => {
@@ -2311,8 +2339,7 @@ impl CodeGenerator {
     // -- AddrOfGlobal -----------------------------------------------------
 
     fn gen_addr_of_global(&mut self, dst: VReg, name: &str) {
-        self.emit_inst(&format!("LXI H,{}", name));
-        self.mark(dst, PhysReg::HL);
+        self.regalloc.mark_remat_label_only(dst, name.to_string());
     }
 
     // -- PtrAdd -----------------------------------------------------------

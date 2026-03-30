@@ -78,6 +78,8 @@ pub enum Location {
     Memory(String),
     /// Value can be rematerialized as an immediate, avoiding spill reloads.
     RematImm(i64),
+    /// Value can be rematerialized as an address-of-global label.
+    RematLabel(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -97,6 +99,8 @@ pub enum MoveOp {
     Reload { dst: PhysReg, label: String, width: Width },
     /// Materialize an immediate constant directly in `dst`.
     LoadImm { dst: PhysReg, value: i64, width: Width },
+    /// Materialize an address-of-global label directly in `dst`.
+    LoadLabel { dst: PhysReg, label: String },
     /// Register-to-register move.
     RegToReg { src: PhysReg, dst: PhysReg },
 }
@@ -120,6 +124,8 @@ pub struct RegAllocator {
     spill_counter: u32,
     /// Vregs that can be regenerated cheaply as immediates.
     remat_imm: HashMap<u32, i64>,
+    /// Vregs that can be regenerated cheaply as address-of-global labels.
+    remat_label: HashMap<u32, String>,
 }
 
 impl RegAllocator {
@@ -135,6 +141,7 @@ impl RegAllocator {
             reg_contents,
             spill_counter: 0,
             remat_imm: HashMap::new(),
+            remat_label: HashMap::new(),
         }
     }
 
@@ -158,6 +165,11 @@ impl RegAllocator {
 
     // -- core operations --------------------------------------------------
 
+    /// Is the given vreg rematerializable (immediate or label)?
+    fn is_remat(&self, vreg_id: u32) -> bool {
+        self.remat_imm.contains_key(&vreg_id) || self.remat_label.contains_key(&vreg_id)
+    }
+
     /// Generate a fresh spill-slot label.
     fn fresh_spill_label(&mut self) -> String {
         let label = format!("__spill_{}", self.spill_counter);
@@ -172,6 +184,11 @@ impl RegAllocator {
         if let Some(vreg_id) = self.occupant(reg) {
             if let Some(&value) = self.remat_imm.get(&vreg_id) {
                 self.vreg_map.insert(vreg_id, Location::RematImm(value));
+                self.reg_contents.insert(reg, None);
+                return None;
+            }
+            if let Some(lbl) = self.remat_label.get(&vreg_id).cloned() {
+                self.vreg_map.insert(vreg_id, Location::RematLabel(lbl));
                 self.reg_contents.insert(reg, None);
                 return None;
             }
@@ -245,7 +262,11 @@ impl RegAllocator {
             }
             // Evict whoever is in target.
             if let Some(displaced_id) = self.occupant(target) {
-                if let Some(alt) = self.find_free_alternate(target) {
+                // Remat values can be re-generated cheaply; just drop them
+                // instead of moving to another register.
+                if self.is_remat(displaced_id) {
+                    self.spill(target);
+                } else if let Some(alt) = self.find_free_alternate(target) {
                     self.reg_contents.insert(target, None);
                     self.reg_contents.insert(alt, Some(displaced_id));
                     self.vreg_map.insert(displaced_id, Location::Reg(alt));
@@ -270,7 +291,9 @@ impl RegAllocator {
 
         // Vreg is in memory — evict target, then reload.
         if let Some(displaced_id) = self.occupant(target) {
-            if let Some(alt) = self.find_free_alternate(target) {
+            if self.is_remat(displaced_id) {
+                self.spill(target);
+            } else if let Some(alt) = self.find_free_alternate(target) {
                 self.reg_contents.insert(target, None);
                 self.reg_contents.insert(alt, Some(displaced_id));
                 self.vreg_map.insert(displaced_id, Location::Reg(alt));
@@ -303,6 +326,11 @@ impl RegAllocator {
                 value,
                 width: vreg.width,
             });
+        } else if let Some(Location::RematLabel(lbl)) = self.vreg_map.get(&vreg.id).cloned() {
+            ops.push(MoveOp::LoadLabel {
+                dst: target,
+                label: lbl,
+            });
         }
         // (If vreg is completely new, the code gen will emit a load itself;
         // we just mark the register occupied.)
@@ -321,6 +349,7 @@ impl RegAllocator {
             self.vreg_map.remove(&vreg.id);
         }
         self.remat_imm.remove(&vreg.id);
+        self.remat_label.remove(&vreg.id);
     }
 
     /// Mark a physical register as directly occupied by `vreg` (e.g. after
@@ -331,7 +360,9 @@ impl RegAllocator {
         // over a memory spill (e.g. move HL → DE rather than SHLD __spill_N).
         if let Some(old_id) = self.occupant(reg) {
             if old_id != vreg.id {
-                if let Some(alt) = self.find_free_alternate(reg) {
+                if self.is_remat(old_id) {
+                    self.spill(reg);
+                } else if let Some(alt) = self.find_free_alternate(reg) {
                     self.reg_contents.insert(reg, None);
                     self.reg_contents.insert(alt, Some(old_id));
                     self.vreg_map.insert(old_id, Location::Reg(alt));
@@ -344,6 +375,7 @@ impl RegAllocator {
         self.reg_contents.insert(reg, Some(vreg.id));
         self.vreg_map.insert(vreg.id, Location::Reg(reg));
         self.remat_imm.remove(&vreg.id);
+        self.remat_label.remove(&vreg.id);
         ops
     }
 
@@ -371,6 +403,20 @@ impl RegAllocator {
         self.remat_imm.get(&vreg.id).copied()
     }
 
+    /// Record `vreg` as a rematerializable address-of-global label WITHOUT
+    /// allocating a physical register.  The load is deferred until the vreg
+    /// is actually needed in a register, allowing `ensure_de` to emit
+    /// `LXI D,label` directly instead of `LXI H,label; XCHG`.
+    pub fn mark_remat_label_only(&mut self, vreg: VReg, label: String) {
+        self.vreg_map.insert(vreg.id, Location::RematLabel(label.clone()));
+        self.remat_label.insert(vreg.id, label);
+    }
+
+    /// Return the tracked label for a vreg when rematerialization is available.
+    pub fn label_of(&self, vreg: VReg) -> Option<&str> {
+        self.remat_label.get(&vreg.id).map(|s| s.as_str())
+    }
+
     /// Save all live registers to memory (e.g. before a CALL).
     /// Returns the list of spill operations.
     pub fn save_all(&mut self) -> Vec<MoveOp> {
@@ -387,6 +433,7 @@ impl RegAllocator {
     pub fn reset(&mut self) {
         self.vreg_map.clear();
         self.remat_imm.clear();
+        self.remat_label.clear();
         for val in self.reg_contents.values_mut() {
             *val = None;
         }
@@ -432,6 +479,11 @@ impl RegAllocator {
                 dst: reg,
                 value: *value,
                 width: vreg.width,
+            });
+        } else if let Some(Location::RematLabel(lbl)) = self.vreg_map.get(&vreg.id) {
+            ops.push(MoveOp::LoadLabel {
+                dst: reg,
+                label: lbl.clone(),
             });
         }
         self.reg_contents.insert(reg, Some(vreg.id));
