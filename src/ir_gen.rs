@@ -607,7 +607,8 @@ impl IrGenerator {
 
             StmtKind::Return(val) => {
                 if let Some(expr) = val {
-                    let (reg, _) = self.gen_expr(expr);
+                    let (reg, val_ty) = self.gen_expr(expr);
+                    let reg = self.maybe_cast(reg, &val_ty, &self.current_return_type.clone());
                     self.emit(IrOp::ret(Some(reg)));
                 } else {
                     self.emit(IrOp::ret(None));
