@@ -79,6 +79,68 @@ fn render_line(line: &Line) -> String {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Return `true` if register A is dead starting at `lines[start]`.
+/// Scans forward until A is written (→ dead, true) or read (→ live, false).
+/// Stops at labels, jumps, calls, and returns (conservative → false).
+fn is_a_dead_after(lines: &[Line], start: usize) -> bool {
+    for line in &lines[start..] {
+        match line {
+            Line::Instruction { opcode, operands } => {
+                let ops = operands.trim();
+                // Instructions that write A without reading it first.
+                if matches!(opcode.as_str(), "MVI" | "LDA" | "XRA" | "LDAX")
+                    && (opcode != "MVI" || ops.starts_with("A,"))
+                    && (opcode != "XRA" || ops == "A")
+                {
+                    return true;
+                }
+                // MOV A,r writes A (but reads the source, not A itself,
+                // unless it's MOV A,A which is a no-op).
+                if opcode == "MOV" && ops.starts_with("A,") {
+                    return true;
+                }
+                // Instructions that read A: STA, STAX, any ALU with A implicit,
+                // MOV r,A, CMP, ANA, ORA, XRA, ADD, ADC, SUB, SBB, ADI, etc.
+                if reads_a(opcode, ops) {
+                    return false;
+                }
+                // Labels/jumps/calls/ret: bail conservatively.
+                if matches!(opcode.as_str(), "JMP" | "JZ" | "JNZ" | "JC" | "JNC"
+                    | "JM" | "JP" | "JPE" | "JPO" | "CALL" | "RET" | "RZ" | "RNZ"
+                    | "RC" | "RNC" | "CZ" | "CNZ" | "HLT" | "PCHL") {
+                    return false;
+                }
+            }
+            Line::Label(_) => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Does this instruction read the A register?
+fn reads_a(opcode: &str, ops: &str) -> bool {
+    match opcode {
+        "STA" | "STAX" | "CMA" | "RAL" | "RAR" | "RLC" | "RRC"
+        | "ADI" | "ACI" | "SUI" | "SBI" | "ANI" | "ORI" | "XRI" | "CPI"
+        | "DAA" | "PUSH" => {
+            // PUSH PSW reads A; other PUSHes don't.
+            opcode != "PUSH" || ops == "PSW"
+        }
+        "MOV" => {
+            // MOV r,A or MOV M,A reads A.
+            let parts: Vec<&str> = ops.split(',').collect();
+            parts.len() == 2 && parts[1].trim() == "A"
+        }
+        "ADD" | "ADC" | "SUB" | "SBB" | "ANA" | "ORA" | "XRA" | "CMP" => {
+            // These use A as accumulator (implicit read).
+            // ADD A, XRA A etc. also read A.
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Return `true` if the opcode is an unconditional jump.
 fn is_unconditional_jump(opcode: &str) -> bool {
     opcode == "JMP"
@@ -378,6 +440,38 @@ fn rule_two_window(lines: &mut Vec<Line>) -> bool {
                 lines.remove(i + 1);
                 changed = true;
                 continue;
+            }
+
+            // --- Rule 45: MOV A,X / MOV Y,A → MOV Y,X (A bypass) -------
+            // When A is used only as a temporary to transfer between
+            // registers (including M), replace with a direct MOV.
+            // Only applies when A is dead after the pair.
+            (
+                Line::Instruction { opcode: op_a, operands: ops_a },
+                Line::Instruction { opcode: op_b, operands: ops_b },
+            ) if op_a == "MOV" && op_b == "MOV" => {
+                let a_parts: Vec<&str> = ops_a.trim().split(',').collect();
+                let b_parts: Vec<&str> = ops_b.trim().split(',').collect();
+                if a_parts.len() == 2 && b_parts.len() == 2
+                    && a_parts[0].trim() == "A"
+                    && b_parts[1].trim() == "A"
+                    && b_parts[0].trim() != "A"
+                {
+                    let src = a_parts[1].trim();
+                    let dst = b_parts[0].trim();
+                    // MOV M,M is invalid on 8080; skip that case.
+                    if !(src == "M" && dst == "M")
+                        && is_a_dead_after(lines, i + 2)
+                    {
+                        lines[i] = Line::Instruction {
+                            opcode: "MOV".to_string(),
+                            operands: format!("{},{}", dst, src),
+                        };
+                        lines.remove(i + 1);
+                        changed = true;
+                        continue;
+                    }
+                }
             }
 
             _ => {}
