@@ -24,14 +24,20 @@ memcpy:
 	ORA C
 	RZ			; count == 0 → done
 	PUSH H			; save dest for return
+	; Use DCR C / DCR B loop (faster than DCX B / ORA)
+	INR B			; pre-increment B for outer loop
+	XRA A
+	ORA C
+	JZ __memcpy_outer
 __memcpy_loop:
 	LDAX D			; A = *(src)
 	MOV M,A			; *(dest) = A
 	INX H
 	INX D
-	DCX B
-	MOV A,B
-	ORA C
+	DCR C
+	JNZ __memcpy_loop
+__memcpy_outer:
+	DCR B
 	JNZ __memcpy_loop
 	POP H			; return original dest
 	RET
@@ -57,14 +63,19 @@ memset:
 	RZ			; n == 0 → done
 	PUSH H			; save dest for return
 	MOV A,E			; A = fill value (low byte of c)
+	INR B			; pre-increment B for outer loop
+	PUSH PSW		; save fill value + check if C==0
+	XRA A
+	ORA C
+	POP PSW
+	JZ __memset_outer
 __memset_loop:
 	MOV M,A
 	INX H
-	DCX B
-	PUSH PSW		; save A (fill value)
-	MOV A,B
-	ORA C
-	POP PSW			; restore A
+	DCR C
+	JNZ __memset_loop
+__memset_outer:
+	DCR B
 	JNZ __memset_loop
 	POP H			; return original dest
 	RET
