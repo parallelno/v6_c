@@ -23,7 +23,7 @@ self-modifying code support via the `* + 1` location-counter pattern.
 ### Grammar
 
 ```
-asm_stmt := 'asm' '(' param_list ')' [ '->' type ] '{' raw_text '}'
+asm_stmt := 'asm' '(' param_list ')' '{' raw_text '}'
           | 'asm' '{' raw_text '}'                         // raw mode, clobber-all
 param_list := [ param_decl [ ',' param_decl ]* ]
 param_decl := type c_variable_name
@@ -44,14 +44,6 @@ void send_data(char *buf, int len) {
         };
     }
 }
-```
-
-With return value:
-```c
-int x = 10, y = 20;
-int z = asm(int x, int y) -> int {  // x → HL, y → DE, result ← HL
-    DAD D
-};
 ```
 
 No params, no return (side-effect only):
@@ -224,9 +216,9 @@ it from both SHLD and LXI.*
 ### Mode 2 — Parameterized Asm Block
 
 The `asm(params) { }` block appears among other C statements.  The compiler
-places the named C variables into registers per the calling convention,
-emits the raw asm, and picks up the return value.  **Only the declared
-registers are spilled/invalidated.**
+places the named C variables into registers per the calling convention
+and emits the raw asm.  **Only the declared registers are
+spilled/invalidated.**
 
 **Register mapping (same as calling convention):**
 
@@ -234,15 +226,13 @@ registers are spilled/invalidated.**
 |-----------|--------|-------|
 | arg 0     | HL     | A     |
 | arg 1     | DE     | —     |
-| return    | HL     | A     |
 
 **Compiler behaviour:**
-1. Compute `touched = param_registers ∪ return_register`
+1. Compute `touched = param_registers`
 2. Spill only registers in `touched` that hold live C values
 3. Place input C variables into the correct registers
 4. Emit the asm block text verbatim
-5. Invalidate all registers in `touched` (except return, which gets
-   fresh tracking for the result variable)
+5. Invalidate all registers in `touched`
 6. Registers **not** in `touched` keep their compiler tracking
 
 **Examples:**
@@ -255,21 +245,14 @@ asm(char val) {
 };
 
 // Add two ints — HL and DE touched, A/BC preserved
-int z = asm(int x, int y) -> int {
+int x = 10, y = 20;
+asm(int x, int y) {
     DAD D
 };
 
 // Enable interrupts — nothing touched, all regs preserved
 asm() {
     EI
-};
-
-// Read memory — HL touched (input+output), others trust programmer
-int val = asm(int ptr) -> int {
-    MOV A, M
-    INX H
-    MOV H, M
-    MOV L, A
 };
 ```
 
@@ -280,12 +263,11 @@ int val = asm(int ptr) -> int {
 | `asm { }`                         | all          | all         |
 | `asm() { }`                       | none         | none        |
 | `asm(char x) { }`                | A            | A only      |
-| `asm(int a) -> int { }`          | HL           | HL only     |
-| `asm(int a, int b) -> int { }`   | HL, DE       | HL, DE only |
-| `asm(char x) -> char { }`        | A            | A only      |
+| `asm(int a) { }`                 | HL           | HL only     |
+| `asm(int a, int b) { }`          | HL, DE       | HL, DE only |
 
 **Note:** If the asm body internally uses registers beyond the declared
-params/return (e.g. touches A when only HL is declared), that is the
+params (e.g. touches A when only HL is declared), that is the
 programmer's responsibility — same trust model as full-body asm functions.
 
 ### Mode 2b — Raw Asm Block (clobber-all fallback)
@@ -386,8 +368,6 @@ AsmBlock {
     /// Typed input parameters: (C variable name, type).
     /// Empty for raw `asm { }` blocks.
     params: Vec<(String, CType)>,
-    /// Return type, if `-> type` was specified.  `None` for void.
-    return_type: Option<CType>,
 },
 ```
 
@@ -409,7 +389,6 @@ fn parse_asm_block(&mut self) -> Option<Stmt> {
 
     // Parse optional parameter list: asm(int x, char y)
     let mut params = Vec::new();
-    let mut return_type = None;
     let has_parens = self.check(&TokenKind::LParen);
 
     if has_parens {
@@ -423,18 +402,12 @@ fn parse_asm_block(&mut self) -> Option<Stmt> {
             }
         }
         self.advance();  // consume ')'
-
-        // Parse optional return type: -> int
-        if self.check(&TokenKind::Arrow) {
-            self.advance();  // consume '->'
-            return_type = Some(self.parse_type_name()?);
-        }
     }
 
     self.expect(&TokenKind::LBrace)?;
     let code = self.collect_raw_until_matching_brace();
 
-    Some(Stmt::new(StmtKind::AsmBlock { code, params, return_type }, loc))
+    Some(Stmt::new(StmtKind::AsmBlock { code, params }, loc))
 }
 ```
 
@@ -450,8 +423,8 @@ token.  The `Token` struct already stores `loc` (line/col); we add the
 byte offset so the parser can index into the source.
 
 **Arrow token:** The `->` token may need to be added to the lexer if not
-already present.  Alternatively, parse `Minus` + `Gt` as a two-token
-sequence.
+already present.  Currently unused by asm blocks but reserved for
+potential future expression-form asm.
 
 ### Phase 4 — IR Generation
 
@@ -460,17 +433,15 @@ sequence.
 Handle `StmtKind::AsmBlock`:
 
 ```rust
-StmtKind::AsmBlock { code, params, return_type } => {
+StmtKind::AsmBlock { code, params } => {
     // Resolve each param name to its vreg in the current scope.
     let input_vregs: Vec<(VReg, CType)> = params.iter().map(|(name, ty)| {
         let vreg = self.lookup_var(name);  // existing C variable
         (vreg, ty.clone())
     }).collect();
-    let ret_ty = return_type.clone();
     self.emit(IrOp::InlineAsm {
         code: code.clone(),
         inputs: input_vregs,
-        return_type: ret_ty,
     });
 }
 ```
@@ -516,8 +487,6 @@ InlineAsm {
     /// Typed input vregs from the parameter list.
     /// Empty for raw `asm { }` blocks.
     inputs: Vec<(VReg, CType)>,
-    /// Return type if `-> type` was specified.
-    return_type: Option<CType>,
 },
 ```
 
@@ -581,8 +550,8 @@ fn gen_function(&mut self, func: &IrFunction) {
 In `gen_op()`, handle `IrOp::InlineAsm`:
 
 ```rust
-IrOp::InlineAsm { code, inputs, return_type } => {
-    if inputs.is_empty() && return_type.is_none() {
+IrOp::InlineAsm { code, inputs } => {
+    if inputs.is_empty() {
         // Raw mode: clobber all.
         self.regalloc.spill_all(&mut self.output);
         self.a_mirrors = None;
@@ -592,8 +561,8 @@ IrOp::InlineAsm { code, inputs, return_type } => {
         self.regalloc.invalidate_all();
     } else {
         // Parameterized mode: precise register tracking.
-        // 1. Determine touched registers from params + return.
-        let touched = compute_touched_regs(inputs, return_type);
+        // 1. Determine touched registers from params.
+        let touched = compute_touched_regs(inputs);
 
         // 2. Spill only touched registers that hold live values.
         for &reg in &touched {
@@ -621,19 +590,9 @@ IrOp::InlineAsm { code, inputs, return_type } => {
             self.emit(line.to_string());
         }
 
-        // 5. Invalidate touched regs; track return value.
+        // 5. Invalidate touched regs.
         for &reg in &touched {
             self.regalloc.invalidate(reg);
-        }
-        if let Some(ret_ty) = return_type {
-            let ret_reg = if ret_ty.size_of() == Some(1) {
-                PhysReg::A
-            } else {
-                PhysReg::HL
-            };
-            // The destination vreg is assigned by IR gen;
-            // mark it as living in ret_reg.
-            self.mark(dst_vreg, ret_reg);
         }
     }
 }
@@ -738,7 +697,6 @@ prefix private labels with the function name to avoid collisions.
 | `unterminated asm block`             | Parser: EOF before closing brace      |
 | `unknown variable 'x' in asm params` | IR gen: param name not in scope       |
 | `asm block supports max 2 params`   | IR gen: >2 params exceeds registers   |
-| `expected '->' or '{'`              | Parser: garbage after ')'             |
 | Assembly errors (syntax, labels)     | Assembler: post-compilation           |
 
 The compiler does **not** validate asm content — that's the assembler's
@@ -768,9 +726,9 @@ script could automate this.
 | File              | Change                                               |
 |-------------------|------------------------------------------------------|
 | `src/lexer.rs`    | Add `Asm` token, keyword registration                |
-| `src/ast.rs`      | Add `StmtKind::AsmBlock { code, params, return_type }`|
-| `src/parser.rs`   | `parse_asm_block()`, param list, `->`, raw-text       |
-| `src/ir.rs`       | Add `IrOp::InlineAsm { inputs, return_type }`, `is_asm_body` |
+| `src/ast.rs`      | Add `StmtKind::AsmBlock { code, params }`            |
+| `src/parser.rs`   | `parse_asm_block()`, param list, raw-text              |
+| `src/ir.rs`       | Add `IrOp::InlineAsm { inputs }`, `is_asm_body`       |
 | `src/ir_gen.rs`   | Handle `AsmBlock`, full-body detection, param resolve  |
 | `src/callgraph.rs`| Skip param allocation for asm funcs, scan for CALLs   |
 | `src/codegen.rs`  | Selective spill for params, full-body fast path        |
@@ -779,18 +737,15 @@ script could automate this.
 
 ## Testing Strategy
 
-Unit test files under `tests/unit/`:
+Unit test files under `tests/unit/asm/`:
 
 1. **`asm_full_body.c`** — Full-body asm function (add, negate, identity)
-2. **`asm_param.c`** — Parameterized asm blocks (OUT, add, read-memory)
-3. **`asm_param_return.c`** — Asm blocks with `-> type` return values
-4. **`asm_raw.c`** — Raw `asm { }` blocks using `_l_` labels
-5. **`asm_strlib.c`** — Hand-optimized string functions (strlen, strcmp)
-6. **`asm_selfmod.c`** — Self-modifying code patterns with `* + 1`
-7. **`asm_loop.c`** — Asm block inside a loop (verify register preservation)
+2. **`asm_param.c`** — Parameterized asm blocks (OUT, add)
+3. **`asm_raw.c`** — Raw `asm { }` blocks using `_l_` labels
+4. **`asm_selfmod.c`** — Self-modifying code patterns with `* + 1`
+5. **`asm_loop.c`** — Asm block inside a loop (verify register preservation)
 
 Verify by compiling to `.asm` and checking:
 - Parameterized blocks only spill declared registers
 - Full-body functions have no compiler prologue
-- Return values are tracked correctly after asm blocks
 - Raw blocks spill/invalidate everything
