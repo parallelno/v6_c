@@ -1381,10 +1381,12 @@ pub fn peephole_optimize(lines: Vec<String>) -> Vec<String> {
     for s in &lines {
         if s.trim() == "; __asm_begin__" {
             in_asm = true;
+            parsed.push(Line::Comment(s.clone()));
             continue;
         }
         if s.trim() == "; __asm_end__" {
             in_asm = false;
+            parsed.push(Line::Comment(s.clone()));
             continue;
         }
         if in_asm {

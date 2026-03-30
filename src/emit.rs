@@ -617,8 +617,22 @@ fn extract_main_body(code_lines: &[String]) -> (Vec<String>, Vec<String>) {
     };
 
     let mut main_end = rest.len();
+    let mut in_asm_block = false;
     for i in main_start + 1..rest.len() {
         let trimmed = rest[i].trim();
+        // Track inline-asm marker comments to avoid treating asm labels
+        // as function boundaries.
+        if trimmed == "; __asm_begin__" {
+            in_asm_block = true;
+            continue;
+        }
+        if trimmed == "; __asm_end__" {
+            in_asm_block = false;
+            continue;
+        }
+        if in_asm_block {
+            continue;
+        }
         // Section delimiter comment — end of this function's code region.
         if trimmed.starts_with("; ---") {
             main_end = i;
