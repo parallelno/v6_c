@@ -61,6 +61,8 @@ pub enum TokenKind {
     Stack,
     /// `__global` – mark a variable/function as globally allocated.
     Global,
+    /// `asm` – inline assembly block.
+    Asm,
 
     // -- Literals --------------------------------------------------------
     /// Identifier (variable / function / type name).
@@ -229,6 +231,7 @@ impl fmt::Display for TokenKind {
             Self::Ellipsis => "...",
             Self::Hash => "#",
             Self::PreprocDirective => "preprocessor directive",
+            Self::Asm => "asm",
             Self::Eof => "end of file",
         };
         f.write_str(s)
@@ -340,6 +343,7 @@ fn keyword_kind(word: &str) -> Option<TokenKind> {
         "while" => Some(TokenKind::While),
         "__stack" => Some(TokenKind::Stack),
         "__global" => Some(TokenKind::Global),
+        "asm" => Some(TokenKind::Asm),
         _ => None,
     }
 }
