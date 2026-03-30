@@ -329,6 +329,17 @@ pub enum StmtKind {
     Default {
         stmt: Box<Stmt>,
     },
+
+    /// Inline assembly block.
+    AsmBlock {
+        /// Raw assembly text between `{ }`.
+        code: String,
+        /// Typed input parameters: (C variable name, type).
+        /// Empty for raw `asm { }` blocks.
+        params: Vec<(String, CType)>,
+        /// Return type, if `-> type` was specified.  `None` for void.
+        return_type: Option<CType>,
+    },
 }
 
 // ---------------------------------------------------------------------------

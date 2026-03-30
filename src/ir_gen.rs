@@ -669,6 +669,11 @@ impl IrGenerator {
                 self.emit(IrOp::label(lbl));
                 self.gen_stmt(stmt);
             }
+
+            StmtKind::AsmBlock { .. } => {
+                // TODO: Phase 4 — inline asm IR generation
+                unimplemented!("inline asm not yet implemented");
+            }
         }
     }
 
