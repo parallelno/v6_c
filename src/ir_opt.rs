@@ -1441,11 +1441,54 @@ fn constant_fold_and_propagate(func: &mut IrFunction) -> bool {
                 new_body.push(instr.clone());
             }
             IrOp::LoadLocal { dst, .. }
-            | IrOp::LoadPtr { dst, .. }
-            | IrOp::AddrOfGlobal { dst, .. }
-            | IrOp::PtrAdd { dst, .. } => {
+            | IrOp::LoadPtr { dst, .. } => {
                 constants.remove(&dst.id);
                 new_body.push(instr.clone());
+            }
+
+            IrOp::AddrOfGlobal { dst, .. } => {
+                constants.remove(&dst.id);
+                new_body.push(instr.clone());
+            }
+
+            IrOp::PtrAdd { dst, ptr, offset, element_size } => {
+                let off_val = constants.get(&offset.id).copied();
+                // PtrAdd(base, 0, _) → Copy(dst, base) — adding 0 is useless.
+                if off_val == Some(0) {
+                    new_body.push(IrInstr {
+                        op: IrOp::Copy { dst: *dst, src: *ptr },
+                        line: instr.line,
+                    });
+                    changed = true;
+                } else {
+                    // Check if ptr comes from AddrOfGlobal and offset is constant.
+                    // Fold: AddrOfGlobal(name) + const*element_size → AddrOfGlobal("name+N")
+                    let addr_name = new_body.iter().rev().find_map(|i| {
+                        if let IrOp::AddrOfGlobal { dst: d, name } = &i.op {
+                            if d.id == ptr.id { Some(name.clone()) } else { None }
+                        } else {
+                            None
+                        }
+                    });
+                    if let (Some(name), Some(off)) = (addr_name, off_val) {
+                        let byte_offset = off * (*element_size as i64);
+                        let folded_name = if byte_offset > 0 {
+                            format!("{}+{}", name, byte_offset)
+                        } else if byte_offset < 0 {
+                            format!("{}{}", name, byte_offset)
+                        } else {
+                            name
+                        };
+                        new_body.push(IrInstr {
+                            op: IrOp::AddrOfGlobal { dst: *dst, name: folded_name },
+                            line: instr.line,
+                        });
+                        changed = true;
+                    } else {
+                        constants.remove(&dst.id);
+                        new_body.push(instr.clone());
+                    }
+                }
             }
 
             IrOp::Cast { dst, src, to_type } => {
@@ -3696,26 +3739,25 @@ fn is_power_of_two(val: i64) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Sink W8 loads — move single-use W8 memory loads closer to their consumer
+// Sink loads — move single-use pure instructions closer to their consumer
 // ---------------------------------------------------------------------------
 //
-// After copy propagation and dead-store elimination, two consecutive W8
-// LoadPtr instructions (from separate variable declarations) both need the
-// accumulator (PhysReg::A).  The first value gets spilled because the second
-// load clobbers A, even when the first value isn't consumed until much later.
+// After constant folding and DCE, instructions like `AddrOfGlobal`,
+// `LoadImm`, `LoadPtr` (W8), and `LoadGlobal` (W8) may be defined far from
+// their single use.  On the 8080, long live ranges cause unnecessary spills
+// because there are very few registers (e.g. W8 values all share A).
 //
-// This pass sinks such loads to just before their single use, which enables
-// the codegen's deferred-M mechanism: the last load before a W8 ALU op
-// emits `LXI H,addr` instead of `LDA addr`, and the ALU op uses `ADD M`.
+// This pass sinks such instructions to just before their consumer within the
+// same basic block.  It follows single-use dependency chains: if a LoadPtr's
+// pointer operand is also single-use (e.g. an AddrOfGlobal), both are sunk
+// together.
 //
-// Only loads within the same basic block (no intervening labels or jumps)
-// are moved, and only when no intervening instruction could modify the
-// memory being loaded.
+// This enables the codegen's deferred-M mechanism and avoids register
+// conflicts between addresses that share HL.
 
 fn sink_w8_loads(func: &mut IrFunction) -> bool {
     // Build def-site map and use-site lists.
     let mut def_site: HashMap<u32, usize> = HashMap::new();
-    // use_sites: vreg_id → list of instruction indices that read it.
     let mut use_sites: HashMap<u32, Vec<usize>> = HashMap::new();
 
     for (idx, instr) in func.body.iter().enumerate() {
@@ -3727,44 +3769,22 @@ fn sink_w8_loads(func: &mut IrFunction) -> bool {
         }
     }
 
-    // Find sinkable loads: W8 LoadPtr whose result has exactly one use,
-    // and that use is more than 1 instruction away.
-    // Also collect the LoadImm dependency (the ptr operand) if it is
-    // single-use and defined immediately before the LoadPtr.
-    struct SinkCandidate {
-        /// Index of the LoadPtr (or LoadGlobal) instruction.
-        load_idx: usize,
-        /// Optional index of the LoadImm that feeds the pointer.
-        dep_idx: Option<usize>,
-        /// Index of the single-use consumer.
-        use_idx: usize,
+    /// Check if an instruction is "sinkable": pure, cheap, and produces a
+    /// single result with no side effects.
+    fn is_sinkable(op: &IrOp) -> bool {
+        matches!(
+            op,
+            IrOp::LoadImm { .. }
+                | IrOp::AddrOfGlobal { .. }
+                | IrOp::LoadPtr { .. }
+                | IrOp::LoadGlobal { .. }
+        )
     }
-    let mut candidates: Vec<SinkCandidate> = Vec::new();
 
-    for (idx, instr) in func.body.iter().enumerate() {
-        let (dst, ptr_id_opt) = match &instr.op {
-            IrOp::LoadPtr { dst, ptr } if dst.width == Width::W8 => (*dst, Some(ptr.id)),
-            IrOp::LoadGlobal { dst, .. } if dst.width == Width::W8 => (*dst, None),
-            _ => continue,
-        };
-
-        // Must have exactly one use.
-        let uses = match use_sites.get(&dst.id) {
-            Some(u) if u.len() == 1 => u,
-            _ => continue,
-        };
-        let use_idx = uses[0];
-
-        // Must be more than 1 instruction away (otherwise can_defer already
-        // handles it at the codegen level).
-        if use_idx <= idx + 1 {
-            continue;
-        }
-
-        // Safety check: no intervening instruction between load_idx+1..use_idx
-        // may be a basic-block boundary or a memory-writing operation that
-        // could alias the load.
-        let safe = func.body[idx + 1..use_idx].iter().all(|i| {
+    /// Check if no intervening instruction between `from`+1 and `to` is a
+    /// BB boundary or memory-writing op that could alias loads.
+    fn safe_to_sink(body: &[IrInstr], from: usize, to: usize) -> bool {
+        body[from + 1..to].iter().all(|i| {
             !matches!(
                 i.op,
                 IrOp::StoreGlobal { .. }
@@ -3777,33 +3797,82 @@ fn sink_w8_loads(func: &mut IrFunction) -> bool {
                     | IrOp::JumpIfFalse { .. }
                     | IrOp::Return { .. }
             )
-        });
-        if !safe {
+        })
+    }
+
+    struct SinkCandidate {
+        /// Indices of instructions to remove (in original order).
+        remove_indices: Vec<usize>,
+        /// Instructions to insert (in order), just before `use_idx`.
+        insert_instrs: Vec<IrInstr>,
+        /// Where to insert them.
+        use_idx: usize,
+    }
+    let mut candidates: Vec<SinkCandidate> = Vec::new();
+
+    for (idx, instr) in func.body.iter().enumerate() {
+        if !is_sinkable(&instr.op) {
+            continue;
+        }
+        let dst = match get_dst_vreg(&instr.op) {
+            Some(d) => d,
+            None => continue,
+        };
+
+        // Must have exactly one use.
+        let uses = match use_sites.get(&dst.id) {
+            Some(u) if u.len() == 1 => u,
+            _ => continue,
+        };
+        let use_idx = uses[0];
+
+        // Must be more than 1 instruction away.
+        if use_idx <= idx + 1 {
             continue;
         }
 
-        // Check if the ptr operand (for LoadPtr) is a single-use LoadImm
-        // defined at idx-1 that can be sunk together.
-        let dep_idx = ptr_id_opt.and_then(|pid| {
-            let d = def_site.get(&pid)?;
-            // Must be defined just before the LoadPtr.
-            if *d + 1 != idx {
-                return None;
+        // Safety: no memory-writing/control-flow barriers in between.
+        if !safe_to_sink(&func.body, idx, use_idx) {
+            continue;
+        }
+
+        // Collect the chain of single-use dependencies to also sink.
+        // Walk backwards from instr: if each source operand is defined by
+        // a sinkable, single-use instruction just before, include it.
+        let mut chain: Vec<usize> = vec![idx];
+        let mut cur_idx = idx;
+        loop {
+            let src_ids = collect_src_vregs(&func.body[cur_idx].op);
+            if src_ids.len() != 1 {
+                break;
             }
-            // Must be a LoadImm with a single use (the LoadPtr itself).
-            if !matches!(func.body[*d].op, IrOp::LoadImm { .. }) {
-                return None;
+            let src_id = src_ids[0];
+            let dep_idx = match def_site.get(&src_id) {
+                Some(&d) if d + 1 == cur_idx => d,
+                _ => break,
+            };
+            if !is_sinkable(&func.body[dep_idx].op) {
+                break;
             }
-            let ptr_uses = use_sites.get(&pid)?;
-            if ptr_uses.len() != 1 {
-                return None;
+            // Dep must also be single-use.
+            match use_sites.get(&src_id) {
+                Some(u) if u.len() == 1 => {}
+                _ => break,
             }
-            Some(*d)
-        });
+            // Dep must also be safe to sink across the same range.
+            if !safe_to_sink(&func.body, dep_idx, use_idx) {
+                break;
+            }
+            chain.push(dep_idx);
+            cur_idx = dep_idx;
+        }
+
+        // chain is [idx, dep1, dep2, ...] — reverse so deps come first.
+        chain.reverse();
 
         candidates.push(SinkCandidate {
-            load_idx: idx,
-            dep_idx,
+            remove_indices: chain.clone(),
+            insert_instrs: chain.iter().map(|&i| func.body[i].clone()).collect(),
             use_idx,
         });
     }
@@ -3812,25 +3881,22 @@ fn sink_w8_loads(func: &mut IrFunction) -> bool {
         return false;
     }
 
-    // Apply sinks: rebuild the instruction list.
-    // Collect the indices of instructions that will be removed from their
-    // original positions and inserted before their use sites.
+    // Deduplicate: if an instruction index appears in multiple candidates'
+    // remove sets, skip the redundant candidate.
     let mut remove_set: HashSet<usize> = HashSet::new();
-    // Map: use_idx → instructions to insert before it.
     let mut insert_before: HashMap<usize, Vec<IrInstr>> = HashMap::new();
-
     for cand in &candidates {
-        remove_set.insert(cand.load_idx);
-        let mut to_insert = Vec::new();
-        if let Some(d) = cand.dep_idx {
-            remove_set.insert(d);
-            to_insert.push(func.body[d].clone());
+        // Check for conflicts: if any index is already claimed, skip.
+        if cand.remove_indices.iter().any(|i| remove_set.contains(i)) {
+            continue;
         }
-        to_insert.push(func.body[cand.load_idx].clone());
+        for &i in &cand.remove_indices {
+            remove_set.insert(i);
+        }
         insert_before
             .entry(cand.use_idx)
             .or_default()
-            .extend(to_insert);
+            .extend(cand.insert_instrs.iter().cloned());
     }
 
     let mut new_body = Vec::with_capacity(func.body.len());

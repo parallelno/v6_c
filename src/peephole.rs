@@ -928,6 +928,30 @@ fn rule_elim_redundant_lxi_h(lines: &mut Vec<Line>) -> bool {
                         changed = true;
                         continue;
                     }
+                    // Rule 44: HL differs by a small offset (±1..±3) — use
+                    // INX H / DCX H instead of a fresh LXI H which costs 3
+                    // bytes.  INX/DCX H is 1 byte each, so up to 3 is a win.
+                    if let Some(ref old_imm) = hl_numeric {
+                        if let Some(delta) = compute_lxi_delta(old_imm, imm) {
+                            let abs = delta.unsigned_abs();
+                            if abs >= 1 && abs <= 3 {
+                                let inst = if delta > 0 { "INX" } else { "DCX" };
+                                // Replace the LXI with abs copies of INX/DCX H.
+                                lines.remove(i);
+                                for k in 0..abs {
+                                    lines.insert(i + k as usize, Line::Instruction {
+                                        opcode: inst.to_string(),
+                                        operands: "H".to_string(),
+                                    });
+                                }
+                                hl_numeric = Some(imm.to_string());
+                                hl_from_addr = None;
+                                changed = true;
+                                i += abs as usize;
+                                continue;
+                            }
+                        }
+                    }
                     hl_numeric = Some(imm.to_string());
                     hl_from_addr = None; // New numeric value, not yet stored anywhere.
                 } else if opcode == "SHLD" {
@@ -960,6 +984,56 @@ fn rule_elim_redundant_lxi_h(lines: &mut Vec<Line>) -> bool {
         i += 1;
     }
     changed
+}
+
+/// Compute the delta `new_val - old_val` for two LXI H operand strings.
+///
+/// Returns `Some(delta)` when both operands share the same symbolic base
+/// (e.g. `_g_array+1` vs `_g_array+3` → delta=2, or `_g_array` vs
+/// `_g_array+1` → delta=1).  Pure numeric operands (e.g. `1001` vs `1002`)
+/// are also supported.  Returns `None` when the bases differ or parsing fails.
+fn compute_lxi_delta(old: &str, new: &str) -> Option<i64> {
+    let (old_base, old_off) = parse_base_offset(old);
+    let (new_base, new_off) = parse_base_offset(new);
+    if old_base != new_base {
+        return None;
+    }
+    Some(new_off - old_off)
+}
+
+/// Split an LXI H operand into (base_label, numeric_offset).
+/// `"_g_array+1"` → `("_g_array", 1)`
+/// `"_g_array"`   → `("_g_array", 0)`
+/// `"1001"`       → `("", 1001)`
+fn parse_base_offset(s: &str) -> (&str, i64) {
+    // Pure numeric: try parsing the whole string.
+    if let Ok(n) = s.parse::<i64>() {
+        return ("", n);
+    }
+    // Also try hex (0x...).
+    if s.starts_with("0x") || s.starts_with("0X") {
+        if let Ok(n) = i64::from_str_radix(&s[2..], 16) {
+            return ("", n);
+        }
+    }
+    // Symbol+offset: look for '+' or '-' after a label.
+    if let Some(pos) = s.rfind('+') {
+        let base = &s[..pos];
+        if let Ok(off) = s[pos + 1..].trim().parse::<i64>() {
+            return (base, off);
+        }
+    }
+    if let Some(pos) = s.rfind('-') {
+        // Don't split on '-' that is part of the label name (e.g. at position 0).
+        if pos > 0 {
+            let base = &s[..pos];
+            if let Ok(off) = s[pos + 1..].trim().parse::<i64>() {
+                return (base, -off);
+            }
+        }
+    }
+    // Plain label, offset = 0.
+    (s, 0)
 }
 
 /// Returns `true` if the instruction may write to the HL register pair.
