@@ -1046,6 +1046,7 @@ fn compute_value_ranges(func: &IrFunction) -> HashMap<u32, ValueRangeFact> {
                     facts.remove(&d.id);
                 }
             }
+            IrOp::InlineAsm { .. } => {}
         }
     }
 
@@ -2039,6 +2040,11 @@ fn collect_used_vregs(body: &[IrInstr]) -> HashSet<u32> {
                 used.insert(ptr.id);
                 used.insert(offset.id);
             }
+            IrOp::InlineAsm { inputs, .. } => {
+                for (vreg, _) in inputs {
+                    used.insert(vreg.id);
+                }
+            }
         }
     }
     used
@@ -2805,6 +2811,11 @@ fn remap_op(
             args: args.iter().map(|a| rv(*a)).collect(),
             dst: dst.map(|d| rv(d)),
         },
+        IrOp::InlineAsm { code, inputs, return_type } => IrOp::InlineAsm {
+            code: code.clone(),
+            inputs: inputs.iter().map(|(v, t)| (rv(*v), t.clone())).collect(),
+            return_type: return_type.clone(),
+        },
     }
 }
 
@@ -2977,6 +2988,9 @@ fn collect_src_vregs(op: &IrOp) -> Vec<u32> {
         IrOp::PtrAdd { ptr, offset, .. } => {
             srcs.push(ptr.id);
             srcs.push(offset.id);
+        }
+        IrOp::InlineAsm { inputs, .. } => {
+            for (v, _) in inputs { srcs.push(v.id); }
         }
     }
     srcs

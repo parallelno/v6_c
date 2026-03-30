@@ -273,6 +273,17 @@ pub enum IrOp {
         offset: VReg,
         element_size: u16,
     },
+
+    /// Inline assembly block.  The raw assembly text is emitted verbatim.
+    InlineAsm {
+        /// Raw assembly text.
+        code: String,
+        /// Typed input vregs from the parameter list.
+        /// Empty for raw `asm { }` blocks (clobber-all).
+        inputs: Vec<(VReg, CType)>,
+        /// Return type if `-> type` was specified.
+        return_type: Option<CType>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -340,6 +351,10 @@ pub struct IrFunction {
 
     /// When `true`, this function accepts a variable number of arguments.
     pub is_variadic: bool,
+
+    /// When `true`, the entire function body is a single `asm { }` block.
+    /// The code generator skips the standard prologue/epilogue.
+    pub is_asm_body: bool,
 }
 
 impl IrFunction {
@@ -353,6 +368,7 @@ impl IrFunction {
             return_type,
             is_stack_mode: false,
             is_variadic: false,
+            is_asm_body: false,
         }
     }
 

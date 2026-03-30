@@ -201,6 +201,22 @@ impl IrGenerator {
             .map_or(false, |i| matches!(i.op, IrOp::Return { .. }))
     }
 
+    /// Check if a function body is a single raw `asm { }` block (no params).
+    /// Used to detect full-body asm functions that need zero compiler overhead.
+    fn is_asm_only_body(body: &Stmt) -> bool {
+        match &body.kind {
+            StmtKind::AsmBlock { params, .. } if params.is_empty() => true,
+            StmtKind::Compound(stmts) => {
+                stmts.len() == 1
+                    && matches!(
+                        stmts[0].kind,
+                        StmtKind::AsmBlock { ref params, .. } if params.is_empty()
+                    )
+            }
+            _ => false,
+        }
+    }
+
     fn get_or_create_user_label(&mut self, name: &str) -> Label {
         if let Some(&lbl) = self.user_labels.get(name) {
             lbl
@@ -504,6 +520,9 @@ impl IrGenerator {
         self.func_return_types
             .insert(name.to_string(), return_type.clone());
 
+        // Detect full-body asm function: body is a single raw asm block.
+        let is_asm_body = Self::is_asm_only_body(body_stmt);
+
         // Build IR params: each parameter gets a static label and a store at
         // function entry.
         let mut ir_params = Vec::new();
@@ -520,12 +539,16 @@ impl IrGenerator {
             });
 
             let label = format!("_l_{}_{}", name, param_name);
-            self.globals.push(GlobalVar {
-                name: label.clone(),
-                ty: param.ty.clone(),
-                init: None,
-            });
-            self.emit(IrOp::store_global(&label, vreg));
+
+            if !is_asm_body {
+                // Normal function: allocate storage and emit store for each param.
+                self.globals.push(GlobalVar {
+                    name: label.clone(),
+                    ty: param.ty.clone(),
+                    init: None,
+                });
+                self.emit(IrOp::store_global(&label, vreg));
+            }
             self.local_syms
                 .insert(param_name, (label, param.ty.clone()));
         }
@@ -553,6 +576,7 @@ impl IrGenerator {
             return_type: return_type.clone(),
             is_stack_mode: false,
             is_variadic,
+            is_asm_body,
         });
     }
 
@@ -670,9 +694,32 @@ impl IrGenerator {
                 self.gen_stmt(stmt);
             }
 
-            StmtKind::AsmBlock { .. } => {
-                // TODO: Phase 4 — inline asm IR generation
-                unimplemented!("inline asm not yet implemented");
+            StmtKind::AsmBlock { code, params, return_type } => {
+                let inputs: Vec<(VReg, CType)> = params
+                    .iter()
+                    .filter_map(|(name, ty)| {
+                        if let Some((label, sym_ty)) = self.local_syms.get(name).cloned() {
+                            let vreg = self.vreg_alloc.alloc_for_type(&sym_ty);
+                            self.emit(IrOp::load_global(vreg, &label));
+                            Some((vreg, ty.clone()))
+                        } else if let Some((label, sym_ty)) = self.global_syms.get(name).cloned() {
+                            let vreg = self.vreg_alloc.alloc_for_type(&sym_ty);
+                            self.emit(IrOp::load_global(vreg, &label));
+                            Some((vreg, ty.clone()))
+                        } else {
+                            self.errors.push(IrGenError {
+                                line: stmt.loc.line,
+                                message: format!("unknown variable '{}' in asm params", name),
+                            });
+                            None
+                        }
+                    })
+                    .collect();
+                self.emit(IrOp::InlineAsm {
+                    code: code.clone(),
+                    inputs,
+                    return_type: return_type.clone(),
+                });
             }
         }
     }

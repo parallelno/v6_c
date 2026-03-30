@@ -818,6 +818,26 @@ impl CodeGenerator {
             IrOp::PtrAdd { dst, ptr, offset, element_size } => {
                 self.gen_ptr_add(*dst, *ptr, *offset, *element_size);
             }
+
+            // -- inline assembly ------------------------------------------
+            IrOp::InlineAsm { code, .. } => {
+                // Spill all live registers, emit raw asm, clobber all.
+                for reg in [PhysReg::HL, PhysReg::DE, PhysReg::BC, PhysReg::A] {
+                    if let Some(op) = self.regalloc.spill(reg) {
+                        self.emit_moves(&[op]);
+                    }
+                }
+                self.a_mirrors = None;
+                for line in code.lines() {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        self.emit_inst(trimmed);
+                    }
+                }
+                self.regalloc.clobber_regs(&[
+                    PhysReg::HL, PhysReg::DE, PhysReg::BC, PhysReg::A,
+                ]);
+            }
         }
     }
 }
@@ -2583,6 +2603,11 @@ fn collect_op_src_ids(op: &IrOp) -> Vec<u32> {
         IrOp::PtrAdd { ptr, offset, .. } => {
             ids.push(ptr.id);
             ids.push(offset.id);
+        }
+        IrOp::InlineAsm { inputs, .. } => {
+            for (vreg, _) in inputs {
+                ids.push(vreg.id);
+            }
         }
     }
     ids
