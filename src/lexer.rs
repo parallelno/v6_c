@@ -793,7 +793,7 @@ impl<'src> Lexer<'src> {
         let start = self.pos;
 
         while let Some(ch) = self.peek() {
-            if ch.is_ascii_alphanumeric() || ch == b'_' {
+            if ch.is_ascii_alphanumeric() || ch == b'_' || ch == b'@' {
                 self.advance();
             } else {
                 break;
@@ -984,7 +984,7 @@ impl<'src> Lexer<'src> {
 
         let mut tok = if ch == b'#' && was_line_start {
             Ok(self.lex_preproc_directive(start_line, start_col))
-        } else if ch.is_ascii_alphabetic() || ch == b'_' {
+        } else if ch.is_ascii_alphabetic() || ch == b'_' || ch == b'@' {
             Ok(self.lex_ident_or_keyword(start_line, start_col))
         } else if ch.is_ascii_digit() {
             self.lex_number(start_line, start_col)

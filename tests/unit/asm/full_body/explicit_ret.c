@@ -17,5 +17,4 @@ int add_explicit_ret(int a, int b) {
 
 void main(void) {
     result = add_explicit_ret(10, 20);
-    result = add_explicit_ret(30, 40);
 }

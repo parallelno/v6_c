@@ -12,7 +12,7 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
 }
 
-fn compile(subfolder: &str, name: &str) -> (bool, String) {
+fn compile(subfolder: &str, name: &str) -> String {
     let root = repo_root();
     let src = root.join("tests").join("unit").join("asm").join(subfolder).join(name);
     let out_dir = root.join("out").join("tests").join("unit").join("asm").join(subfolder);
@@ -20,19 +20,42 @@ fn compile(subfolder: &str, name: &str) -> (bool, String) {
     let base = name.trim_end_matches(".c");
     let asm_path = out_dir.join(format!("{}.asm", base));
 
+    // Step 1: compile .c → .asm with v6c
     let output = Command::new(env!("CARGO_BIN_EXE_v6c"))
-        .arg(src)
+        .arg(&src)
         .arg("-o")
         .arg(&asm_path)
         .output()
         .expect("failed to run v6c");
 
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    if !output.status.success() {
-        return (false, stderr);
-    }
+    assert!(
+        output.status.success(),
+        "v6c failed on {}:\n{}",
+        src.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
     let asm = fs::read_to_string(&asm_path).unwrap_or_default();
-    (true, asm)
+
+    // Step 2: assemble .asm with v6asm (must succeed with no errors)
+    let v6asm = root.join("dependencies").join("v6asm").join("v6asm.exe");
+    if v6asm.exists() {
+        let asm_file = format!("{}.asm", base);
+        let v6asm_out = Command::new(&v6asm)
+            .arg(&asm_file)
+            .arg("--lst")
+            .current_dir(&out_dir)
+            .output()
+            .expect("failed to run v6asm");
+        assert!(
+            v6asm_out.status.success(),
+            "v6asm failed on {}:\n{}\n{}",
+            asm_path.display(),
+            String::from_utf8_lossy(&v6asm_out.stdout),
+            String::from_utf8_lossy(&v6asm_out.stderr)
+        );
+    }
+
+    asm
 }
 
 // ---------------------------------------------------------------------------
@@ -41,8 +64,7 @@ fn compile(subfolder: &str, name: &str) -> (bool, String) {
 
 #[test]
 fn full_body_add() {
-    let (ok, asm) = compile("full_body", "add.c");
-    assert!(ok, "compilation failed");
+    let asm = compile("full_body", "add.c");
     assert!(asm.contains("DAD D"), "add's DAD D should appear in output");
     assert!(
         !asm.contains("SHLD _l_add_"),
@@ -52,24 +74,19 @@ fn full_body_add() {
 
 #[test]
 fn full_body_identity() {
-    let (ok, _) = compile("full_body", "identity.c");
-    assert!(ok, "compilation failed");
+    compile("full_body", "identity.c");
 }
 
 #[test]
 fn full_body_negate_byte() {
-    let (ok, asm) = compile("full_body", "negate_byte.c");
-    assert!(ok, "compilation failed");
-    // Verify the asm body (CMA + INR A) appears in the output
+    let asm = compile("full_body", "negate_byte.c");
     assert!(asm.contains("CMA"), "negate_byte should contain CMA");
     assert!(asm.contains("INR A"), "negate_byte should contain INR A");
 }
 
 #[test]
 fn full_body_explicit_ret() {
-    let (ok, asm) = compile("full_body", "explicit_ret.c");
-    assert!(ok, "compilation failed");
-    // The asm body contains DAD D + RET; verify both are present
+    let asm = compile("full_body", "explicit_ret.c");
     assert!(asm.contains("DAD D"), "explicit_ret should contain DAD D");
     assert!(asm.contains("\tRET") || asm.contains("\tHLT"),
         "explicit_ret should contain RET or HLT (control flow terminator)");
@@ -77,16 +94,26 @@ fn full_body_explicit_ret() {
 
 #[test]
 fn full_body_internal_labels() {
-    let (ok, asm) = compile("full_body", "internal_labels.c");
-    assert!(ok, "compilation failed");
+    let asm = compile("full_body", "internal_labels.c");
     assert!(asm.contains("_abs_done:"), "internal label _abs_done should be present");
 }
 
 #[test]
 fn full_body_embedded_data() {
-    let (ok, asm) = compile("full_body", "embedded_data.c");
-    assert!(ok, "compilation failed");
+    let asm = compile("full_body", "embedded_data.c");
     assert!(asm.contains("_lc_data:"), "data label _lc_data should be present");
+}
+
+#[test]
+fn full_body_embedded_data_local_labels() {
+    let asm = compile("full_body", "embedded_data_local_labels.c");
+    assert!(asm.contains("@data:"), "v6asm local label @data should be present");
+}
+
+#[test]
+fn full_body_remove_unused_asm_funcs() {
+    let asm = compile("full_body", "remove_unused_asm funcs.c");
+    assert!(!asm.contains("unused_func"), "unused asm function should be eliminated");
 }
 
 // ---------------------------------------------------------------------------
@@ -95,35 +122,30 @@ fn full_body_embedded_data() {
 
 #[test]
 fn param_char() {
-    let (ok, asm) = compile("param", "char_param.c");
-    assert!(ok, "compilation failed");
+    let asm = compile("param", "char_param.c");
     assert!(asm.contains("OUT 42"), "OUT 42 should appear in output");
 }
 
 #[test]
 fn param_int() {
-    let (ok, _) = compile("param", "int_param.c");
-    assert!(ok, "compilation failed");
+    compile("param", "int_param.c");
 }
 
 #[test]
 fn param_two() {
-    let (ok, asm) = compile("param", "two_params.c");
-    assert!(ok, "compilation failed");
+    let asm = compile("param", "two_params.c");
     assert!(asm.contains("DAD D"), "DAD D should appear from two-param add");
 }
 
 #[test]
 fn param_empty() {
-    let (ok, asm) = compile("param", "empty_params.c");
-    assert!(ok, "compilation failed");
+    let asm = compile("param", "empty_params.c");
     assert!(asm.contains("\tEI"), "EI should appear from empty-param block");
 }
 
 #[test]
 fn param_char_sta() {
-    let (ok, asm) = compile("param", "char_sta.c");
-    assert!(ok, "compilation failed");
+    let asm = compile("param", "char_sta.c");
     assert!(asm.contains("STA"), "STA should appear in output");
 }
 
@@ -133,8 +155,7 @@ fn param_char_sta() {
 
 #[test]
 fn raw_local_labels() {
-    let (ok, asm) = compile("raw", "local_labels.c");
-    assert!(ok, "compilation failed");
+    let asm = compile("raw", "local_labels.c");
     assert!(
         asm.contains("_l_sum_via_asm_a"),
         "should reference _l_sum_via_asm_a"
@@ -143,23 +164,20 @@ fn raw_local_labels() {
 
 #[test]
 fn raw_global_labels() {
-    let (ok, asm) = compile("raw", "global_labels.c");
-    assert!(ok, "compilation failed");
+    let asm = compile("raw", "global_labels.c");
     assert!(asm.contains("_g_global_a"), "should reference _g_global_a");
     assert!(asm.contains("_g_global_b"), "should reference _g_global_b");
 }
 
 #[test]
 fn raw_internal_labels() {
-    let (ok, asm) = compile("raw", "internal_labels.c");
-    assert!(ok, "compilation failed");
+    let asm = compile("raw", "internal_labels.c");
     assert!(asm.contains("_ctt_loop:"), "internal loop label should be present");
 }
 
 #[test]
 fn raw_multi_block() {
-    let (ok, _) = compile("raw", "multi_block.c");
-    assert!(ok, "compilation failed");
+    compile("raw", "multi_block.c");
 }
 
 // ---------------------------------------------------------------------------
@@ -168,22 +186,19 @@ fn raw_multi_block() {
 
 #[test]
 fn selfmod_equate() {
-    let (ok, asm) = compile("selfmod", "equate.c");
-    assert!(ok, "compilation failed");
+    let asm = compile("selfmod", "equate.c");
     assert!(asm.contains("= * + 1"), "self-mod equate pattern should be present");
 }
 
 #[test]
 fn selfmod_storage() {
-    let (ok, asm) = compile("selfmod", "storage.c");
-    assert!(ok, "compilation failed");
+    let asm = compile("selfmod", "storage.c");
     assert!(asm.contains("_rt_temp:"), ".STORAGE label should be present");
 }
 
 #[test]
 fn selfmod_reg_only() {
-    let (ok, _) = compile("selfmod", "reg_only.c");
-    assert!(ok, "compilation failed");
+    compile("selfmod", "reg_only.c");
 }
 
 // ---------------------------------------------------------------------------
@@ -192,27 +207,23 @@ fn selfmod_reg_only() {
 
 #[test]
 fn loop_raw_while() {
-    let (ok, _) = compile("loop", "raw_while.c");
-    assert!(ok, "compilation failed");
+    compile("loop", "raw_while.c");
 }
 
 #[test]
 fn loop_param_for() {
-    let (ok, _) = compile("loop", "param_for.c");
-    assert!(ok, "compilation failed");
+    compile("loop", "param_for.c");
 }
 
 #[test]
 fn loop_noclobber() {
-    let (ok, asm) = compile("loop", "noclobber.c");
-    assert!(ok, "compilation failed");
+    let asm = compile("loop", "noclobber.c");
     assert!(asm.contains("\tNOP"), "NOP inside asm block should survive peephole");
 }
 
 #[test]
 fn loop_nested() {
-    let (ok, _) = compile("loop", "nested.c");
-    assert!(ok, "compilation failed");
+    compile("loop", "nested.c");
 }
 
 // ---------------------------------------------------------------------------

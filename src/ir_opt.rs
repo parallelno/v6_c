@@ -60,6 +60,11 @@ pub fn optimize(program: &mut IrProgram) {
         optimize_function(func, profile);
     }
 
+    // Remove functions unreachable from main (only when main exists).
+    if program.functions.iter().any(|f| f.name == "main") {
+        remove_dead_functions(program);
+    }
+
     // Run loop-specific passes once (outside the fixed-point loop to avoid
     // interaction between passes causing unbounded IR growth).
     for func in &mut program.functions {
@@ -149,6 +154,8 @@ fn function_specialization(program: &mut IrProgram, profile: OptProfile) {
         .filter(|f| {
             !f.name.contains("__spec_")
                 && !f.is_variadic
+                && !f.is_asm_body
+                && !has_inline_asm(f)
                 && f.body.len() <= size_limit
                 && !calls_self(f)
         })
@@ -2415,23 +2422,8 @@ fn jump_threading(func: &mut IrFunction) -> bool {
 ///
 /// Reachability is seeded from every function that is never the target of a
 /// `Call` instruction in any other function (i.e., all potential entry points,
-/// not just "main").  This keeps unit-test helper functions (which are also
-/// never called by anyone) alive while still removing fully-inlined callees.
+/// Remove functions that are never reachable from `main`.
 fn remove_dead_functions(program: &mut IrProgram) {
-    // Build set of function names that appear as Call targets.
-    let called: HashSet<String> = program
-        .functions
-        .iter()
-        .flat_map(|f| f.body.iter())
-        .filter_map(|instr| {
-            if let IrOp::Call { func_name, .. } = &instr.op {
-                Some(func_name.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
-
     // Build a call-graph adjacency list (caller → callees) indexed by name.
     let func_map: HashMap<String, usize> = program
         .functions
@@ -2440,14 +2432,9 @@ fn remove_dead_functions(program: &mut IrProgram) {
         .map(|(i, f)| (f.name.clone(), i))
         .collect();
 
-    // Seed live set with all functions that are not called by anyone.
+    // Seed the live set from "main" and walk the call graph.
     let mut live: HashSet<String> = HashSet::new();
-    let mut worklist: Vec<String> = program
-        .functions
-        .iter()
-        .filter(|f| !called.contains(&f.name))
-        .map(|f| f.name.clone())
-        .collect();
+    let mut worklist: Vec<String> = vec!["main".to_string()];
 
     while let Some(name) = worklist.pop() {
         if !live.insert(name.clone()) {
@@ -2499,6 +2486,8 @@ fn inline_expand(program: &mut IrProgram) {
             f.name != "main"
                 && f.body.len() <= INLINE_THRESHOLD
                 && !calls_self(f)
+                && !f.is_asm_body
+                && !has_inline_asm(f)
         })
         .map(|f| f.name.clone())
         .collect();
@@ -2617,6 +2606,11 @@ fn calls_self(func: &IrFunction) -> bool {
     func.body.iter().any(|instr| {
         matches!(&instr.op, IrOp::Call { func_name, .. } if func_name == &func.name)
     })
+}
+
+/// Check if a function contains any raw inline asm blocks.
+fn has_inline_asm(func: &IrFunction) -> bool {
+    func.body.iter().any(|instr| matches!(&instr.op, IrOp::InlineAsm { .. }))
 }
 
 /// Get the destination vreg of any instruction (for computing max vreg ids).

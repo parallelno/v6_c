@@ -1231,11 +1231,30 @@ fn rule_elim_unused_storage(lines: &mut Vec<Line>) -> bool {
     let mut referenced: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     for line in lines.iter() {
-        if let Line::Instruction { operands, .. } = line {
-            let trimmed = operands.trim();
-            if !trimmed.is_empty() {
-                referenced.insert(trimmed.to_string());
+        match line {
+            Line::Instruction { operands, .. } => {
+                let trimmed = operands.trim();
+                if !trimmed.is_empty() {
+                    referenced.insert(trimmed.to_string());
+                }
             }
+            // Inline asm (Raw) lines may reference compiler-local labels.
+            Line::Raw(text) => {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    // Extract potential label references (words starting with '_').
+                    let mut rest = trimmed;
+                    while let Some(pos) = rest.find('_') {
+                        let tail = &rest[pos..];
+                        let end = tail
+                            .find(|c: char| c.is_whitespace() || c == ',' || c == '+' || c == ';')
+                            .unwrap_or(tail.len());
+                        referenced.insert(tail[..end].to_string());
+                        rest = &tail[1..];
+                    }
+                }
+            }
+            _ => {}
         }
     }
 

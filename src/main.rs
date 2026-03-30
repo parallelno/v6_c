@@ -413,7 +413,12 @@ mod tests {
             void main(void) { arg1 = compute(arg1, 4); }
         "#;
         let out = compile_source(src, "test.c", &[]).expect("compilation failed");
-        assert!(has_line(&out, "compute:"), "must have compute function");
+        let has_compute = has_line(&out, "compute:");
+        let has_spec = out.iter().any(|l| l.contains("__spec_compute"));
+        assert!(
+            has_compute || has_spec,
+            "must have compute function or a specialized clone"
+        );
         let calls_compute = has_line(&out, "CALL compute");
         let calls_specialized_compute = out
             .iter()
