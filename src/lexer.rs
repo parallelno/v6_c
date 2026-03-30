@@ -254,6 +254,8 @@ pub struct Token {
     pub line: u32,
     /// 1-based column (byte offset within the line) where the token starts.
     pub column: u32,
+    /// Byte offset into the source where the token starts.
+    pub byte_offset: usize,
 }
 
 impl Token {
@@ -263,6 +265,7 @@ impl Token {
             value: value.into(),
             line,
             column,
+            byte_offset: 0,
         }
     }
 }
@@ -964,9 +967,12 @@ impl<'src> Lexer<'src> {
         self.skip_whitespace_and_comments()?;
 
         if self.at_end() {
-            return Ok(Token::new(TokenKind::Eof, "", self.line, self.column));
+            let mut tok = Token::new(TokenKind::Eof, "", self.line, self.column);
+            tok.byte_offset = self.pos;
+            return Ok(tok);
         }
 
+        let start_pos = self.pos;
         let start_line = self.line;
         let start_col = self.column;
         let was_line_start = self.at_line_start;
@@ -976,33 +982,22 @@ impl<'src> Lexer<'src> {
 
         let ch = self.peek().unwrap();
 
-        // Preprocessor directive: # at the start of a line.
-        if ch == b'#' && was_line_start {
-            return Ok(self.lex_preproc_directive(start_line, start_col));
-        }
+        let mut tok = if ch == b'#' && was_line_start {
+            Ok(self.lex_preproc_directive(start_line, start_col))
+        } else if ch.is_ascii_alphabetic() || ch == b'_' {
+            Ok(self.lex_ident_or_keyword(start_line, start_col))
+        } else if ch.is_ascii_digit() {
+            self.lex_number(start_line, start_col)
+        } else if ch == b'\'' {
+            self.lex_char_literal(start_line, start_col)
+        } else if ch == b'"' {
+            self.lex_string_literal(start_line, start_col)
+        } else {
+            self.lex_operator(start_line, start_col)
+        }?;
 
-        // Identifier or keyword.
-        if ch.is_ascii_alphabetic() || ch == b'_' {
-            return Ok(self.lex_ident_or_keyword(start_line, start_col));
-        }
-
-        // Number literal.
-        if ch.is_ascii_digit() {
-            return self.lex_number(start_line, start_col);
-        }
-
-        // Character literal.
-        if ch == b'\'' {
-            return self.lex_char_literal(start_line, start_col);
-        }
-
-        // String literal.
-        if ch == b'"' {
-            return self.lex_string_literal(start_line, start_col);
-        }
-
-        // Operators and punctuation.
-        self.lex_operator(start_line, start_col)
+        tok.byte_offset = start_pos;
+        Ok(tok)
     }
 }
 

@@ -235,7 +235,7 @@ fn compile_multi(inputs: &[String], include_paths: &[String]) -> Result<Vec<Stri
         let tokens = lexer::tokenize(&processed)
             .map_err(|e| format!("{}:{}:{}: {}", path, e.line, e.column, e.message))?;
 
-        let program = parser::Parser::new(&tokens)
+        let program = parser::Parser::new(&tokens, &processed)
             .parse()
             .map_err(|errs| {
                 errs.iter()
@@ -313,7 +313,7 @@ fn compile_source(source: &str, filename: &str, include_paths: &[String]) -> Res
         .map_err(|e| format!("{}:{}:{}: {}", filename, e.line, e.column, e.message))?;
 
     // 3. Parser
-    let program = parser::Parser::new(&tokens)
+    let program = parser::Parser::new(&tokens, &processed)
         .parse()
         .map_err(|errs| {
             errs.iter()

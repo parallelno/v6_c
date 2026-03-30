@@ -63,11 +63,13 @@ pub struct Parser<'t> {
     enum_constants: HashMap<String, i64>,
     /// Set when a `#pragma unroll` was seen and should apply to the next loop.
     pending_unroll_hint: bool,
+    /// Original source text for raw-text extraction (asm blocks).
+    source: &'t str,
 }
 
 impl<'t> Parser<'t> {
-    /// Create a new parser over the given token slice.
-    pub fn new(tokens: &'t [Token]) -> Self {
+    /// Create a new parser over the given token slice and source text.
+    pub fn new(tokens: &'t [Token], source: &'t str) -> Self {
         Self {
             tokens,
             pos: 0,
@@ -78,6 +80,7 @@ impl<'t> Parser<'t> {
             enum_tags: HashMap::new(),
             enum_constants: HashMap::new(),
             pending_unroll_hint: false,
+            source,
         }
     }
 
@@ -708,6 +711,7 @@ impl<'t> Parser<'t> {
             TokenKind::Switch => self.parse_switch_stmt(),
             TokenKind::Case => self.parse_case_stmt(),
             TokenKind::Default => self.parse_default_stmt(),
+            TokenKind::Asm => self.parse_asm_block(),
             // Label: `identifier ':'`
             TokenKind::Ident if self.peek_ahead(1).kind == TokenKind::Colon => {
                 self.parse_label_stmt()
@@ -995,6 +999,95 @@ impl<'t> Parser<'t> {
         self.expect(&TokenKind::Colon);
         let stmt = Box::new(self.parse_stmt()?);
         Some(Stmt::new(StmtKind::Default { stmt }, loc))
+    }
+
+    // -- Inline assembly ------------------------------------------------
+
+    fn parse_asm_block(&mut self) -> Option<Stmt> {
+        let loc = self.current_loc();
+        self.advance(); // consume `asm`
+
+        // Parse optional parameter list: asm(int x, char y)
+        let mut params = Vec::new();
+        let mut return_type = None;
+        let has_parens = self.check(&TokenKind::LParen);
+
+        if has_parens {
+            self.advance(); // consume '('
+            while !self.check(&TokenKind::RParen) && !self.at_eof() {
+                let ty = self.parse_type_name()?;
+                if !self.check(&TokenKind::Ident) {
+                    self.error(format!(
+                        "expected variable name in asm parameter, found `{}`",
+                        self.peek().kind
+                    ));
+                    return None;
+                }
+                let name = self.advance().value.clone();
+                params.push((name, ty));
+                if !self.check(&TokenKind::RParen) {
+                    self.expect(&TokenKind::Comma)?;
+                }
+            }
+            self.expect(&TokenKind::RParen)?;
+
+            // Parse optional return type: -> int
+            if self.check(&TokenKind::Arrow) {
+                self.advance(); // consume '->'
+                return_type = Some(self.parse_type_name()?);
+            }
+        }
+
+        self.expect(&TokenKind::LBrace)?;
+        let code = self.collect_raw_until_matching_brace();
+
+        // Consume optional trailing `;` (asm blocks are compound-like
+        // statements but the grammar allows a trailing semicolon).
+        self.eat(&TokenKind::Semicolon);
+
+        Some(Stmt::new(StmtKind::AsmBlock { code, params, return_type }, loc))
+    }
+
+    /// Collect raw source text from the current position until the matching
+    /// closing brace, counting brace depth.  Uses the byte offsets stored in
+    /// tokens and the original source text to preserve assembly formatting,
+    /// labels, comments, and special characters.
+    fn collect_raw_until_matching_brace(&mut self) -> String {
+        // The `{` has already been consumed.  The byte offset of the next
+        // token (or the current lexer position) tells us where the asm body
+        // starts in the source.
+        let body_start = self.peek().byte_offset;
+
+        // Walk tokens counting brace depth to find the matching `}`.
+        let mut depth: u32 = 1;
+        while !self.at_eof() {
+            match self.peek().kind {
+                TokenKind::LBrace => {
+                    depth += 1;
+                    self.advance();
+                }
+                TokenKind::RBrace => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let body_end = self.peek().byte_offset;
+                        self.advance(); // consume the closing '}'
+                        // Extract from source if available.
+                        if !self.source.is_empty() && body_end <= self.source.len() {
+                            let raw = &self.source[body_start..body_end];
+                            return raw.trim_matches('\n').to_string();
+                        }
+                        // Fallback: empty.
+                        return String::new();
+                    }
+                    self.advance();
+                }
+                _ => {
+                    self.advance();
+                }
+            }
+        }
+        self.error("unterminated asm block".to_string());
+        String::new()
     }
 
     /// Parse a constant expression (integer literal, enum constant, or simple
@@ -1868,12 +1961,12 @@ mod tests {
 
     /// Convenience: parse tokens and unwrap.
     fn parse_ok(tokens: Vec<Token>) -> Program {
-        Parser::new(&tokens).parse().expect("parse should succeed")
+        Parser::new(&tokens, "").parse().expect("parse should succeed")
     }
 
     /// Convenience: parse tokens and expect errors.
     fn parse_err(tokens: Vec<Token>) -> Vec<ParseError> {
-        Parser::new(&tokens).parse().expect_err("parse should fail")
+        Parser::new(&tokens, "").parse().expect_err("parse should fail")
     }
 
     // ===================================================================
@@ -2029,7 +2122,7 @@ mod tests {
         let last_line = expr_tokens.last().map(|t| t.line).unwrap_or(1);
         expr_tokens.push(tok(TokenKind::Semicolon, ";", last_line, 99));
         expr_tokens.push(eof(last_line));
-        let mut parser = Parser::new(&expr_tokens);
+        let mut parser = Parser::new(&expr_tokens, "");
         let e = parser.parse_expr().expect("expr parse failed");
         assert!(
             parser.errors.is_empty(),
