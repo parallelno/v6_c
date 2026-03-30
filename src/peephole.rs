@@ -29,6 +29,8 @@ enum Line {
     Comment(String),
     /// A blank / whitespace-only line.
     Empty,
+    /// A raw line from an inline-asm block — never touched by peephole rules.
+    Raw(String),
 }
 
 /// Parse a raw assembly string into a [`Line`].
@@ -72,6 +74,7 @@ fn render_line(line: &Line) -> String {
         }
         Line::Comment(text) => text.clone(),
         Line::Empty => String::new(),
+        Line::Raw(s) => s.clone(),
     }
 }
 
@@ -510,8 +513,8 @@ fn rule_dead_code_after_jump(lines: &mut Vec<Line>) -> bool {
                 // Delete everything after this JMP until we hit a label.
                 let mut j = i + 1;
                 while j < lines.len() && !is_label(&lines[j]) {
-                    // Keep comments – they're harmless and often useful.
-                    if matches!(lines[j], Line::Comment(_) | Line::Empty) {
+                    // Keep comments, raw asm lines – they're harmless.
+                    if matches!(lines[j], Line::Comment(_) | Line::Empty | Line::Raw(_)) {
                         j += 1;
                         continue;
                     }
@@ -876,7 +879,7 @@ fn rule_jump_threading(lines: &mut Vec<Line>) -> bool {
         let mut j = idx + 1;
         while j < lines.len() {
             match &lines[j] {
-                Line::Label(_) | Line::Comment(_) | Line::Empty => { j += 1; }
+                Line::Label(_) | Line::Comment(_) | Line::Empty | Line::Raw(_) => { j += 1; }
                 Line::Instruction { opcode, operands } => {
                     if opcode == "JMP" {
                         forward.insert((*name).to_string(), operands.trim().to_string());
@@ -1372,7 +1375,24 @@ fn next_significant_line(lines: &[Line], mut start: usize) -> Option<usize> {
 /// assert_eq!(opt, vec!["\tSHLD _x"]);
 /// ```
 pub fn peephole_optimize(lines: Vec<String>) -> Vec<String> {
-    let mut parsed: Vec<Line> = lines.iter().map(|s| parse_line(s)).collect();
+    // Parse lines, but protect inline-asm content between markers as Raw.
+    let mut parsed: Vec<Line> = Vec::with_capacity(lines.len());
+    let mut in_asm = false;
+    for s in &lines {
+        if s.trim() == "; __asm_begin__" {
+            in_asm = true;
+            continue;
+        }
+        if s.trim() == "; __asm_end__" {
+            in_asm = false;
+            continue;
+        }
+        if in_asm {
+            parsed.push(Line::Raw(s.clone()));
+        } else {
+            parsed.push(parse_line(s));
+        }
+    }
 
     loop {
         if !apply_rules(&mut parsed) {

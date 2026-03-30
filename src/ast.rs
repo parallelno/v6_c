@@ -339,6 +339,9 @@ pub enum StmtKind {
         params: Vec<(String, CType)>,
         /// Return type, if `-> type` was specified.  `None` for void.
         return_type: Option<CType>,
+        /// True for raw `asm { }` (no parens) — clobber-all mode.
+        /// False for `asm(...) { }` — selective spill based on params.
+        is_raw: bool,
     },
 }
 

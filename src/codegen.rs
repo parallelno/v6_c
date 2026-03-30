@@ -662,6 +662,32 @@ impl CodeGenerator {
         self.emit_comment(&format!("function {}", func.name));
         self.emit_label(&func.name);
 
+        // Full-body asm function: emit raw asm with no prologue/regalloc.
+        if func.is_asm_body {
+            self.emit("; __asm_begin__".to_string());
+            for instr in func.body.iter() {
+                if let IrOp::InlineAsm { code, .. } = &instr.op {
+                    for line in code.lines() {
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() {
+                            // Labels and equates go at column 0; instructions indented.
+                            if trimmed.ends_with(':') || trimmed.contains(" = ") || trimmed.starts_with('.') {
+                                self.emit(trimmed.to_string());
+                            } else {
+                                self.emit_inst(trimmed);
+                            }
+                        }
+                    }
+                }
+            }
+            // Add RET if the asm doesn't end with a control-flow instruction.
+            if !self.asm_ends_with_control_flow(func) {
+                self.emit_inst("RET");
+            }
+            self.emit("; __asm_end__".to_string());
+            return;
+        }
+
         // For variadic functions, capture the address of the first variadic
         // arg on the stack. At entry: SP → [ret_addr], stack args start at SP+2.
         if func.is_variadic {
@@ -690,6 +716,34 @@ impl CodeGenerator {
         {
             self.emit_inst("RET");
         }
+    }
+
+    /// Check if the last non-empty line in a full-body asm function is a
+    /// control-flow instruction (RET, JMP, etc.), meaning no auto-RET needed.
+    fn asm_ends_with_control_flow(&self, func: &IrFunction) -> bool {
+        for instr in func.body.iter().rev() {
+            if let IrOp::InlineAsm { code, .. } = &instr.op {
+                let last_mnemonic = code
+                    .lines()
+                    .rev()
+                    .filter_map(|line| {
+                        let trimmed = line.split(';').next().unwrap_or("").trim();
+                        if trimmed.is_empty() {
+                            return None;
+                        }
+                        trimmed.split_whitespace().next().map(|s| s.to_uppercase())
+                    })
+                    .next();
+                if let Some(m) = last_mnemonic {
+                    return matches!(
+                        m.as_str(),
+                        "RET" | "RZ" | "RNZ" | "RC" | "RNC" | "RP" | "RM" | "RPE" | "RPO"
+                            | "JMP" | "PCHL"
+                    );
+                }
+            }
+        }
+        false
     }
 
     /// Free any source-operand vregs whose last use is the current instruction.
@@ -820,23 +874,84 @@ impl CodeGenerator {
             }
 
             // -- inline assembly ------------------------------------------
-            IrOp::InlineAsm { code, .. } => {
-                // Spill all live registers, emit raw asm, clobber all.
-                for reg in [PhysReg::HL, PhysReg::DE, PhysReg::BC, PhysReg::A] {
-                    if let Some(op) = self.regalloc.spill(reg) {
-                        self.emit_moves(&[op]);
+            IrOp::InlineAsm { code, inputs, return_type, clobber_all } => {
+                if *clobber_all {
+                    // Raw mode (asm { }): spill all, emit, clobber all.
+                    for reg in [PhysReg::HL, PhysReg::DE, PhysReg::BC, PhysReg::A] {
+                        if let Some(op) = self.regalloc.spill(reg) {
+                            self.emit_moves(&[op]);
+                        }
+                    }
+                    self.a_mirrors = None;
+                    self.emit("; __asm_begin__".to_string());
+                    for line in code.lines() {
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() {
+                            if trimmed.ends_with(':') || trimmed.contains(" = ") || trimmed.starts_with('.') {
+                                self.emit(trimmed.to_string());
+                            } else {
+                                self.emit_inst(trimmed);
+                            }
+                        }
+                    }
+                    self.emit("; __asm_end__".to_string());
+                    self.regalloc.clobber_regs(&[
+                        PhysReg::HL, PhysReg::DE, PhysReg::BC, PhysReg::A,
+                    ]);
+                } else {
+                    // Parameterized mode: selective spill based on declared params.
+                    let touched = compute_touched_regs(inputs, return_type);
+
+                    // Spill only touched registers that hold live values.
+                    for &reg in &touched {
+                        let Some(vreg_id) = self.regalloc.occupant(reg) else {
+                            continue;
+                        };
+                        let live_after = self
+                            .last_use
+                            .get(&vreg_id)
+                            .is_some_and(|&last_idx| last_idx > self.instr_index);
+                        if live_after {
+                            if let Some(op) = self.regalloc.spill(reg) {
+                                self.emit_moves(&[op]);
+                            }
+                        }
+                    }
+                    if touched.iter().any(|r| *r == PhysReg::A) {
+                        self.a_mirrors = None;
+                    }
+
+                    // Place input values into correct registers per calling convention.
+                    for (i, (vreg, ty)) in inputs.iter().enumerate() {
+                        let size = ty.size_of().unwrap_or(2);
+                        match (i, size) {
+                            (0, 1) => self.ensure_a(*vreg),
+                            (0, _) => self.ensure_hl(*vreg),
+                            (1, _) => self.ensure_de(*vreg),
+                            _ => {} // >2 params: only first two get registers
+                        }
+                    }
+
+                    // Emit raw assembly.
+                    self.emit("; __asm_begin__".to_string());
+                    for line in code.lines() {
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() {
+                            if trimmed.ends_with(':') || trimmed.contains(" = ") || trimmed.starts_with('.') {
+                                self.emit(trimmed.to_string());
+                            } else {
+                                self.emit_inst(trimmed);
+                            }
+                        }
+                    }
+                    self.emit("; __asm_end__".to_string());
+
+                    // Clobber touched registers.
+                    self.regalloc.clobber_regs(&touched);
+                    if touched.iter().any(|r| *r == PhysReg::A) {
+                        self.a_mirrors = None;
                     }
                 }
-                self.a_mirrors = None;
-                for line in code.lines() {
-                    let trimmed = line.trim();
-                    if !trimmed.is_empty() {
-                        self.emit_inst(trimmed);
-                    }
-                }
-                self.regalloc.clobber_regs(&[
-                    PhysReg::HL, PhysReg::DE, PhysReg::BC, PhysReg::A,
-                ]);
             }
         }
     }
@@ -2567,6 +2682,41 @@ fn compute_last_use(body: &[IrInstr]) -> HashMap<u32, usize> {
         }
     }
     last
+}
+
+/// Compute the set of physical registers touched by a parameterized asm block
+/// based on params and return type following the calling convention:
+///   arg0: 16-bit → HL, 8-bit → A
+///   arg1: 16-bit → DE
+///   return: 16-bit → HL, 8-bit → A
+fn compute_touched_regs(
+    inputs: &[(VReg, CType)],
+    return_type: &Option<CType>,
+) -> Vec<PhysReg> {
+    let mut regs = Vec::new();
+    for (i, (_vreg, ty)) in inputs.iter().enumerate() {
+        let size = ty.size_of().unwrap_or(2);
+        let reg = match (i, size) {
+            (0, 1) => PhysReg::A,
+            (0, _) => PhysReg::HL,
+            (1, _) => PhysReg::DE,
+            _ => continue,
+        };
+        if !regs.contains(&reg) {
+            regs.push(reg);
+        }
+    }
+    if let Some(ret_ty) = return_type {
+        let ret_reg = if ret_ty.size_of() == Some(1) {
+            PhysReg::A
+        } else {
+            PhysReg::HL
+        };
+        if !regs.contains(&ret_reg) {
+            regs.push(ret_reg);
+        }
+    }
+    regs
 }
 
 /// Collect all vreg IDs that are *read* by an IR operation (source operands).

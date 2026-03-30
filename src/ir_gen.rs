@@ -694,7 +694,7 @@ impl IrGenerator {
                 self.gen_stmt(stmt);
             }
 
-            StmtKind::AsmBlock { code, params, return_type } => {
+            StmtKind::AsmBlock { code, params, return_type, is_raw } => {
                 let inputs: Vec<(VReg, CType)> = params
                     .iter()
                     .filter_map(|(name, ty)| {
@@ -719,6 +719,7 @@ impl IrGenerator {
                     code: code.clone(),
                     inputs,
                     return_type: return_type.clone(),
+                    clobber_all: *is_raw,
                 });
             }
         }

@@ -1045,7 +1045,7 @@ impl<'t> Parser<'t> {
         // statements but the grammar allows a trailing semicolon).
         self.eat(&TokenKind::Semicolon);
 
-        Some(Stmt::new(StmtKind::AsmBlock { code, params, return_type }, loc))
+        Some(Stmt::new(StmtKind::AsmBlock { code, params, return_type, is_raw: !has_parens }, loc))
     }
 
     /// Collect raw source text from the current position until the matching

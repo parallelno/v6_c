@@ -283,6 +283,9 @@ pub enum IrOp {
         inputs: Vec<(VReg, CType)>,
         /// Return type if `-> type` was specified.
         return_type: Option<CType>,
+        /// True for raw `asm { }` (no parens) — spill/clobber all registers.
+        /// False for `asm(...) { }` — selective spill based on params.
+        clobber_all: bool,
     },
 }
 

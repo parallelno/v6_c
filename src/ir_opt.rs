@@ -612,6 +612,11 @@ fn load_store_forwarding(func: &mut IrFunction) -> bool {
                 mem_state.clear();
                 out.push(instr.clone());
             }
+            // Inline asm may read/write any memory location.
+            IrOp::InlineAsm { .. } => {
+                mem_state.clear();
+                out.push(instr.clone());
+            }
             _ => out.push(instr.clone()),
         }
     }
@@ -1790,6 +1795,11 @@ fn redundant_store_eliminate(func: &mut IrFunction) -> bool {
                 pending_global.clear();
                 pending_local.clear();
             }
+            // Inline asm may read/write any memory location.
+            IrOp::InlineAsm { .. } => {
+                pending_global.clear();
+                pending_local.clear();
+            }
             _ => {}
         }
     }
@@ -1814,9 +1824,26 @@ fn redundant_store_eliminate(func: &mut IrFunction) -> bool {
         })
         .collect();
 
+    // Labels referenced in inline asm text are also considered "loaded" —
+    // the raw assembly accesses them directly, outside the IR's visibility.
+    let asm_referenced: HashSet<String> = func.body.iter()
+        .filter_map(|i| {
+            if let IrOp::InlineAsm { code, .. } = &i.op { Some(code.as_str()) }
+            else { None }
+        })
+        .flat_map(|code| {
+            code.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .filter(|word| word.starts_with("_l_") || word.starts_with("_g_"))
+                .map(|w| w.to_string())
+        })
+        .collect();
+
     for (idx, instr) in func.body.iter().enumerate() {
         if let IrOp::StoreGlobal { addr_label, .. } = &instr.op {
-            if addr_label.starts_with("_l_") && !loaded_globals.contains(addr_label) {
+            if addr_label.starts_with("_l_")
+                && !loaded_globals.contains(addr_label)
+                && !asm_referenced.contains(addr_label)
+            {
                 dead.insert(idx);
             }
         }
@@ -2811,10 +2838,11 @@ fn remap_op(
             args: args.iter().map(|a| rv(*a)).collect(),
             dst: dst.map(|d| rv(d)),
         },
-        IrOp::InlineAsm { code, inputs, return_type } => IrOp::InlineAsm {
+        IrOp::InlineAsm { code, inputs, return_type, clobber_all } => IrOp::InlineAsm {
             code: code.clone(),
             inputs: inputs.iter().map(|(v, t)| (rv(*v), t.clone())).collect(),
             return_type: return_type.clone(),
+            clobber_all: *clobber_all,
         },
     }
 }
