@@ -90,7 +90,7 @@ The compiler is a single‑pass‑per‑stage pipeline:
 4. **IR optimization passes** → constant folding/propagation, dead‑code elimination, strength reduction, common sub‑expression elimination.
 5. **Code generator** → Intel 8080 assembly with physical register allocation.
 6. **Peephole optimizer** → pattern‑matched rewriting of emitted assembly.
-7. **Output** → assembly text for the **v6asm** assembler (https://github.com/parallelno/v6_assembler), targeting the Vector 06 computer (starting address `0x100`).
+7. **Output** → assembly text for the **v6asm** assembler (https://github.com/parallelno/v6asm), targeting the Vector 06 computer (starting address `0x100`).
 
 ### 2.3 Calling Convention & Memory Model
 
@@ -305,7 +305,7 @@ Each routine is hand‑optimized for the 8080 instruction set. The multiply/divi
 ## 4. Project Structure
 
 ```
-v6_c/
+v6c/
 ├── plan.md                  # This document
 ├── Cargo.toml               # Rust project manifest
 ├── src/

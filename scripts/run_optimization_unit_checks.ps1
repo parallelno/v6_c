@@ -19,7 +19,7 @@ if ($UseSmall) {
 }
 $toolsDir = Join-Path $repoRoot "dependencies\v6asm"
 $v6asmExe = Join-Path $toolsDir "v6asm.exe"
-$v6asmSrcDir = Join-Path $toolsDir "v6_assembler"
+$v6asmSrcDir = Join-Path $toolsDir "v6asm"
 
 $strictMode = $RequireV6asm -or (-not $AllowAsmFailure)
 
@@ -37,9 +37,9 @@ function Resolve-V6asm {
     New-Item -ItemType Directory -Force -Path $toolsDir | Out-Null
 
     if (-not (Test-Path $v6asmSrcDir)) {
-        git clone https://github.com/parallelno/v6_assembler.git $v6asmSrcDir
+        git clone https://github.com/parallelno/v6asm.git $v6asmSrcDir
         if ($LASTEXITCODE -ne 0) {
-            throw "Failed to clone v6_assembler"
+            throw "Failed to clone v6asm"
         }
     }
 

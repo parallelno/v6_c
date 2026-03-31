@@ -19,7 +19,7 @@ From repository root:
 
 The runner will automatically try to clone and build `v6asm.exe` from:
 
-- `https://github.com/parallelno/v6_assembler.git`
+- `https://github.com/parallelno/v6asm.git`
 
 if `v6asm.exe` is not already available.
 
