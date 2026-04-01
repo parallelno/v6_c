@@ -26,7 +26,7 @@ v6asm --init <name>
 v6asm main.asm                        # compile, output main.rom
 v6asm main.asm -o out/program.rom     # custom output path
 v6asm main.asm --cpu z80 --lst        # Z80 mode + listing
-v6asm --init myproject                # create myproject.asm from template
+v6asm --init main                     # create main.asm from template
 ```
 
 ## Output Artifacts

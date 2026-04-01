@@ -2,7 +2,9 @@ param(
     [string]$Filter,
     [switch]$RequireV6asm,
     [switch]$AllowAsmFailure,
-    [switch]$UseSmall
+    [switch]$UseSmall,
+    [switch]$RunExecution,
+    [int]$RunCycles = 1000000
 )
 
 Set-StrictMode -Version Latest
@@ -17,6 +19,7 @@ if ($UseSmall) {
     $outDir = Join-Path $repoRoot "out\tests\unit\optimization"
 }
 $v6asmExe = Join-Path $repoRoot "tools\v6asm\v6asm.exe"
+$v6emulExe = Join-Path $repoRoot "tools\v6emul\v6emul.exe"
 
 $strictMode = $RequireV6asm -or (-not $AllowAsmFailure)
 
@@ -27,6 +30,97 @@ function Resolve-V6asm {
     return $null
 }
 
+function Resolve-V6emul {
+    if (Test-Path $v6emulExe) {
+        return $v6emulExe
+    }
+    return $null
+}
+
+function Test-CSourceExecutionReady {
+    param([string]$SourcePath)
+
+    $source = Get-Content -Path $SourcePath -Raw
+    $mainMatch = [regex]::Match($source, '(?is)\bint\s+main\s*\([^\)]*\)\s*\{(?<body>.*?)\}')
+    if (-not $mainMatch.Success) {
+        return [PSCustomObject]@{
+            IsReady = $false
+            Reason = "missing 'int main(...)'"
+        }
+    }
+
+    if (-not [regex]::IsMatch($mainMatch.Groups['body'].Value, '(?i)\breturn\b')) {
+        return [PSCustomObject]@{
+            IsReady = $false
+            Reason = "main has no return statement"
+        }
+    }
+
+    return [PSCustomObject]@{
+        IsReady = $true
+        Reason = ""
+    }
+}
+
+function Get-OrgAddress {
+    param([string]$AsmPath)
+
+    $asm = Get-Content -Path $AsmPath -Raw
+    $orgMatch = [regex]::Match($asm, '(?im)^\s*\.ORG\s+(0x[0-9A-Fa-f]+|\d+)')
+    if ($orgMatch.Success) {
+        return [PSCustomObject]@{
+            Found = $true
+            Value = $orgMatch.Groups[1].Value
+        }
+    }
+
+    return [PSCustomObject]@{
+        Found = $false
+        Value = "0"
+    }
+}
+
+function Test-AsmExecutionReady {
+    param([string]$AsmPath)
+
+    $asm = Get-Content -Path $AsmPath -Raw
+    if (-not [regex]::IsMatch($asm, '(?im)^\s*\.ORG\b')) {
+        return [PSCustomObject]@{
+            IsReady = $false
+            Reason = "missing .ORG directive"
+        }
+    }
+    if (-not [regex]::IsMatch($asm, '(?im)^\s*HLT\b')) {
+        return [PSCustomObject]@{
+            IsReady = $false
+            Reason = "missing HLT instruction"
+        }
+    }
+
+    return [PSCustomObject]@{
+        IsReady = $true
+        Reason = ""
+    }
+}
+
+function Parse-HLReturnCode {
+    param([string]$Text)
+
+    $cpuLine = [regex]::Match($Text, '(?im)^\s*CPU:.*$')
+    if (-not $cpuLine.Success) {
+        return $null
+    }
+
+    $hlMatch = [regex]::Match($cpuLine.Value, '(?i)\bH=([0-9A-F]{2})\b.*\bL=([0-9A-F]{2})\b')
+    if (-not $hlMatch.Success) {
+        return $null
+    }
+
+    $h = [Convert]::ToInt32($hlMatch.Groups[1].Value, 16)
+    $l = [Convert]::ToInt32($hlMatch.Groups[2].Value, 16)
+    return ($h * 256 + $l)
+}
+
 if (-not (Test-Path $testsDir)) {
     throw "Missing tests directory: $testsDir"
 }
@@ -34,6 +128,7 @@ if (-not (Test-Path $testsDir)) {
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
 $v6asmCmd = Resolve-V6asm
+$v6emulCmd = Resolve-V6emul
 if ($null -eq $v6asmCmd -and $strictMode) {
     throw "Strict mode requires v6asm, but it was not found and auto-build is disabled"
 }
@@ -50,8 +145,18 @@ if ($null -eq $cases -or $cases.Count -eq 0) {
 Write-Host "Building optimization test set from $testsDir"
 Write-Host "Output directory: $outDir"
 Write-Host "Strict assembler mode: $strictMode"
+Write-Host "Run execution: $RunExecution"
+if ($RunExecution) {
+    Write-Host "Run cycles: $RunCycles"
+}
 if ($null -ne $v6asmCmd) {
     Write-Host "Using v6asm: $v6asmCmd"
+}
+if ($RunExecution -and $null -ne $v6emulCmd) {
+    Write-Host "Using v6emul: $v6emulCmd"
+}
+if ($RunExecution -and $null -eq $v6emulCmd) {
+    Write-Warning "Execution requested, but v6emul.exe is missing. Execution step will be skipped."
 }
 
 $results = @()
@@ -63,7 +168,8 @@ try {
         $base = [System.IO.Path]::GetFileNameWithoutExtension($case.Name)
         $asmPath = Join-Path $outDir ($base + ".asm")
         $lstPath = Join-Path $outDir ($base + ".v6c.lst")
-        $romPath = $base + ".rom"
+        $romPath = Join-Path $outDir ($base + ".rom")
+        $projectPath = Join-Path $outDir ($base + ".project.json")
 
         Write-Host "--- $($case.Name)"
 
@@ -82,10 +188,20 @@ try {
 
         $assembled = $false
         if ($null -ne $v6asmCmd) {
+            $project = [PSCustomObject]@{
+                asmPath = (Split-Path -Leaf $asmPath)
+                cpu = "i8080"
+                debugPath = "$base.debug.json"
+                name = $base
+                romPath = (Split-Path -Leaf $romPath)
+                settings = @{}
+            }
+            $project | ConvertTo-Json -Depth 4 | Set-Content -Path $projectPath
+
             $innerSavedLocation = (Get-Location).Path
             Set-Location $outDir
             try {
-                & $v6asmCmd (Split-Path -Leaf $asmPath) --lst
+                & $v6asmCmd (Split-Path -Leaf $projectPath)
                 if ($LASTEXITCODE -ne 0) {
                     if ($strictMode) {
                         throw "v6asm failed for $($case.Name)"
@@ -95,14 +211,8 @@ try {
                 else {
                     $assembled = $true
 
-                    $romOutput = Join-Path $outDir ($base + ".rom")
-                    $v6asmLstPath = Join-Path $outDir ($base + ".lst")
-
-                    if (-not (Test-Path $romOutput)) {
-                        throw "v6asm did not emit ROM for $($case.Name): $romOutput"
-                    }
-                    if (-not (Test-Path $v6asmLstPath)) {
-                        throw "v6asm did not emit list file for $($case.Name): $v6asmLstPath"
+                    if (-not (Test-Path $romPath)) {
+                        throw "v6asm did not emit ROM for $($case.Name): $romPath"
                     }
                 }
             }
@@ -116,12 +226,67 @@ try {
             }
         }
 
+        $executed = $false
+        $resultCode = $null
+        $resultText = "SKIP"
+
+        if ($RunExecution) {
+            if (-not $assembled) {
+                Write-Warning "Skipping execution for $($case.Name): ROM was not assembled"
+            }
+            elseif ($null -eq $v6emulCmd) {
+                Write-Warning "Skipping execution for $($case.Name): missing v6emul.exe"
+            }
+            else {
+                $cValidation = Test-CSourceExecutionReady -SourcePath $case.FullName
+                if (-not $cValidation.IsReady) {
+                    Write-Warning "Skipping execution for $($case.Name): $($cValidation.Reason)"
+                }
+                else {
+                    $asmValidation = Test-AsmExecutionReady -AsmPath $asmPath
+                    if (-not $asmValidation.IsReady) {
+                        Write-Warning "Skipping execution for $($case.Name): $($asmValidation.Reason)"
+                    }
+                    else {
+                        $org = Get-OrgAddress -AsmPath $asmPath
+                        if (-not $org.Found) {
+                            Write-Warning "No .ORG found in $($case.Name); defaulting --load-addr to 0"
+                        }
+
+                        $emulOutput = (& $v6emulCmd --rom $romPath --load-addr $org.Value --halt-exit --dump-cpu --run-cycles $RunCycles 2>&1 | Out-String)
+                        if ($LASTEXITCODE -ne 0) {
+                            throw "v6emul failed for $($case.Name) (exit $LASTEXITCODE):`n$emulOutput"
+                        }
+
+                        $parsed = Parse-HLReturnCode -Text $emulOutput
+                        if ($null -eq $parsed) {
+                            throw "Failed to parse H/L return code for $($case.Name):`n$emulOutput"
+                        }
+
+                        $executed = $true
+                        $resultCode = $parsed
+                        if ($parsed -eq 0) {
+                            $resultText = "PASS"
+                        }
+                        else {
+                            $resultText = "FAIL"
+                            throw "Execution failed for $($case.Name): HL=$parsed`n$emulOutput"
+                        }
+                    }
+                }
+            }
+        }
+
         $results += [PSCustomObject]@{
             Test = $case.Name
+            Compiled = $true
+            Assembled = $assembled
+            Executed = $executed
+            Result = $resultText
+            ReturnCode = $resultCode
             Asm = $asmPath
             Lst = $lstPath
-            Rom = (Join-Path $outDir $romPath)
-            Assembled = $assembled
+            Rom = $romPath
         }
     }
 }
@@ -136,6 +301,6 @@ finally {
 
 Write-Host ""
 Write-Host "Optimization unit compile/check summary:"
-$results | Format-Table Test, Assembled, Rom -AutoSize
+$results | Format-Table Test, Compiled, Assembled, Executed, Result, ReturnCode, Rom -AutoSize
 Write-Host ""
 Write-Host "Done. Generated outputs are in: $outDir"
