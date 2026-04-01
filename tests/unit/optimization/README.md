@@ -33,21 +33,13 @@ From repository root:
 
 ## Optional Flags
 
-1. Disable auto-bootstrap of assembler:
-
-```powershell
-.\scripts\run_optimization_unit_checks.ps1 -NoAutoBuildV6asm
-```
-
-2. Strict mode is enabled by default.
-
-To allow assembler failures and continue after compile (without strict assembly):
+1. To allow assembler failures and continue after compile (without strict assembly):
 
 ```powershell
 .\scripts\run_optimization_unit_checks.ps1 -AllowAsmFailure
 ```
 
-3. Explicitly force strict mode (same as default):
+2. Explicitly force strict mode (same as default):
 
 ```powershell
 .\scripts\run_optimization_unit_checks.ps1 -RequireV6asm
@@ -59,9 +51,9 @@ The runner writes assembly/list/project/debug/rom artifacts to:
 
 - `out/tests/unit/optimization/`
 
-The runner stores `v6asm.exe` and the cloned assembler source in:
+The runner uses pre-built `v6asm.exe` from:
 
-- `dependencies/v6asm/`
+- `tools/v6asm/`
 
 ## Assembly Validation
 

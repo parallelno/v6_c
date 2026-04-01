@@ -1,6 +1,5 @@
 param(
     [string]$Filter,
-    [switch]$NoAutoBuildV6asm,
     [switch]$RequireV6asm,
     [switch]$AllowAsmFailure,
     [switch]$UseSmall
@@ -17,57 +16,15 @@ if ($UseSmall) {
     $testsDir = Join-Path $repoRoot "tests\unit\optimization"
     $outDir = Join-Path $repoRoot "out\tests\unit\optimization"
 }
-$toolsDir = Join-Path $repoRoot "dependencies\v6asm"
-$v6asmExe = Join-Path $toolsDir "v6asm.exe"
-$v6asmSrcDir = Join-Path $toolsDir "v6asm"
+$v6asmExe = Join-Path $repoRoot "tools\v6asm\v6asm.exe"
 
 $strictMode = $RequireV6asm -or (-not $AllowAsmFailure)
 
 function Resolve-V6asm {
-    param([switch]$NoAutoBuild)
-
     if (Test-Path $v6asmExe) {
         return $v6asmExe
     }
-
-    if ($NoAutoBuild) {
-        return $null
-    }
-
-    New-Item -ItemType Directory -Force -Path $toolsDir | Out-Null
-
-    if (-not (Test-Path $v6asmSrcDir)) {
-        git clone https://github.com/parallelno/v6asm.git $v6asmSrcDir
-        if ($LASTEXITCODE -ne 0) {
-            throw "Failed to clone v6asm"
-        }
-    }
-
-    $savedLocation = (Get-Location).Path
-    Set-Location $v6asmSrcDir
-    try {
-        cargo build --release --bin v6asm
-        if ($LASTEXITCODE -ne 0) {
-            throw "Failed to build v6asm"
-        }
-
-        $builtExe = Join-Path $v6asmSrcDir "target\release\v6asm.exe"
-        if (-not (Test-Path $builtExe)) {
-            throw "Built v6asm executable not found at $builtExe"
-        }
-
-        Copy-Item -Path $builtExe -Destination $v6asmExe -Force
-    }
-    finally {
-        if (Test-Path $savedLocation) {
-            Set-Location $savedLocation
-        }
-        else {
-            Set-Location $repoRoot
-        }
-    }
-
-    return $v6asmExe
+    return $null
 }
 
 if (-not (Test-Path $testsDir)) {
@@ -76,7 +33,7 @@ if (-not (Test-Path $testsDir)) {
 
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
-$v6asmCmd = Resolve-V6asm -NoAutoBuild:$NoAutoBuildV6asm
+$v6asmCmd = Resolve-V6asm
 if ($null -eq $v6asmCmd -and $strictMode) {
     throw "Strict mode requires v6asm, but it was not found and auto-build is disabled"
 }

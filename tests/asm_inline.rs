@@ -37,7 +37,7 @@ fn compile(subfolder: &str, name: &str) -> String {
     let asm = fs::read_to_string(&asm_path).unwrap_or_default();
 
     // Step 2: assemble .asm with v6asm (must succeed with no errors)
-    let v6asm = root.join("dependencies").join("v6asm").join("v6asm.exe");
+    let v6asm = root.join("tools").join("v6asm").join("v6asm.exe");
     if v6asm.exists() {
         let asm_file = format!("{}.asm", base);
         let v6asm_out = Command::new(&v6asm)

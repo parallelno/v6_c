@@ -39,7 +39,6 @@ Filter one test:
 
 ### Optional runner flags
 
-- `-NoAutoBuildV6asm`: skip automatic `v6asm` clone/build
 - `-RequireV6asm`: fail if `v6asm` missing
 - `-AllowAsmFailure`: allow 8080 assembly failure and continue
 
