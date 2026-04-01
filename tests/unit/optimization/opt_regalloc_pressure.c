@@ -1,8 +1,6 @@
 /* opt_regalloc_pressure.c - register pressure/rematerialization coverage */
 
-int status;
-
-void main(void)
+int main(void)
 {
     int a;
     int b;
@@ -25,18 +23,21 @@ void main(void)
     g = 7;
     h = 8;
 
-    /* positive: many simultaneously live values */
+    /* positive: 1+2+3+4+5+6+7+8 = 36 */
     pos = a + b + c + d;
     pos = pos + e + f + g + h;
 
-    /* negative: dependent chain */
+    /* negative: 1+100+100+100 = 301 */
     neg = a;
     neg = neg + 100;
     neg = neg + 100;
     neg = neg + 100;
 
-    /* safety: repeated immediates can rematerialize */
+    /* safety: 42*4 = 168 */
     safe = 42 + 42 + 42 + 42;
 
-    status = pos + neg + safe;
+    if (pos != 36) return 1;
+    if (neg != 301) return 2;
+    if (safe != 168) return 3;
+    return 0;
 }

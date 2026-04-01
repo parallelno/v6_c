@@ -1,9 +1,8 @@
 /* loop.c — loop construct test for v6c */
 
-int sum;
-
-void main(void)
+int main(void)
 {
+    int sum;
     int i;
 
     /* while loop: sum 1..10 */
@@ -13,12 +12,14 @@ void main(void)
         sum = sum + i;
         i = i + 1;
     }
-    /* sum == 55 */
+    if (sum != 55) return 1;  /* while sum */
 
     /* for loop: sum 1..10 again */
     sum = 0;
     for (i = 1; i <= 10; i = i + 1) {
         sum = sum + i;
     }
-    /* sum == 55 */
+    if (sum != 55) return 2;  /* for sum */
+
+    return 0;
 }

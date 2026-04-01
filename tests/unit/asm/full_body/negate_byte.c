@@ -5,8 +5,6 @@
 /*           complement. Called twice to prevent inlining. */
 /* Expect:   Compiles without error. Output contains CMA and INR A. */
 
-char result;
-
 char negate_byte(char x) {
     asm {
         CMA
@@ -14,7 +12,8 @@ char negate_byte(char x) {
     }
 }
 
-void main(void) {
-    result = negate_byte(5);
-    result = negate_byte(10);
+int main(void) {
+    if (negate_byte(5) != -5) return 1;
+    if (negate_byte(10) != -10) return 2;
+    return 0;
 }

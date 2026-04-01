@@ -2,14 +2,15 @@
 //
 // Feature: remove move/copy operations that are unnecessary.
 // Benefit: simplified code path and fewer instructions.
-// Example:
-//   a = b; a = b; // second assignment is redundant after optimization
 
 int a;
 int b;
 
-void main(void) {
+int main(void) {
     b = 5;
-    a = b;
-    a = b;
+    a = b;  /* a=5 */
+    a = b;  /* redundant: a still 5 */
+    if (a != 5) return 1;
+    if (b != 5) return 2;
+    return 0;
 }

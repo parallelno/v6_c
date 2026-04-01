@@ -185,18 +185,9 @@ fn run_unit_rom_execution_suite() {
             .and_then(|s| s.to_str())
             .expect("asm filename is invalid");
 
-        let project_file = format!("{}.project.json", base_name);
-        let debug_file = format!("{}.debug.json", base_name);
-        let rom_file = format!("{}.rom", base_name);
-        let project_json = format!(
-            "{{\n  \"asmPath\": \"{}\",\n  \"cpu\": \"i8080\",\n  \"debugPath\": \"{}\",\n  \"name\": \"{}\",\n  \"romPath\": \"{}\",\n  \"settings\": {{}}\n}}\n",
-            asm_file, debug_file, base_name, rom_file
-        );
-        fs::write(asm_dir.join(&project_file), project_json)
-            .unwrap_or_else(|e| panic!("failed to write project file for {}: {e}", rel));
-
         let assemble = Command::new(&v6asm)
-            .arg(&project_file)
+            .arg(asm_file)
+            .arg("--lst")
             .current_dir(asm_dir)
             .output()
             .expect("failed to run v6asm");
@@ -209,7 +200,7 @@ fn run_unit_rom_execution_suite() {
             String::from_utf8_lossy(&assemble.stderr)
         );
 
-        let rom_path = asm_dir.join(&rom_file);
+        let rom_path = asm_dir.join(format!("{}.rom", base_name));
         assert!(
             rom_path.exists(),
             "expected ROM output missing for {}: {}",

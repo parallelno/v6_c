@@ -5,14 +5,13 @@
 /*           The first int arg is already in HL per calling convention. */
 /* Expect:   Compiles without error. The asm region is present in output. */
 
-int result;
-
 int identity(int x) {
     asm {
         ; x is in HL, nothing to do
     }
 }
 
-void main(void) {
-    result = identity(42);
+int main(void) {
+    if (identity(42) != 42) return 1;
+    return 0;
 }

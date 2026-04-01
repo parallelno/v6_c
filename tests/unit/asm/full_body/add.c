@@ -6,14 +6,13 @@
 /* Expect:   Compiles without error. Output contains DAD D and no */
 /*           compiler-generated parameter prologue (SHLD _l_add_...). */
 
-int result;
-
 int add(int a, int b) {
     asm {
         DAD D
     }
 }
 
-void main(void) {
-    result = add(10, 20);
+int main(void) {
+    if (add(10, 20) != 30) return 1;
+    return 0;
 }

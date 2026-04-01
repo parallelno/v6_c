@@ -21,6 +21,8 @@ void raw_in_loop() {
     }
 }
 
-void main(void) {
+int main(void) {
     raw_in_loop();
+    if (result != 5) return 1;
+    return 0;
 }

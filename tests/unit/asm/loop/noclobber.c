@@ -20,6 +20,8 @@ void noclobber_in_loop() {
     result = sum;
 }
 
-void main(void) {
+int main(void) {
     noclobber_in_loop();
+    if (result != 55) return 1;
+    return 0;
 }

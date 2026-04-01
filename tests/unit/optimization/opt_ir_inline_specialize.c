@@ -1,7 +1,5 @@
 /* opt_ir_inline_specialize.c - IR inlining/specialization coverage */
 
-int status;
-
 int addk(int x, int k)
 {
     return x + k;
@@ -18,23 +16,26 @@ int big_func(int x)
     return r;
 }
 
-void main(void)
+int main(void)
 {
     int pos;
     int neg;
     int safe;
     int t;
 
-    /* positive: same constant argument at multiple call sites */
+    /* positive: addk(10,2)+addk(11,2) = 12+13 = 25 */
     pos = addk(10, 2);
     pos = pos + addk(11, 2);
 
-    /* negative: variable argument should not specialize the same way */
+    /* negative: addk(7,3) = 10 */
     t = 3;
     neg = addk(7, t);
 
-    /* safety: larger function call remains valid */
+    /* safety: big_func(5): r=5+0+1+2+3+4+5 = 20 */
     safe = big_func(5);
 
-    status = pos + neg + safe;
+    if (pos != 25) return 1;
+    if (neg != 10) return 2;
+    if (safe != 20) return 3;
+    return 0;
 }

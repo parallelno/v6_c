@@ -2,14 +2,14 @@
 //
 // Feature: merge adjacent blocks where possible and remove unnecessary jumps.
 // Benefit: reduces instruction count and improves fall-through density.
-// Example:
-//   label1: jmp label2; label2: ... -> direct fall-through or remove noop jump.
 
 int k;
 
-void main(void) {
+int main(void) {
     k = 1;
     if (k == 1) {
-        k = 2;
+        k = 2;  /* k=2 */
     }
+    if (k != 2) return 1;
+    return 0;
 }

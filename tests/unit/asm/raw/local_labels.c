@@ -5,8 +5,6 @@
 /*           add them with DAD D, and SHLD the result into a local sum. */
 /* Expect:   Compiles without error. Output references _l_sum_via_asm_a. */
 
-int result;
-
 int sum_via_asm(int a, int b) {
     int sum;
     sum = 0;
@@ -20,6 +18,7 @@ int sum_via_asm(int a, int b) {
     return sum;
 }
 
-void main(void) {
-    result = sum_via_asm(30, 12);
+int main(void) {
+    if (sum_via_asm(30, 12) != 42) return 1;
+    return 0;
 }

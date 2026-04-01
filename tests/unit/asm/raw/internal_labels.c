@@ -5,8 +5,6 @@
 /*           a loop that increments HL from 0 to 10. */
 /* Expect:   Compiles without error. Output contains _ctt_loop: label. */
 
-int result;
-
 int count_to_ten() {
     int counter;
     counter = 0;
@@ -22,6 +20,7 @@ _ctt_loop:
     return counter;
 }
 
-void main(void) {
-    result = count_to_ten();
+int main(void) {
+    if (count_to_ten() != 10) return 1;
+    return 0;
 }

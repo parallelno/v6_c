@@ -169,7 +169,6 @@ try {
         $asmPath = Join-Path $outDir ($base + ".asm")
         $lstPath = Join-Path $outDir ($base + ".v6c.lst")
         $romPath = Join-Path $outDir ($base + ".rom")
-        $projectPath = Join-Path $outDir ($base + ".project.json")
 
         Write-Host "--- $($case.Name)"
 
@@ -188,20 +187,10 @@ try {
 
         $assembled = $false
         if ($null -ne $v6asmCmd) {
-            $project = [PSCustomObject]@{
-                asmPath = (Split-Path -Leaf $asmPath)
-                cpu = "i8080"
-                debugPath = "$base.debug.json"
-                name = $base
-                romPath = (Split-Path -Leaf $romPath)
-                settings = @{}
-            }
-            $project | ConvertTo-Json -Depth 4 | Set-Content -Path $projectPath
-
             $innerSavedLocation = (Get-Location).Path
             Set-Location $outDir
             try {
-                & $v6asmCmd (Split-Path -Leaf $projectPath)
+                & $v6asmCmd (Split-Path -Leaf $asmPath) --lst
                 if ($LASTEXITCODE -ne 0) {
                     if ($strictMode) {
                         throw "v6asm failed for $($case.Name)"
@@ -213,6 +202,11 @@ try {
 
                     if (-not (Test-Path $romPath)) {
                         throw "v6asm did not emit ROM for $($case.Name): $romPath"
+                    }
+
+                    $v6asmLstPath = Join-Path $outDir ($base + ".lst")
+                    if (-not (Test-Path $v6asmLstPath)) {
+                        throw "v6asm did not emit list file for $($case.Name): $v6asmLstPath"
                     }
                 }
             }

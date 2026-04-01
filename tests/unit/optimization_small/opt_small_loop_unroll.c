@@ -2,15 +2,15 @@
 //
 // Feature: expand small constant-trip-count loops when hint is present.
 // Benefit: fewer branch checks and more straight-line code.
-// Example:
-//   for (int i=0; i<3; i++) sum += i;
 
 int sum;
 
-void main(void) {
+int main(void) {
     sum = 0;
 #pragma unroll
     for (int i = 0; i < 3; i++) {
-        sum += i;
+        sum += i;  /* 0+1+2 = 3 */
     }
+    if (sum != 3) return 1;
+    return 0;
 }

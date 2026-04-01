@@ -2,13 +2,13 @@
 //
 // Feature: convert expensive operations to cheaper ones (mul->add/shift).
 // Benefit: reduce cycle cost for repeated computations.
-// Example:
-//   y = x * 4; // becomes shift left by 2
 
 int x;
 int y;
 
-void main(void) {
+int main(void) {
     x = 7;
-    y = x * 4;
+    y = x * 4;  /* 28 */
+    if (y != 28) return 1;
+    return 0;
 }

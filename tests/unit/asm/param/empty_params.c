@@ -11,6 +11,7 @@ void enable_interrupts() {
     };
 }
 
-void main(void) {
+int main(void) {
     enable_interrupts();
+    return 0;
 }

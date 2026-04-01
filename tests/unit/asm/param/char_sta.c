@@ -14,6 +14,7 @@ void toggle_bit(char mask) {
     };
 }
 
-void main(void) {
+int main(void) {
     toggle_bit(0x55);
+    return 0;
 }

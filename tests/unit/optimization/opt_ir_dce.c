@@ -1,6 +1,5 @@
 /* opt_ir_dce.c - IR dead-code elimination coverage */
 
-int status;
 int side;
 
 int dead_path(int x)
@@ -17,7 +16,7 @@ void bump(void)
     side = side + 3;
 }
 
-void main(void)
+int main(void)
 {
     int pos;
     int neg;
@@ -25,18 +24,21 @@ void main(void)
 
     side = 0;
 
-    /* positive: unreachable tail after return */
+    /* positive: dead_path(5): 5>0 → return 6 */
     pos = dead_path(5);
 
-    /* negative: reachable branch should stay */
+    /* negative: pos>0 → side=1; neg=side=1 */
     if (pos > 0) {
         side = side + 1;
     }
     neg = side;
 
-    /* safety: side-effecting call must remain even if return is unused */
+    /* safety: bump() → side=4; safe=4 */
     bump();
     safe = side;
 
-    status = pos + neg + safe;
+    if (pos != 6) return 1;
+    if (neg != 1) return 2;
+    if (safe != 4) return 3;
+    return 0;
 }

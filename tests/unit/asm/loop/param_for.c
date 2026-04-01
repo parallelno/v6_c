@@ -16,6 +16,7 @@ void param_in_loop() {
     }
 }
 
-void main(void) {
+int main(void) {
     param_in_loop();
+    return 0;
 }

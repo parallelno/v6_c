@@ -5,8 +5,6 @@
 /*           followed by .STORAGE 2 to save and reload HL. */
 /* Expect:   Compiles without error. Output contains the _rt_temp: label. */
 
-int result;
-
 int round_trip(int val) {
     asm {
         SHLD _rt_temp
@@ -18,6 +16,7 @@ _rt_temp:
     }
 }
 
-void main(void) {
-    result = round_trip(123);
+int main(void) {
+    if (round_trip(123) != 123) return 1;
+    return 0;
 }

@@ -2,14 +2,15 @@
 //
 // Feature: remove stores to memory that are not later read.
 // Benefit: avoids unnecessary instructions and reduces code size.
-// Example:
-//   a = 5; a = 6; return a; // first store is dead and can be removed.
 
 int a;
 int b;
 
-void main(void) {
-    a = 5;
-    a = 6; // first value is dead
-    b = a;
+int main(void) {
+    a = 5;   /* dead store */
+    a = 6;   /* live */
+    b = a;   /* b=6 */
+    if (a != 6) return 1;
+    if (b != 6) return 2;
+    return 0;
 }

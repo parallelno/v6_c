@@ -6,8 +6,6 @@
 /* Expect:   Compiles without error. Output contains DAD D and exactly */
 /*           one RET (or HLT when inlined). */
 
-int result;
-
 int add_explicit_ret(int a, int b) {
     asm {
         DAD D
@@ -15,6 +13,7 @@ int add_explicit_ret(int a, int b) {
     }
 }
 
-void main(void) {
-    result = add_explicit_ret(10, 20);
+int main(void) {
+    if (add_explicit_ret(10, 20) != 30) return 1;
+    return 0;
 }

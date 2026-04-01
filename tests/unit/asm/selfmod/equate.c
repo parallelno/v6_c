@@ -6,8 +6,6 @@
 /*           save/restore pair that patches its own operands. */
 /* Expect:   Compiles without error. Output contains "= * + 1". */
 
-int result;
-
 int save_and_restore(int x) {
     asm {
 _sar_save = * + 1
@@ -21,6 +19,7 @@ _sar_restore = * + 1
     }
 }
 
-void main(void) {
-    result = save_and_restore(42);
+int main(void) {
+    save_and_restore(42);
+    return 0;
 }

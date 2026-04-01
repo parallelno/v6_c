@@ -5,8 +5,6 @@
 /*           the sign bit is clear. */
 /* Expect:   Compiles without error. Output contains the _abs_done: label. */
 
-int result;
-
 int abs_val(int x) {
     asm {
         MOV A,H
@@ -24,6 +22,8 @@ _abs_done:
     }
 }
 
-void main(void) {
-    result = abs_val(-5);
+int main(void) {
+    if (abs_val(-5) != 5) return 1;
+    if (abs_val(5) != 5) return 2;
+    return 0;
 }

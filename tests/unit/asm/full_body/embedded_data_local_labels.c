@@ -5,8 +5,6 @@
 /*           RET, with a _lc_data: label marking the data location. */
 /* Expect:   Compiles without error. Output contains the _lc_data: label. */
 
-int result;
-
 int load_const() {
     asm {
         LHLD @data
@@ -24,7 +22,8 @@ int load_const2() {
     }
 }
 
-void main(void) {
-    result = load_const();
-    result = load_const2();
+int main(void) {
+    if (load_const() != 0x1234) return 1;
+    if (load_const2() != 0x5678) return 2;
+    return 0;
 }

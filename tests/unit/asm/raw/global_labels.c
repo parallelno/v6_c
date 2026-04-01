@@ -20,8 +20,11 @@ void swap_globals() {
     }
 }
 
-void main(void) {
+int main(void) {
     global_a = 100;
     global_b = 200;
     swap_globals();
+    if (global_a != 200) return 1;
+    if (global_b != 100) return 2;
+    return 0;
 }

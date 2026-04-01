@@ -13,6 +13,8 @@ void store_int(int x) {
     };
 }
 
-void main(void) {
+int main(void) {
     store_int(100);
+    if (result != 100) return 1;
+    return 0;
 }

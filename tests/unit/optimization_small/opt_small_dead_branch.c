@@ -2,17 +2,16 @@
 //
 // Feature: remove conditional branches whose condition is a compile-time constant.
 // Benefit: eliminates unreachable code and reduces instruction count.
-// Example:
-//   if (0) { x = 1; }  -> entire branch removed; body is unreachable.
-//   if (1) { x = 2; }  -> branch removed; body always executes inline.
 
 int x;
 
-void main(void) {
+int main(void) {
     if (0) {
-        x = 1; // unreachable — whole branch must be removed
+        x = 1; /* unreachable */
     }
     if (1) {
-        x = 2; // always taken — branch condition and jump must be removed
+        x = 2; /* always taken */
     }
+    if (x != 2) return 1;
+    return 0;
 }

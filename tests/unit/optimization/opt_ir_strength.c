@@ -1,26 +1,29 @@
 /* opt_ir_strength.c - IR strength reduction coverage */
 
-int status;
 int x;
-int pos;
-int neg;
 unsigned int ux;
-int safe;
 
-void main(void)
+int main(void)
 {
+    int pos;
+    int neg;
+    int safe;
+
     x = 9;
 
-    /* positive: power-of-two multipliers */
+    /* positive: 9*8+9*4+9*2 = 72+36+18 = 126 */
     pos = (x * 8) + (x * 4) + (x * 2);
 
-    /* negative: non-power-of-two multiply should stay generic */
+    /* negative: 9*7 = 63 */
     neg = x * 7;
 
-    /* safety: unsigned div/mod by power of two */
+    /* safety: 123/8=15 remainder 3; safe=18 */
     ux = 123;
     safe = (int)(ux / 8);
     safe = safe + (int)(ux % 8);
 
-    status = pos + neg + safe;
+    if (pos != 126) return 1;
+    if (neg != 63) return 2;
+    if (safe != 18) return 3;
+    return 0;
 }

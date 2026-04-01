@@ -19,6 +19,8 @@ void multi_block() {
     }
 }
 
-void main(void) {
+int main(void) {
     multi_block();
+    if (result != 2) return 1;
+    return 0;
 }

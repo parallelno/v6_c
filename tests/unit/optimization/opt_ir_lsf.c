@@ -1,12 +1,8 @@
 /* opt_ir_lsf.c - IR load/store forwarding coverage */
 
-int status;
 int g0;
 int g1;
 int g2;
-int pos;
-int neg;
-int safe;
 
 int touch(int v)
 {
@@ -14,21 +10,24 @@ int touch(int v)
     return g2;
 }
 
-void main(void)
+int main(void)
 {
+    int pos;
+    int neg;
+    int safe;
     int *p;
 
-    /* positive: store then load from same global slot */
+    /* positive: g0=10; g1=g0=10; pos=10 */
     g0 = 10;
     g1 = g0;
     pos = g1;
 
-    /* negative: different slot should not forward */
+    /* negative: g0=3; g1=4; neg=7 */
     g0 = 3;
     g1 = 4;
     neg = g0 + g1;
 
-    /* safety: pointer store/call should invalidate forwarding facts */
+    /* safety: *p=20 → g0=20; safe=20+touch(5)=26; g1=g0=20; safe=46 */
     p = &g0;
     *p = 20;
     safe = g0;
@@ -36,5 +35,8 @@ void main(void)
     g1 = g0;
     safe = safe + g1;
 
-    status = pos + neg + safe;
+    if (pos != 10) return 1;
+    if (neg != 7) return 2;
+    if (safe != 46) return 3;
+    return 0;
 }

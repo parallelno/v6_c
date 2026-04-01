@@ -22,6 +22,8 @@ void nested_loop() {
     }
 }
 
-void main(void) {
+int main(void) {
     nested_loop();
+    if (result != 6) return 1;
+    return 0;
 }

@@ -1,9 +1,8 @@
 /* opt_peephole_data.c - peephole data-movement coverage */
 
-int status;
 int g;
 
-void main(void)
+int main(void)
 {
     int x;
     int y;
@@ -11,19 +10,22 @@ void main(void)
     int neg;
     int safe;
 
-    /* positive: redundant copy-style updates */
+    /* positive: x=3; g=3; g=g (nop); pos=3 */
     x = 3;
     g = x;
     g = g;
     pos = g;
 
-    /* negative: distinct values */
+    /* negative: y=5; neg=3+5=8 */
     y = 5;
     neg = x + y;
 
-    /* safety: preserve observable store */
+    /* safety: g=8; safe=8 */
     g = neg;
     safe = g;
 
-    status = pos + neg + safe;
+    if (pos != 3) return 1;
+    if (neg != 8) return 2;
+    if (safe != 8) return 3;
+    return 0;
 }

@@ -2,13 +2,14 @@
 //
 // Feature: narrow 32-bit to 16-bit or 16-bit to 8-bit when safe.
 // Benefit: smaller instructions and reduced register pressure.
-// Example:
-//   uint16_t x = 255; // can remain 8-bit if usage allows
 
 unsigned int x;
 unsigned char y;
 
-void main(void) {
+int main(void) {
     x = 255;
-    y = (unsigned char)x;
+    y = (unsigned char)x;  /* 255 */
+    if (x != 255) return 1;
+    if (y != 255) return 2;
+    return 0;
 }

@@ -14,6 +14,8 @@ void add_and_store(int a, int b) {
     };
 }
 
-void main(void) {
+int main(void) {
     add_and_store(10, 20);
+    if (result != 30) return 1;
+    return 0;
 }

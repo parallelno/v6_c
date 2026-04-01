@@ -2,9 +2,6 @@
 //
 // Feature: inline small known functions and optimize parameter constants.
 // Benefit: removes call overhead and enables further peephole optimization.
-// Example:
-//   int add1(int x) { return x + 1; }
-//   y = add1(3); // inline to y=4
 
 int y;
 
@@ -12,6 +9,8 @@ int add1(int x) {
     return x + 1;
 }
 
-void main(void) {
-    y = add1(3);
+int main(void) {
+    y = add1(3);  /* 4 */
+    if (y != 4) return 1;
+    return 0;
 }

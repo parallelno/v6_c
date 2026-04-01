@@ -5,8 +5,6 @@
 /*           RET, with a _lc_data: label marking the data location. */
 /* Expect:   Compiles without error. Output contains the _lc_data: label. */
 
-int result;
-
 int load_const() {
     asm {
         LHLD _lc_data
@@ -21,6 +19,7 @@ void unused_func(char a) {
     }
 }
 
-void main(void) {
-    result = load_const();
+int main(void) {
+    if (load_const() != 0x1234) return 1;
+    return 0;
 }

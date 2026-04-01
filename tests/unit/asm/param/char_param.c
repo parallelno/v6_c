@@ -11,6 +11,7 @@ void out_byte(char val) {
     };
 }
 
-void main(void) {
+int main(void) {
     out_byte(0xFF);
+    return 0;
 }

@@ -5,8 +5,6 @@
 /*           x already being in HL per calling convention. */
 /* Expect:   Compiles without error. */
 
-int result;
-
 int just_return(int x) {
     asm {
 _l_just_return_x = 0
@@ -14,6 +12,7 @@ _l_just_return_x = 0
     }
 }
 
-void main(void) {
-    result = just_return(7);
+int main(void) {
+    if (just_return(7) != 7) return 1;
+    return 0;
 }

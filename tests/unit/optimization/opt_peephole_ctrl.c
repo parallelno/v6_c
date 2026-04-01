@@ -1,7 +1,5 @@
 /* opt_peephole_ctrl.c - peephole control-flow coverage */
 
-int status;
-
 int route(int x)
 {
     if (x == 0) {
@@ -16,24 +14,27 @@ L3:
     return 7;
 }
 
-void main(void)
+int main(void)
 {
     int pos;
     int neg;
     int safe;
 
-    /* positive: branch/jump patterns */
+    /* pos = route(0): x==0 → L1→L3 → return 7 */
     pos = route(0);
 
-    /* negative: alternate branch */
+    /* neg = route(1): x!=0 → L2 → return 9 */
     neg = route(1);
 
-    /* safety: direct compare path */
+    /* neg>pos: 9>7 → safe = 9-7 = 2 */
     if (neg > pos) {
         safe = neg - pos;
     } else {
         safe = pos - neg;
     }
 
-    status = pos + neg + safe;
+    if (pos != 7) return 1;
+    if (neg != 9) return 2;
+    if (safe != 2) return 3;
+    return 0;
 }
