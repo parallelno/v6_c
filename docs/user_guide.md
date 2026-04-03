@@ -17,10 +17,13 @@ v6c source.c -o output.asm
 | Option | Description |
 |--------|-------------|
 | `source.c` | Input C source file(s) |
-| `-o <path>` | Output assembly file path |
-| `--lst <path>` | Output listing file path |
-| `--no-lst` | Suppress listing file generation |
-| `-I <dir>` | Add include search directory |
+| `-o`, `--output <path>` | Output assembly file path (default: first input with `.asm` extension) |
+| `-l`, `--lst <path>` | Listing file path (default: output path with `.lst` extension) |
+| `-i`, `--include <dir>` | Add include search directory |
+| `-v`, `--version` | Show version information (`YYYY.MM.DD-HASH`) |
+| `-h`, `--help` | Show help message |
+
+Running `v6c` with no arguments prints the help message.
 
 ### Examples
 
@@ -32,7 +35,7 @@ v6c hello.c -o hello.asm
 v6c program.c -o program.asm --lst program.lst
 
 # Compile with extra include path
-v6c program.c -o program.asm -I myheaders/
+v6c program.c -o program.asm -i myheaders/
 
 # Multi-file compilation
 v6c file1.c file2.c -o program.asm

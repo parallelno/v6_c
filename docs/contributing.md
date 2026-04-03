@@ -85,7 +85,7 @@ Script parameters:
 
 ```bash
 # Compile a test file
-cargo run -- tests/unit/arith.c -o temp/arith.asm --lst temp/arith.lst
+cargo run -- tests/unit/arith.c -o temp/arith.asm -l temp/arith.lst
 
 # Assemble
 tools/v6asm/v6asm.exe temp/arith.asm

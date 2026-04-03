@@ -18,6 +18,11 @@ mod types;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
+    if args.len() <= 1 {
+        print_help();
+        std::process::exit(0);
+    }
+
     let opts = match parse_args(&args) {
         Ok(o) => o,
         Err(msg) => {
@@ -51,57 +56,74 @@ struct CompilerOpts {
 // Argument parsing
 // ---------------------------------------------------------------------------
 
-fn print_usage() {
-    eprintln!("Usage: v6c <input.c> [input2.c ...] [-o <output.asm>] [--lst <output.lst>] [--no-lst] [-I <path>]");
+// ---------------------------------------------------------------------------
+// Version
+// ---------------------------------------------------------------------------
+
+fn version_string() -> String {
+    let date = env!("V6C_BUILD_DATE", "unknown");
+    let hash = env!("V6C_BUILD_HASH", "unknown");
+    format!("{}-{}", date, hash)
+}
+
+// ---------------------------------------------------------------------------
+// Argument parsing
+// ---------------------------------------------------------------------------
+
+fn print_help() {
+    eprintln!("C compiler for Intel 8080, version {}", version_string());
+    eprintln!("(c) Aleksandr Fedotovskikh mailforfriend@gmail.com");
+    eprintln!();
+    eprintln!("Usage: v6c <input.c> [input2.c ...] [-o <output.asm>] [--lst <output.lst>] [-i <path>]");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  -o <file>   Output file path (default: first input with .asm extension)");
-    eprintln!("  --lst <file>  Listing output path (default: output path with .lst extension)");
-    eprintln!("  --no-lst      Disable listing output generation");
-    eprintln!("  -I <path>   Add include search path");
-    eprintln!("  -h, --help  Show this help message");
+    eprintln!("  -o, --output <file>  Output file path (default: first input with .asm extension)");
+    eprintln!("  -l, --lst <file>     Listing output path (default: output path with .lst extension)");
+    eprintln!("  -i, --include <path> Add include search path");
+    eprintln!("  -v, --version        Show version information");
+    eprintln!("  -h, --help           Show this help message");
 }
 
 fn parse_args(args: &[String]) -> Result<CompilerOpts, String> {
     let mut inputs: Vec<String> = Vec::new();
     let mut output: Option<String> = None;
     let mut lst_output: Option<String> = None;
-    let mut emit_lst = true;
     let mut include_paths: Vec<String> = Vec::new();
 
     let mut i = 1; // skip program name
     while i < args.len() {
         match args[i].as_str() {
             "-h" | "--help" => {
-                print_usage();
+                print_help();
                 std::process::exit(0);
             }
-            "-o" => {
+            "-v" | "--version" => {
+                eprintln!("{}", version_string());
+                std::process::exit(0);
+            }
+            "-o" | "--output" => {
                 i += 1;
                 if i >= args.len() {
                     return Err("-o requires an argument".into());
                 }
                 output = Some(args[i].clone());
             }
-            "-I" => {
+            "-i" | "--include" => {
                 i += 1;
                 if i >= args.len() {
-                    return Err("-I requires an argument".into());
+                    return Err("-i requires an argument".into());
                 }
                 include_paths.push(args[i].clone());
             }
-            "--lst" => {
+            "-l" | "--lst" => {
                 i += 1;
                 if i >= args.len() {
                     return Err("--lst requires an argument".into());
                 }
                 lst_output = Some(args[i].clone());
             }
-            "--no-lst" => {
-                emit_lst = false;
-            }
-            arg if arg.starts_with("-I") => {
-                // Support -Ipath (no space)
+            arg if arg.starts_with("-i") && arg.len() > 2 && !arg.starts_with("--") => {
+                // Support -ipath (no space)
                 include_paths.push(arg[2..].to_string());
             }
             arg if arg.starts_with('-') => {
@@ -127,17 +149,13 @@ fn parse_args(args: &[String]) -> Result<CompilerOpts, String> {
         }
     });
 
-    let final_lst_output = if emit_lst {
-        Some(lst_output.unwrap_or_else(|| {
-            if let Some(stem) = output_path.strip_suffix(".asm") {
-                format!("{}.lst", stem)
-            } else {
-                format!("{}.lst", output_path)
-            }
-        }))
-    } else {
-        None
-    };
+    let final_lst_output = Some(lst_output.unwrap_or_else(|| {
+        if let Some(stem) = output_path.strip_suffix(".asm") {
+            format!("{}.lst", stem)
+        } else {
+            format!("{}.lst", output_path)
+        }
+    }));
 
     Ok(CompilerOpts {
         inputs,

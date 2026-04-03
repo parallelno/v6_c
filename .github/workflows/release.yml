@@ -1,0 +1,107 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: v6c.exe
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: v6c
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Compute version
+        id: version
+        shell: bash
+        run: |
+          DATE=$(date +'%Y.%m.%d')
+          HASH=$(git rev-parse --short HEAD)
+          echo "version=${DATE}-${HASH}" >> "$GITHUB_OUTPUT"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $dir = "v6c-${version}-windows"
+          New-Item -ItemType Directory -Path $dir
+          Copy-Item "target/${{ matrix.target }}/release/v6c.exe" "$dir/"
+          Copy-Item -Recurse "docs" "$dir/docs"
+          Copy-Item -Recurse "include" "$dir/include"
+          Compress-Archive -Path $dir -DestinationPath "v6c-${version}-windows.zip"
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          dir="v6c-${version}-linux"
+          mkdir -p "$dir"
+          cp "target/${{ matrix.target }}/release/v6c" "$dir/"
+          cp -r docs "$dir/docs"
+          cp -r include "$dir/include"
+          tar czf "v6c-${version}-linux.tar.gz" "$dir"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: v6c-${{ runner.os }}
+          path: |
+            v6c-*.zip
+            v6c-*.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute version
+        id: version
+        run: |
+          DATE=$(date +'%Y.%m.%d')
+          HASH=$(git rev-parse --short HEAD)
+          echo "version=${DATE}-${HASH}" >> "$GITHUB_OUTPUT"
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: v6c ${{ steps.version.outputs.version }}
+          body: "v6c release ${{ steps.version.outputs.version }}"
+          files: |
+            dist/**/*.zip
+            dist/**/*.tar.gz

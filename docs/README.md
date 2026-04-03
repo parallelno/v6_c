@@ -28,8 +28,7 @@
 | 14 | [Inline Assembly](inline_asm.md) | `asm { }` blocks, parameterized asm, full-body asm functions, clobber hints |
 | 15 | [Standard Library](stdlib.md) | C headers, runtime library functions, assembly implementations |
 | 16 | [Testing](testing.md) | Test pipeline, unit tests, execution tests, benchmarks, test harness |
-| 17 | [User Guide](user_guide.md) | Installation, CLI options, compilation workflow, C language support |
-| 18 | [Contributing Guide](contributing.md) | Building from source, running tests, adding tests, project structure |
+| 17 | [Contributing Guide](contributing.md) | Building from source, running tests, adding tests, project structure |
 
 ### Design Documents
 
