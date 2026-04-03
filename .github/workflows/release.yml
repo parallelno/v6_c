@@ -54,6 +54,7 @@ jobs:
           Copy-Item "target/${{ matrix.target }}/release/v6c.exe" "$dir/"
           Copy-Item -Recurse "docs" "$dir/docs"
           Copy-Item -Recurse "include" "$dir/include"
+          Copy-Item -Recurse "tools" "$dir/tools"
           Compress-Archive -Path $dir -DestinationPath "v6c-${version}-windows.zip"
 
       - name: Package (Linux)
@@ -66,6 +67,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/v6c" "$dir/"
           cp -r docs "$dir/docs"
           cp -r include "$dir/include"
+          cp -r tools "$dir/tools"
           tar czf "v6c-${version}-linux.tar.gz" "$dir"
 
       - name: Upload artifact
