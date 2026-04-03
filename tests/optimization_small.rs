@@ -4,14 +4,26 @@ use std::process::Command;
 
 #[test]
 fn run_optimization_small_test_suite() {
-    if !cfg!(windows) {
-        eprintln!("Skipping optimization_small test: v6asm.exe is Windows-only in tools/v6asm");
+    let repo_root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let v6asm_exe = repo_root.join("tools").join("v6asm").join("v6asm.exe");
+    let v6asm_bin = repo_root.join("tools").join("v6asm").join("v6asm");
+    let v6emul_exe = repo_root.join("tools").join("v6emul").join("v6emul.exe");
+    let v6emul_bin = repo_root.join("tools").join("v6emul").join("v6emul");
+
+    let has_v6asm = v6asm_exe.exists() || v6asm_bin.exists();
+    let has_v6emul = v6emul_exe.exists() || v6emul_bin.exists();
+
+    if !has_v6asm {
+        eprintln!("Skipping optimization_small test: v6asm not found in tools/v6asm");
+        return;
+    }
+    if !has_v6emul {
+        eprintln!("Skipping optimization_small test: v6emul not found in tools/v6emul");
         return;
     }
 
-    let repo_root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let script_path = repo_root.join("scripts").join("run_optimization_unit_checks.ps1");
-    let shell = "powershell";
+    let shell = if cfg!(windows) { "powershell" } else { "pwsh" };
 
     let output = Command::new(shell)
         .args(&["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])

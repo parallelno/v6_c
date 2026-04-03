@@ -19,7 +19,9 @@ if ($UseSmall) {
     $outDir = Join-Path $repoRoot "out\tests\unit\optimization"
 }
 $v6asmExe = Join-Path $repoRoot "tools\v6asm\v6asm.exe"
+$v6asmBin = Join-Path $repoRoot "tools\v6asm\v6asm"
 $v6emulExe = Join-Path $repoRoot "tools\v6emul\v6emul.exe"
+$v6emulBin = Join-Path $repoRoot "tools\v6emul\v6emul"
 
 $strictMode = $RequireV6asm -or (-not $AllowAsmFailure)
 
@@ -27,12 +29,18 @@ function Resolve-V6asm {
     if (Test-Path $v6asmExe) {
         return $v6asmExe
     }
+    if (Test-Path $v6asmBin) {
+        return $v6asmBin
+    }
     return $null
 }
 
 function Resolve-V6emul {
     if (Test-Path $v6emulExe) {
         return $v6emulExe
+    }
+    if (Test-Path $v6emulBin) {
+        return $v6emulBin
     }
     return $null
 }
