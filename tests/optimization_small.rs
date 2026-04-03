@@ -6,8 +6,9 @@ use std::process::Command;
 fn run_optimization_small_test_suite() {
     let repo_root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let script_path = repo_root.join("scripts").join("run_optimization_unit_checks.ps1");
+    let shell = if cfg!(windows) { "powershell" } else { "pwsh" };
 
-    let output = Command::new("powershell")
+    let output = Command::new(shell)
         .args(&["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
         .arg(script_path)
         .arg("-UseSmall")
