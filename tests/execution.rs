@@ -110,6 +110,10 @@ fn run_unit_rom_execution_suite() {
         eprintln!("Skipping execution suite: missing {}", v6asm.display());
         return;
     }
+    if !cfg!(windows) {
+        eprintln!("Skipping execution suite: v6asm is Windows executable, running only on Windows hosts");
+        return;
+    }
 
     let v6emul = root.join("tools").join("v6emul").join("v6emul.exe");
     if !v6emul.exists() {

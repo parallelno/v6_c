@@ -38,7 +38,7 @@ fn compile(subfolder: &str, name: &str) -> String {
 
     // Step 2: assemble .asm with v6asm (must succeed with no errors)
     let v6asm = root.join("tools").join("v6asm").join("v6asm.exe");
-    if v6asm.exists() {
+    if v6asm.exists() && cfg!(windows) {
         let asm_file = format!("{}.asm", base);
         let v6asm_out = Command::new(&v6asm)
             .arg(&asm_file)
@@ -53,6 +53,8 @@ fn compile(subfolder: &str, name: &str) -> String {
             String::from_utf8_lossy(&v6asm_out.stdout),
             String::from_utf8_lossy(&v6asm_out.stderr)
         );
+    } else if v6asm.exists() {
+        eprintln!("Skipping v6asm execution on non-Windows host: {}", v6asm.display());
     }
 
     asm
