@@ -4,14 +4,23 @@ Detailed analysis of v6c compiler output across sieve.c, dhrystone.c, fannkuch.c
 loop.c, and the optimization_small test suite. Items are ordered by estimated
 cycle-count impact (highest first).
 
+> **Note (2026-04-06):** All cycle counts in this report use Vector 06c
+> (КР580ВМ80) timings, which differ from standard i8080 timings. Key
+> differences: `MOV R,R` = 8 (not 5), `LHLD`/`SHLD` = 20 (not 16),
+> `LXI` = 12 (not 10), `DAD` = 12 (not 10), `INX`/`DCX` = 8 (not 5),
+> `JMP`/`J*` = 12 (not 10), `CALL` = 24 (not 17), `RET` = 12 (not 10),
+> `MOV R,M`/`MOV M,R` = 8 (not 7), `MVI M` = 12 (not 10).
+> `XCHG` = 4, register ALU (`ADD R`, `SUB R`, `ORA R`, etc.) = 4 — same
+> as standard i8080.
+
 ---
 
 ## 1. W16 Comparison + Branch Fusion (CRITICAL)
 
 **Current state:** CPI-branch fusion exists only for W8 comparisons. Every W16
 comparison (the dominant width) materialises a full boolean value into HL,
-then tests it again. A typical `i <= size` loop guard emits **~18 instructions /
-~60 cycles**:
+then tests it again. A typical `i <= size` loop guard emits **~22 instructions /
+~170–200 cycles** (Vector timings):
 
 ```asm
 ; --- current: i <= size ---
@@ -63,9 +72,9 @@ JZ   L0__main
 JMP  L1__main         ; exit loop
 ```
 
-This cuts **~10 instructions / ~35 cycles per comparison** and eliminates
+This cuts **~12 instructions / ~70–100 cycles per comparison** and eliminates
 four register shuffles, the LXI+JMP materialisation pair, the MOV B,H / MOV C,L
-copy, and the ORA L + JZ re-test, yielding **~60 % speedup on comparison
+copy, and the ORA L + JZ re-test, yielding **~50 % cycle reduction on comparison
 sequences**. Every loop in the benchmarks benefits.
 
 The register shuffle (`MOV B,D; MOV C,E; XCHG; MOV H,B; MOV L,C`) exists
@@ -83,14 +92,15 @@ Every `int` array access generates `CALL __mul16` for `offset * 2`:
 ; flags[i] access:
 LHLD _l_main_i
 LXI  D,2
-CALL __mul16       ; ~150 cycles for a simple shift!
+CALL __mul16       ; ~350 cycles on Vector for a simple shift!
 XCHG
 LXI  H,_g_flags
 DAD  D
 ```
 
-`__mul16` is a general-purpose 16-bit multiply loop (~150 cycles).
-Multiplying by 2 should be a single `DAD H` (11 cycles).
+`__mul16` is a general-purpose 16-bit multiply loop (~220–1800 cycles on Vector,
+depending on operand values; even a multiply by 2 costs ~350 cycles).
+Multiplying by 2 should be a single `DAD H` (12 cycles).
 
 **Proposed:** Extend `gen_ptr_add` with fast-paths matching `gen_mul`:
 
@@ -115,8 +125,10 @@ fn gen_ptr_add(&mut self, dst: VReg, ptr: VReg, offset: VReg, element_size: u16)
 }
 ```
 
-In sieve.c the inner loop has four `int[]` accesses → saves ~**560 cycles per
-inner iteration**. In fannkuch.c, virtually every line uses array indexing.
+In sieve.c the inner loop has four `int[]` accesses → saves **~800–7000+
+cycles per inner iteration** (depending on index values; `__mul16` cost grows
+with the number of significant bits in the index). In fannkuch.c, virtually
+every line uses array indexing, so the impact is even greater.
 
 ---
 
@@ -150,7 +162,8 @@ LHLD _l_main_i      ; HL = i
 ```
 
 **b) Use XCHG:** When lhs is in DE and rhs is in HL, emit a single `XCHG`
-(4 cycles) instead of the 4-MOV shuffle through BC (20 cycles).
+(4 cycles) instead of the 4-MOV shuffle through BC (32 cycles on Vector, since
+each `MOV R,R` costs 8 cycles).
 
 ---
 
@@ -179,17 +192,18 @@ For sieve.c's inner loop (`k += prime`):
 
 ```asm
 ; current (per iteration):
-LHLD _l_main_k       ; 16 cycles
+LHLD _l_main_k       ; 20 cycles
 XCHG                  ; 4 cycles
-LHLD _l_main_prime   ; 16 cycles
-DAD  D                ; 10 cycles
-SHLD _l_main_k       ; 16 cycles
-; total: 62 cycles
+LHLD _l_main_prime   ; 20 cycles
+DAD  D                ; 12 cycles
+SHLD _l_main_k       ; 20 cycles
+; total: 76 cycles
 
 ; proposed (k in DE, prime in BC):
 XCHG                  ; 4 cycles
-DAD  D                ; 10 cycles (DE = updated k)
-; total: 14 cycles
+DAD  B                ; 12 cycles
+XCHG                  ; 4 cycles
+; total: 20 cycles
 ```
 
 ---
@@ -327,7 +341,7 @@ INX  H
 MOV  M,D        ; store high byte
 ```
 
-Storing zero to an `int` could use:
+Total: 12 + 8 + 8 + 8 = 36 cycles.  Storing zero to an `int` could use:
 
 ```asm
 MVI  M,0
@@ -335,7 +349,7 @@ INX  H
 MVI  M,0
 ```
 
-Or better, for arrays of int 0:
+Total: 12 + 8 + 12 = 32 cycles.  Or better, for arrays of int 0:
 
 ```asm
 XRA  A
@@ -344,13 +358,17 @@ INX  H
 MOV  M,A
 ```
 
-This saves loading zero into a register pair. Similarly, storing 1:
+Total: 4 + 8 + 8 + 8 = 28 cycles — saves 8 cycles and avoids occupying DE.
+
+Similarly, storing 1:
 
 ```asm
 MVI  M,1
 INX  H
 MVI  M,0
 ```
+
+Total: 12 + 8 + 12 = 32 cycles vs 36 for the `LXI D` approach.
 
 **Proposed:** In codegen, when StorePtr value is a known immediate, emit
 `MVI M,n` directly instead of loading into DE first.
@@ -429,7 +447,7 @@ In sieve.c, `_l_main_size` is loaded every iteration of the outer and inner
 loops:
 
 ```asm
-LHLD _l_main_size   ; loaded every iteration but never changes!
+LHLD _l_main_size   ; 20 cycles — loaded every iteration but never changes!
 ```
 
 LICM (Loop Invariant Code Motion) should hoist this outside the loop. The
@@ -476,45 +494,49 @@ missed CSE opportunity. Additionally, `&arr[i-1]` could be computed as
 `flags[i] = 1` and `flags[k] = 0` store to an `int` (2-byte) array using:
 
 ```asm
-LXI  D,1         ; 10 cycles
-MOV  M,E         ; 7 cycles
-INX  H           ; 5 cycles
-MOV  M,D         ; 7 cycles
+LXI  D,1         ; 12 cycles
+MOV  M,E         ; 8 cycles
+INX  H           ; 8 cycles
+MOV  M,D         ; 8 cycles
 ```
 
-Since the values 0 and 1 fit in a byte and `int` on 8080 is 16-bit:
+Total: 36 cycles.  Since the values 0 and 1 fit in a byte and `int` on 8080 is 16-bit:
 
 ```asm
-MVI  M,1         ; 10 cycles (low byte)
-INX  H           ; 5 cycles
-MVI  M,0         ; 10 cycles (high byte)
+MVI  M,1         ; 12 cycles (low byte)
+INX  H           ; 8 cycles
+MVI  M,0         ; 12 cycles (high byte)
 ```
 
-Both are similar in cycle count, but the `MVI M,n` form avoids occupying the
+Total: 32 cycles.  Both are similar in cycle count, but the `MVI M,n` form avoids occupying the
 DE register pair, leaving it free for other values.
 
 ---
 
 ## Summary of Impact
 
-| # | Optimization | Est. Savings | Difficulty |
+| # | Optimization | Est. Savings (Vector) | Difficulty |
 |---|-------------|-------------|------------|
-| 1 | W16 compare-branch fusion | ~35 cycles/compare | Medium |
-| 2 | PtrAdd fast-path for element_size 2/4/8 | ~140 cycles/array access | Easy |
-| 3 | Eliminate register shuffles around compares | ~16 cycles/compare | Medium |
-| 4 | Loop induction variable register promotion | ~48 cycles/loop iter | Hard |
-| 5 | Compare-with-zero fast path | ~10 cycles/test | Easy |
+| 1 | W16 compare-branch fusion | ~70–100 cycles/compare | Medium |
+| 2 | PtrAdd fast-path for element_size 2/4/8 | ~200–1800 cycles/array access | Easy |
+| 3 | Eliminate register shuffles around compares | ~28 cycles/compare | Medium |
+| 4 | Loop induction variable register promotion | ~56 cycles/loop iter | Hard |
+| 5 | Compare-with-zero fast path | ~12 cycles/test | Easy |
 | 6 | Dedup identical specializations | Code size only | Easy |
 | 7 | Dead inline asm elimination | Case-specific | Easy |
-| 8 | Cross-block store-reload forwarding | ~32 cycles/reload | Medium |
-| 9 | Eliminate dead BC copy after compare | ~8 cycles/compare | Easy (via #1) |
-| 10 | MVI M,n for small immediates | ~5 cycles/store | Easy |
-| 11 | Strength reduction for 2*i+k patterns | ~30 cycles/occurrence | Medium |
+| 8 | Cross-block store-reload forwarding | ~40 cycles/reload | Medium |
+| 9 | Eliminate dead BC copy after compare | ~16 cycles/compare | Easy (via #1) |
+| 10 | MVI M,n for small immediates | ~4–8 cycles/store | Easy |
+| 11 | Strength reduction for 2*i+k patterns | ~40 cycles/occurrence | Medium |
 | 12 | Peephole compare-branch collapse | Safety net for #1 | Medium |
-| 13 | LICM for _l_ variables in loops | ~16 cycles/loop iter | Medium |
-| 14 | CSE for repeated PtrAdd | ~150 cycles/occurrence | Medium |
-| 15 | MVI M,n for constant stores | ~0–5 cycles/store | Easy |
+| 13 | LICM for _l_ variables in loops | ~20 cycles/loop iter | Medium |
+| 14 | CSE for repeated PtrAdd | ~200–1800 cycles/occurrence | Medium |
+| 15 | MVI M,n for constant stores | ~0–4 cycles/store | Easy |
 
 **Biggest wins:** Items 1, 2, and 4 together would dramatically improve code
 quality on every non-trivial program. Item 2 alone (PtrAdd fast-path for
-element_size=2) is a one-line code change with massive payoff.
+element_size=2) is a one-line code change with massive payoff — on Vector,
+`CALL __mul16` for a multiply-by-2 costs ~350 cycles (more for larger indices)
+vs `DAD H` at 12 cycles. Item 3 (register shuffle elimination) is also more
+impactful on Vector than on standard i8080 because `MOV R,R` costs 8 cycles
+(not 5), making the 4-MOV shuffle 32 cycles vs 4 for `XCHG`.
