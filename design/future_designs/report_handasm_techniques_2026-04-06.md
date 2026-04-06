@@ -1,19 +1,19 @@
 # Optimization Techniques from Hand-Optimized ASM — Applicability to v6c
 
-**Date:** 2026-04-06  
+**Date:** 2026-04-06
 **Source files:**
 - `design/future_designs/refs/app_macros.asm` — pointer advance macros with validation
 - `design/future_designs/refs/v6_macros.asm` — Vector-06C utility macros, 16-bit arithmetic idioms
 - `design/future_designs/refs/v6_utils.asm` — memory copy/erase, palette, SP-based bulk ops
 
-**Scope:** Cycle-count improvements for Vector-06C (i8080 with 4-cycle rounding).  
+**Scope:** Cycle-count improvements for Vector-06C (i8080 with 4-cycle rounding).
 All cycle counts below use **Vector-06C rounded timing** unless marked *(i8080)*.
 
 ---
 
 ## 0. Vector-06C Cycle Rounding — Impact on Cost Model
 
-The compiler's internal cost model (if any) must account for 4-cycle rounding.  
+The compiler's internal cost model (if any) must account for 4-cycle rounding.
 Several instructions become **more expensive relative to alternatives** on V6C than on stock i8080:
 
 | Instruction  | i8080 cc | V6C cc | Note |
@@ -161,8 +161,8 @@ This is a **very common pattern** — it covers most `char[]`, `int[]`, and poin
 
 ### Complexity: Medium
 
-Requires codegen to detect the pattern:  
-`PtrAdd(dest, base_const, idx_w8, scale ∈ {1,2,4})` → emit the `ADI/ACI/SUB` sequence.  
+Requires codegen to detect the pattern:
+`PtrAdd(dest, base_const, idx_w8, scale ∈ {1,2,4})` → emit the `ADI/ACI/SUB` sequence.
 Partially overlaps with existing `Mul(d, x, 2)` → `DAD H` but should be recognized as a **combined** scale+offset pattern.
 
 ---
@@ -179,7 +179,7 @@ Partially overlaps with existing `Mul(d, x, 2)` → `DAD H` but should be recogn
 
 ### Current compiler status
 
-Peephole rule 5 already converts `ORA L; CPI 0` → `ORA L` when CPI follows ORA.  
+Peephole rule 5 already converts `ORA L; CPI 0` → `ORA L` when CPI follows ORA.
 However, standalone zero-tests may still emit `CPI 0` (8cc) instead of `ORA A` (4cc).
 
 ### Recommendation
@@ -211,7 +211,7 @@ mem_erase_sp:
     ; ... loop check ...
 ```
 
-Each `PUSH B` writes 2 bytes in 12cc = **6cc/byte**.  
+Each `PUSH B` writes 2 bytes in 12cc = **6cc/byte**.
 Compare: `MOV M,r; INX H` loop = 8+8 = 16cc/byte. **2.67× faster**.
 
 **`mem_copy_to_ram_disk`** — copies memory using `POP; PUSH` pattern through SP, with **Duff's device** (jump-table entry into unrolled loop) for handling non-aligned lengths.
