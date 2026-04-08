@@ -1166,6 +1166,18 @@ impl CodeGenerator {
                     self.emit_inst(&format!("SHLD {}", addr16));
                     return;
                 }
+                // Fast path: compile-time constant value → MVI M,n sequence
+                // (saves DE register and avoids LXI D,val + MOV M,E/D).
+                if let Some(imm) = self.known_imm(src) {
+                    let low = (imm & 0xFF) as u8;
+                    let high = ((imm >> 8) & 0xFF) as u8;
+                    self.regalloc.free(src);
+                    self.ensure_hl(ptr);
+                    self.emit_inst(&format!("MVI M,{}", low));
+                    self.emit_inst("INX H");
+                    self.emit_inst(&format!("MVI M,{}", high));
+                    return;
+                }
                 self.ensure_de(src);
                 self.ensure_hl(ptr);
                 self.emit_inst("MOV M,E");
@@ -2485,6 +2497,21 @@ impl CodeGenerator {
             self.ensure_de(offset);
             self.ensure_hl(ptr);
             self.emit_inst("DAD D");
+        } else if matches!(element_size, 2 | 4 | 8) {
+            // Fast path: scale offset by 2/4/8 via repeated DAD H, then add
+            // to ptr.  Avoids expensive CALL __mul16 (~350+ cycles).
+            self.ensure_hl(offset);
+            let shifts = match element_size {
+                2 => 1,
+                4 => 2,
+                _ => 3, // 8
+            };
+            for _ in 0..shifts {
+                self.emit_inst("DAD H");
+            }
+            self.emit_inst("XCHG"); // DE = scaled offset
+            self.ensure_hl(ptr);
+            self.emit_inst("DAD D");
         } else {
             // offset * element_size, then add to ptr
             self.spill_live_before_call("__mul16");
@@ -3149,8 +3176,10 @@ mod tests {
         f.push_op(IrOp::ptr_add(dst, ptr, off, 2));
         f.push_op(IrOp::ret(Some(dst)));
         let out = gen_single_func(f);
-        assert!(has_line(&out, "CALL __mul16"));
+        // Fast path: DAD H for *2, no __mul16
+        assert!(has_line(&out, "DAD H"));
         assert!(has_line(&out, "DAD D"));
+        assert!(!has_line(&out, "CALL __mul16"));
     }
 
     // -- Shift ------------------------------------------------------------
@@ -3366,5 +3395,75 @@ mod tests {
         let out = gen_single_func(f);
         assert!(has_line(&out, "my_func:"));
         assert!(has_line(&out, "RET"));
+    }
+
+    // -- PtrAdd fast-path (Step 1) ----------------------------------------
+
+    #[test]
+    fn ptr_add_element_size_2_uses_dad_h() {
+        // arr[i] where arr is int* (element_size=2) should use DAD H, not __mul16
+        let mut f = IrFunction::new("test", CType::Void);
+        let ptr = VReg::new(0, Width::W16);
+        let idx = VReg::new(1, Width::W16);
+        let addr = VReg::new(2, Width::W16);
+        let val = VReg::new(3, Width::W16);
+        f.push_op(IrOp::load_global(ptr, "_g_arr"));
+        f.push_op(IrOp::load_global(idx, "_g_i"));
+        f.push_op(IrOp::ptr_add(addr, ptr, idx, 2));
+        f.push_op(IrOp::load_imm(val, 5));
+        f.push_op(IrOp::store_ptr(addr, val));
+        f.push_op(IrOp::ret(None));
+        let out = gen_single_func(f);
+        assert!(has_line(&out, "DAD H"), "element_size=2 should use DAD H");
+        assert!(!has_line(&out, "CALL __mul16"), "element_size=2 should not call __mul16");
+    }
+
+    #[test]
+    fn ptr_add_element_size_4_uses_dad_h() {
+        // long arr[]; arr[i] where element_size=4 should use two DAD H's
+        let mut f = IrFunction::new("test", CType::Void);
+        let ptr = VReg::new(0, Width::W16);
+        let idx = VReg::new(1, Width::W16);
+        let addr = VReg::new(2, Width::W16);
+        f.push_op(IrOp::load_global(ptr, "_g_arr"));
+        f.push_op(IrOp::load_global(idx, "_g_i"));
+        f.push_op(IrOp::ptr_add(addr, ptr, idx, 4));
+        f.push_op(IrOp::ret(Some(addr)));
+        let out = gen_single_func(f);
+        let dad_count = out.iter().filter(|l| l.contains("DAD H")).count();
+        assert_eq!(dad_count, 2, "element_size=4 should use two DAD H");
+        assert!(!has_line(&out, "CALL __mul16"), "element_size=4 should not call __mul16");
+    }
+
+    // -- MVI M,n for constant stores (Step 2) -----------------------------
+
+    #[test]
+    fn store_ptr_zero_uses_mvi_m() {
+        // Storing 0 through pointer should use MVI M,0, not LXI D
+        let mut f = IrFunction::new("test", CType::Void);
+        let ptr = VReg::new(0, Width::W16);
+        let val = VReg::new(1, Width::W16);
+        f.push_op(IrOp::load_global(ptr, "_g_p"));
+        f.push_op(IrOp::load_imm(val, 0));
+        f.push_op(IrOp::store_ptr(ptr, val));
+        f.push_op(IrOp::ret(None));
+        let out = gen_single_func(f);
+        assert!(has_line(&out, "MVI M,0"), "zero store should use MVI M,0");
+        assert!(!has_line(&out, "LXI D,0"), "zero store should not use LXI D,0");
+    }
+
+    #[test]
+    fn store_ptr_const_uses_mvi_m() {
+        // Storing a small constant through pointer should use MVI M,n
+        let mut f = IrFunction::new("test", CType::Void);
+        let ptr = VReg::new(0, Width::W16);
+        let val = VReg::new(1, Width::W16);
+        f.push_op(IrOp::load_global(ptr, "_g_p"));
+        f.push_op(IrOp::load_imm(val, 1));
+        f.push_op(IrOp::store_ptr(ptr, val));
+        f.push_op(IrOp::ret(None));
+        let out = gen_single_func(f);
+        assert!(has_line(&out, "MVI M,"), "constant store should use MVI M,n");
+        assert!(!has_line(&out, "LXI D,1"), "constant store should not use LXI D,1");
     }
 }
