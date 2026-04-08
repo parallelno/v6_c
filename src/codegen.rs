@@ -2072,9 +2072,11 @@ impl CodeGenerator {
                 self.emit_inst(&format!("CMP {}", operand));
             }
             Width::W16 | Width::W32 => {
-                // Subtract: HL - DE, check flags
-                self.ensure_de(rhs);
+                // Subtract: HL - DE, check flags.
+                // Load lhs into HL first: if lhs is already in HL (common case),
+                // no move is needed.  Then load rhs into DE.
                 self.ensure_hl(lhs);
+                self.ensure_de(rhs);
                 // For equality/inequality: XOR compare
                 if kind == "eq" || kind == "ne" {
                     self.emit_inst("MOV A,L");
@@ -3465,5 +3467,45 @@ mod tests {
         let out = gen_single_func(f);
         assert!(has_line(&out, "MVI M,"), "constant store should use MVI M,n");
         assert!(!has_line(&out, "LXI D,1"), "constant store should not use LXI D,1");
+    }
+
+    // -- Step 6: Compare ensure order optimization ------------------------
+
+    #[test]
+    fn compare_w16_no_unnecessary_shuffle() {
+        // When lhs is loaded via add (result in HL) and rhs is an immediate,
+        // the compare should not produce unnecessary register shuffles.
+        let mut f = IrFunction::new("test", CType::Void);
+        let a = VReg::new(0, Width::W16);
+        let b = VReg::new(1, Width::W16);
+        let sum = VReg::new(2, Width::W16);
+        let rhs = VReg::new(3, Width::W16);
+        let cmp = VReg::new(4, Width::W8);
+        let lbl = Label::new(10);
+        f.push_op(IrOp::load_global(a, "_g_a"));
+        f.push_op(IrOp::load_global(b, "_g_b"));
+        f.push_op(IrOp::add(sum, a, b, Width::W16)); // sum in HL
+        f.push_op(IrOp::LoadImm { dst: rhs, value: 100 });
+        f.push_op(IrOp::Lt { dst: cmp, lhs: sum, rhs, width: Width::W16, signed: false });
+        f.push_op(IrOp::JumpIfTrue { cond: cmp, target: lbl });
+        f.push_op(IrOp::Label { label: lbl });
+        f.push_op(IrOp::ret(None));
+        let out = gen_single_func(f);
+        // After DAD D, sum is in HL; ensure_hl(lhs) should be no-op.
+        // rhs should go to DE via LXI D,100 (no LHLD needed).
+        assert!(has_line(&out, "DAD D"), "add should use DAD D");
+        assert!(has_line(&out, "LXI D,100"), "rhs immediate should use LXI D,100");
+        // Between DAD D and MOV A,H (start of compare) there should be no
+        // register-to-register shuffles — just LXI D,100.
+        let dad_idx = out.iter().position(|l| l.contains("DAD D")).unwrap();
+        let sub_idx = out.iter().position(|l| l.contains("SUB D")).unwrap();
+        let between = &out[dad_idx + 1..sub_idx];
+        let has_shuffle = between.iter().any(|l| {
+            l.contains("MOV B,D") || l.contains("MOV C,E")
+                || l.contains("MOV H,B") || l.contains("MOV L,C")
+                || l.contains("MOV D,B") || l.contains("MOV E,C")
+        });
+        assert!(!has_shuffle, "should not have register shuffles between add and compare; got:\n{}",
+            between.iter().map(|l| l.as_str()).collect::<Vec<_>>().join("\n"));
     }
 }
