@@ -1643,4 +1643,52 @@ mod tests {
             }
         }
     }
+
+    /// Bug fix: W16 comparison with live lhs used in if-body — BC must not be
+    /// stale.
+    ///
+    /// When `lhs` is live after a W16 comparison (because the if-body assigns
+    /// it to another variable), `gen_compare` used to call `mark(dst, HL)`
+    /// *after* `LXI H,0`/`LXI H,1`, so the eviction `MOV B,H; MOV C,L`
+    /// copied 0 or 1 (the boolean result) into BC instead of the original
+    /// operand.  The body then read a stale BC via `MOV H,B; MOV L,C`.
+    ///
+    /// The fix: call `mark(dst, HL)` *before* the first conditional branch so
+    /// that HL still holds `lhs` when the eviction fires.
+    #[test]
+    fn fix_w16_compare_bc_not_stale_when_lhs_live_in_body() {
+        let src = r#"
+            int counter;
+            int g_result;
+            void main(void) {
+                counter = counter + 1;
+                if (counter < 10) {
+                    g_result = counter;
+                }
+            }
+        "#;
+        let out = compile_source(src, "test.c", &[]).expect("bc stale test failed");
+        let text = out.join("\n");
+        // BC spill (MOV B,H / MOV C,L) must appear in the output: lhs is live
+        // across the comparison and is saved to BC.
+        assert!(
+            text.contains("MOV B,H") && text.contains("MOV C,L"),
+            "lhs must be spilled to BC: MOV B,H / MOV C,L missing"
+        );
+        // BC reload (MOV H,B / MOV L,C) must appear in the body.
+        assert!(
+            text.contains("MOV H,B") && text.contains("MOV L,C"),
+            "lhs must be reloaded from BC in body: MOV H,B / MOV L,C missing"
+        );
+        // The spill must happen BEFORE the reload (BC is set before use).
+        let spill_pos = out.iter().position(|l| l.contains("MOV B,H")).unwrap();
+        let reload_pos = out.iter().position(|l| l.contains("MOV H,B")).unwrap();
+        assert!(
+            spill_pos < reload_pos,
+            "BC spill (MOV B,H) must precede BC reload (MOV H,B); \
+             got spill at line {} reload at line {}",
+            spill_pos,
+            reload_pos
+        );
+    }
 }

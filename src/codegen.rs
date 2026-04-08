@@ -2107,6 +2107,15 @@ impl CodeGenerator {
             }
         }
 
+        // Mark dst as living in HL *before* any conditional branch so that any
+        // live value currently in HL (e.g. lhs) is evicted to BC via
+        // MOV B,H / MOV C,L while HL still contains it.  If this call is
+        // deferred until after the conditional branches and the LXI H,0/1
+        // instructions the eviction copies 0 or 1 (the boolean result) into BC
+        // instead of the original operand, leaving a stale BC value for any
+        // subsequent use of lhs.
+        self.mark(dst, PhysReg::HL);
+
         // Now branch based on comparison kind
         let branch = match kind {
             "eq" => "JZ",
@@ -2142,7 +2151,6 @@ impl CodeGenerator {
         self.emit_label(&true_lbl);
         self.emit_inst("LXI H,1");
         self.emit_label(&done_lbl);
-        self.mark(dst, PhysReg::HL);
     }
 
     // -- Neg (two's complement) -------------------------------------------
