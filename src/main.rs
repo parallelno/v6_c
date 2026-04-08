@@ -1529,8 +1529,9 @@ mod tests {
             has_line(&out, "ORA L"),
             "zero comparison must use ORA L to test HL"
         );
-        // Must NOT have boolean materialisation — the false path assigns LXI H,0
-        // (the `1` seen in output is from `r = 1`, not from bool materialisation)
+        // Must NOT have boolean materialisation — the false path assigns LXI H,0.
+        // The `r = 1` and `r = 2` assignments only generate `LXI H,1` / `LXI H,2`
+        // (not `LXI H,0`), so any `LXI H,0` in the output is from materialisation.
         assert!(
             !has_line(&out, "LXI H,0"),
             "zero comparison must not materialise bool via LXI H,0 false path"
@@ -1580,7 +1581,9 @@ mod tests {
             "W16 comparison must subtract high bytes (SUB D)"
         );
         // Boolean materialisation false path (LXI H,0 / JMP) must be eliminated.
-        // Note: LXI H,1 and LXI H,2 legitimately appear for `r = 1` / `r = 2`.
+        // Note: `LXI H,1` and `LXI H,2` legitimately appear for `r = 1` / `r = 2`
+        // assignments, but `LXI H,0` only appears when bool materialisation is present
+        // (the test body never assigns 0).
         assert!(
             !has_line(&out, "LXI H,0"),
             "W16 compare-branch should not materialise bool false path (LXI H,0 found)"

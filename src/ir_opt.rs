@@ -2175,7 +2175,8 @@ fn compare_zero_simplify(func: &mut IrFunction) -> bool {
                 } else {
                     IrOp::JumpIfTrue { cond: VReg::new(operand.id, cmp_width), target }
                 };
-                // Replace comparison with Nop (will be cleaned up by DCE).
+                // Replace comparison with a dead LoadImm placeholder (value=0).
+                // This makes cmp_dst_id dead; DCE will remove it in the next pass.
                 func.body[i] = IrInstr { op: IrOp::LoadImm { dst: VReg::new(cmp_dst_id, Width::W8), value: 0 }, line };
                 func.body[i + 1] = IrInstr { op: new_op, line: func.body[i + 1].line };
                 changed = true;
@@ -2190,6 +2191,8 @@ fn compare_zero_simplify(func: &mut IrFunction) -> bool {
                 } else {
                     IrOp::JumpIfFalse { cond: VReg::new(operand.id, cmp_width), target }
                 };
+                // Replace comparison with a dead LoadImm placeholder (value=0).
+                // This makes cmp_dst_id dead; DCE will remove it in the next pass.
                 func.body[i] = IrInstr { op: IrOp::LoadImm { dst: VReg::new(cmp_dst_id, Width::W8), value: 0 }, line };
                 func.body[i + 1] = IrInstr { op: new_op, line: func.body[i + 1].line };
                 changed = true;
@@ -2204,9 +2207,9 @@ fn compare_zero_simplify(func: &mut IrFunction) -> bool {
     changed
 }
 
-/// Collect source (non-destination) vregs referenced by an IR operation.
+/// Collect source (non-destination) vreg IDs referenced by an IR operation.
 /// (Note: the existing `collect_src_vregs` at module scope returns `Vec<u32>`;
-///  this is a wrapper that returns `Vec<VReg>` for use in compare_zero_simplify.)
+///  this local variant returns `Vec<u32>` IDs for use in compare_zero_simplify.)
 fn collect_src_vreg_ids(op: &IrOp) -> Vec<u32> {
     // Delegate to the existing function.
     let mut srcs = Vec::new();
