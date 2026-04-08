@@ -566,12 +566,24 @@ fn load_store_forwarding(func: &mut IrFunction) -> bool {
 
     for instr in &func.body {
         match &instr.op {
-            // Unconditional control flow and join points: any path can reach
-            // what follows, so we conservatively clear the forwarding map.
-            IrOp::Label { .. }
-            | IrOp::Jump { .. }
-            | IrOp::Return { .. } => {
+            // Unconditional control flow and join points.
+            // Labels are merge points — any path can reach them, so we must
+            // conservatively clear the forwarding map for all variables.
+            // For Jump and Return, the fall-through to the next instruction
+            // is the only path, but the next instruction is typically dead
+            // code until the next Label, so clearing is safest.
+            // _l_* variables are compiler-local and never address-taken, so
+            // we preserve their forwarding facts across unconditional jumps
+            // (the linear fall-through path). At labels (merge points) we
+            // still clear everything because another predecessor may have
+            // stored a different value.
+            IrOp::Label { .. } => {
                 mem_state.clear();
+                out.push(instr.clone());
+            }
+            IrOp::Jump { .. }
+            | IrOp::Return { .. } => {
+                mem_state.retain(|label, _| label.starts_with("_l_"));
                 out.push(instr.clone());
             }
             // Conditional branches: the fall-through path still sees every
@@ -1596,6 +1608,61 @@ fn strength_reduce(func: &mut IrFunction) -> bool {
         })
         .collect();
 
+    // Find max vreg ID for allocating new vregs.
+    let mut max_vreg_id: u32 = func
+        .body
+        .iter()
+        .filter_map(|instr| get_dst_vreg(&instr.op))
+        .map(|v| v.id)
+        .max()
+        .unwrap_or(0);
+
+    // Collect Add(x, x) → Shl(x, 1) conversions that need a new LoadImm.
+    // We record (insertion_index, new_load_imm_instr, shift_rhs_vreg_id).
+    let mut add_self_conversions: Vec<(usize, u32)> = Vec::new();
+
+    for (idx, instr) in func.body.iter().enumerate() {
+        match &instr.op {
+            // Add(x, x) → candidate for Shl(x, 1)
+            IrOp::Add { lhs, rhs, width, .. } if lhs.id == rhs.id && *width != Width::W8 => {
+                max_vreg_id += 1;
+                add_self_conversions.push((idx, max_vreg_id));
+            }
+            _ => {}
+        }
+    }
+
+    // Apply Add(x, x) → Shl(x, 1) conversions with injected LoadImm.
+    if !add_self_conversions.is_empty() {
+        let mut new_body: Vec<IrInstr> = Vec::with_capacity(func.body.len() + add_self_conversions.len());
+        let conv_map: HashMap<usize, u32> = add_self_conversions.iter().copied().collect();
+        for (idx, instr) in func.body.iter().enumerate() {
+            if let Some(&shift_vreg_id) = conv_map.get(&idx) {
+                if let IrOp::Add { dst, lhs, width, .. } = &instr.op {
+                    let shift_vreg = VReg::new(shift_vreg_id, lhs.width);
+                    // Insert LoadImm for shift amount (1) before the Shl.
+                    new_body.push(IrInstr {
+                        op: IrOp::LoadImm { dst: shift_vreg, value: 1 },
+                        line: instr.line,
+                    });
+                    new_body.push(IrInstr {
+                        op: IrOp::Shl {
+                            dst: *dst,
+                            lhs: *lhs,
+                            rhs: shift_vreg,
+                            width: *width,
+                        },
+                        line: instr.line,
+                    });
+                    changed = true;
+                    continue;
+                }
+            }
+            new_body.push(instr.clone());
+        }
+        func.body = new_body;
+    }
+
     for instr in &mut func.body {
         match &instr.op {
             // Multiply by power of 2 → shift left
@@ -2306,6 +2373,7 @@ fn cse(func: &mut IrFunction) -> bool {
 enum CseKey {
     BinOp { op: &'static str, lhs_id: u32, rhs_id: u32, width: Width },
     UnaryOp { op: &'static str, src_id: u32, width: Width },
+    PtrAddOp { ptr_id: u32, offset_id: u32, element_size: u16 },
 }
 
 /// Extract a CSE key and the destination vreg from an instruction, if applicable.
@@ -2346,6 +2414,10 @@ fn cse_key(op: &IrOp) -> Option<(CseKey, VReg)> {
         )),
         IrOp::Not { dst, src, width } => Some((
             CseKey::UnaryOp { op: "not", src_id: src.id, width: *width },
+            *dst,
+        )),
+        IrOp::PtrAdd { dst, ptr, offset, element_size } => Some((
+            CseKey::PtrAddOp { ptr_id: ptr.id, offset_id: offset.id, element_size: *element_size },
             *dst,
         )),
         _ => None,
@@ -3268,11 +3340,46 @@ fn loop_invariant_code_motion(func: &mut IrFunction) -> bool {
             }
         }
 
+        // Step 9 (LICM for _l_ variables): collect labels that are stored
+        // to inside the loop and check for calls.  LoadGlobal for _l_*
+        // labels that are not stored inside the loop (and have no calls
+        // that could alias them) can be safely hoisted.
+        let mut loop_stored_labels: HashSet<String> = HashSet::new();
+        let mut loop_has_call = false;
+        for idx in lp.header_idx..=lp.back_edge_idx {
+            match &func.body[idx].op {
+                IrOp::StoreGlobal { addr_label, .. } => {
+                    loop_stored_labels.insert(addr_label.clone());
+                }
+                IrOp::Call { .. } | IrOp::InlineAsm { .. } => {
+                    loop_has_call = true;
+                }
+                _ => {}
+            }
+        }
+
         // Identify loop-invariant instructions: pure instructions whose
         // source operands are ALL defined outside the loop.
         let mut hoist_indices: Vec<usize> = Vec::new();
         for idx in lp.header_idx..=lp.back_edge_idx {
             let op = &func.body[idx].op;
+
+            // Check if this is a hoistable LoadGlobal for a _l_ variable.
+            let is_hoistable_load_global = match op {
+                IrOp::LoadGlobal { addr_label, .. } => {
+                    addr_label.starts_with("_l_")
+                        && !loop_stored_labels.contains(addr_label)
+                        && !loop_has_call
+                }
+                _ => false,
+            };
+
+            if !is_hoistable_load_global {
+                // Only hoist pure instructions (no side effects).
+                if get_pure_dst(op).is_none() {
+                    continue;
+                }
+            }
             // Only hoist pure instructions (no side effects).
             if get_pure_dst(op).is_none() {
                 continue;

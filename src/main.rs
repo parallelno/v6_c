@@ -1669,26 +1669,26 @@ mod tests {
         "#;
         let out = compile_source(src, "test.c", &[]).expect("bc stale test failed");
         let text = out.join("\n");
-        // BC spill (MOV B,H / MOV C,L) must appear in the output: lhs is live
-        // across the comparison and is saved to BC.
+        // With W16 compare-branch fusion, the comparison emits direct
+        // conditional jumps without materialising a boolean in HL.
+        // counter stays in HL across the fused comparison, so no BC
+        // spill/reload is needed.  Just verify the body stores counter
+        // to g_result (SHLD _g_g_result must appear).
         assert!(
-            text.contains("MOV B,H") && text.contains("MOV C,L"),
-            "lhs must be spilled to BC: MOV B,H / MOV C,L missing"
+            text.contains("SHLD _g_g_result"),
+            "g_result = counter must appear as SHLD _g_g_result"
         );
-        // BC reload (MOV H,B / MOV L,C) must appear in the body.
+        // The comparison should use direct conditional jump (JNC or JC or JP or JM)
+        // and NOT materialise a boolean (LXI H,0 / LXI H,1).
+        // Check that within the main function there is no LXI H,0 followed by LXI H,1
+        // for comparison materialisation.  (There may be LXI H,1 for counter+1 though.)
+        let main_start = out.iter().position(|l| l.contains("main:")).unwrap();
+        let main_end = out.iter().position(|l| l.contains("RET")).unwrap_or(out.len());
+        let main_section = &out[main_start..main_end];
+        let has_lxi_h_0 = main_section.iter().any(|l| l.trim() == "LXI H,0");
         assert!(
-            text.contains("MOV H,B") && text.contains("MOV L,C"),
-            "lhs must be reloaded from BC in body: MOV H,B / MOV L,C missing"
-        );
-        // The spill must happen BEFORE the reload (BC is set before use).
-        let spill_pos = out.iter().position(|l| l.contains("MOV B,H")).unwrap();
-        let reload_pos = out.iter().position(|l| l.contains("MOV H,B")).unwrap();
-        assert!(
-            spill_pos < reload_pos,
-            "BC spill (MOV B,H) must precede BC reload (MOV H,B); \
-             got spill at line {} reload at line {}",
-            spill_pos,
-            reload_pos
+            !has_lxi_h_0,
+            "W16 compare-branch fusion should eliminate LXI H,0 materialisation"
         );
     }
 }

@@ -2062,6 +2062,92 @@ impl CodeGenerator {
         // ----------------------------------------------------------------
         // General path (W16/W32, or W8 with a non-immediate RHS)
         // ----------------------------------------------------------------
+
+        // ----------------------------------------------------------------
+        // W16 compare-branch fusion (Step 7).
+        //
+        // When the next IR instruction is JumpIfTrue/JumpIfFalse consuming
+        // this comparison's result vreg, skip the boolean materialisation
+        // (LXI H,0 / LXI H,1) and emit direct conditional jumps instead.
+        // This saves ~70–100 cycles per comparison.
+        // ----------------------------------------------------------------
+        if width == Width::W16 || width == Width::W32 {
+            let fuse_target: Option<(Label, bool)> = match next_op {
+                Some(IrOp::JumpIfTrue  { cond, target }) if cond.id == dst.id => Some((*target, true)),
+                Some(IrOp::JumpIfFalse { cond, target }) if cond.id == dst.id => Some((*target, false)),
+                _ => None,
+            };
+
+            if let Some((target, branch_if_true)) = fuse_target {
+                self.ensure_hl(lhs);
+                self.ensure_de(rhs);
+                let lbl = self.ir_label(target);
+
+                if kind == "eq" || kind == "ne" {
+                    // For eq/ne: compare both bytes
+                    let is_eq = kind == "eq";
+                    if branch_if_true {
+                        if is_eq {
+                            // JumpIfTrue(eq): branch if lhs == rhs
+                            let ne_skip = self.fresh_label();
+                            self.emit_inst("MOV A,L");
+                            self.emit_inst("SUB E");
+                            self.emit_inst(&format!("JNZ {}", ne_skip));
+                            self.emit_inst("MOV A,H");
+                            self.emit_inst("SUB D");
+                            self.emit_inst(&format!("JZ {}", lbl));
+                            self.emit_label(&ne_skip);
+                        } else {
+                            // JumpIfTrue(ne): branch if lhs != rhs
+                            self.emit_inst("MOV A,L");
+                            self.emit_inst("SUB E");
+                            self.emit_inst(&format!("JNZ {}", lbl));
+                            self.emit_inst("MOV A,H");
+                            self.emit_inst("SUB D");
+                            self.emit_inst(&format!("JNZ {}", lbl));
+                        }
+                    } else {
+                        if is_eq {
+                            // JumpIfFalse(eq): branch if lhs != rhs
+                            self.emit_inst("MOV A,L");
+                            self.emit_inst("SUB E");
+                            self.emit_inst(&format!("JNZ {}", lbl));
+                            self.emit_inst("MOV A,H");
+                            self.emit_inst("SUB D");
+                            self.emit_inst(&format!("JNZ {}", lbl));
+                        } else {
+                            // JumpIfFalse(ne): branch if lhs == rhs
+                            let ne_skip = self.fresh_label();
+                            self.emit_inst("MOV A,L");
+                            self.emit_inst("SUB E");
+                            self.emit_inst(&format!("JNZ {}", ne_skip));
+                            self.emit_inst("MOV A,H");
+                            self.emit_inst("SUB D");
+                            self.emit_inst(&format!("JZ {}", lbl));
+                            self.emit_label(&ne_skip);
+                        }
+                    }
+                } else {
+                    // Ordering comparisons (lt, le, gt, ge)
+                    // Emit high-byte compare, then conditionally low-byte.
+                    let cmp_done = self.fresh_label();
+                    self.emit_inst("MOV A,H");
+                    self.emit_inst("SUB D");
+                    self.emit_inst(&format!("JNZ {}", cmp_done));
+                    self.emit_inst("MOV A,L");
+                    self.emit_inst("SUB E");
+                    self.emit_label(&cmp_done);
+
+                    // Now flags reflect the subtraction result.
+                    // Emit conditional jump(s) to target.
+                    self.emit_w16_fused_branch(kind, signed, branch_if_true, &lbl);
+                }
+
+                self.consumed_cmp.insert(dst.id);
+                return;
+            }
+        }
+
         let true_lbl = self.fresh_label();
         let done_lbl = self.fresh_label();
 
@@ -2151,6 +2237,73 @@ impl CodeGenerator {
         self.emit_label(&true_lbl);
         self.emit_inst("LXI H,1");
         self.emit_label(&done_lbl);
+    }
+
+    /// Emit fused conditional branches for W16 compare-branch fusion.
+    ///
+    /// After the subtraction sequence (flags set from HL - DE), emit the
+    /// appropriate conditional jump(s) to `target` based on the comparison
+    /// kind, signedness, and whether the branch is taken on true or false.
+    fn emit_w16_fused_branch(&mut self, kind: &str, signed: bool, branch_if_true: bool, target: &str) {
+        match (kind, signed, branch_if_true) {
+            // lt: jump when result < 0 (signed: sign flag; unsigned: carry)
+            ("lt", true,  true)  => { self.emit_inst(&format!("JM {}", target)); }
+            ("lt", false, true)  => { self.emit_inst(&format!("JC {}", target)); }
+            ("lt", true,  false) => { self.emit_inst(&format!("JP {}", target)); }
+            ("lt", false, false) => { self.emit_inst(&format!("JNC {}", target)); }
+
+            // ge: jump when result >= 0
+            ("ge", true,  true)  => { self.emit_inst(&format!("JP {}", target)); }
+            ("ge", false, true)  => { self.emit_inst(&format!("JNC {}", target)); }
+            ("ge", true,  false) => { self.emit_inst(&format!("JM {}", target)); }
+            ("ge", false, false) => { self.emit_inst(&format!("JC {}", target)); }
+
+            // gt: not zero AND not less — need two conditions
+            ("gt", _, true) => {
+                let skip = self.fresh_label();
+                self.emit_inst(&format!("JZ {}", skip));
+                if signed {
+                    self.emit_inst(&format!("JP {}", target));
+                } else {
+                    self.emit_inst(&format!("JNC {}", target));
+                }
+                self.emit_label(&skip);
+            }
+            ("gt", _, false) => {
+                // branch when NOT gt = le = zero OR less
+                if signed {
+                    self.emit_inst(&format!("JZ {}", target));
+                    self.emit_inst(&format!("JM {}", target));
+                } else {
+                    self.emit_inst(&format!("JZ {}", target));
+                    self.emit_inst(&format!("JC {}", target));
+                }
+            }
+
+            // le: zero OR less
+            ("le", _, true) => {
+                if signed {
+                    self.emit_inst(&format!("JZ {}", target));
+                    self.emit_inst(&format!("JM {}", target));
+                } else {
+                    self.emit_inst(&format!("JZ {}", target));
+                    self.emit_inst(&format!("JC {}", target));
+                }
+            }
+            ("le", _, false) => {
+                // branch when NOT le = gt = not zero AND not less
+                let skip = self.fresh_label();
+                self.emit_inst(&format!("JZ {}", skip));
+                if signed {
+                    self.emit_inst(&format!("JP {}", target));
+                } else {
+                    self.emit_inst(&format!("JNC {}", target));
+                }
+                self.emit_label(&skip);
+            }
+
+            _ => {}
+        }
     }
 
     // -- Neg (two's complement) -------------------------------------------

@@ -210,6 +210,18 @@ fn apply_rules(lines: &mut Vec<Line>) -> bool {
     // --- Rule 34: Jump to RET folding ------------------------------------
     changed |= rule_jump_to_ret(lines);
 
+    // --- Rule 47: Conditional jump to RET folding (Step 12) --------------
+    changed |= rule_conditional_jump_to_ret(lines);
+
+    // --- Rule 48: Collapse double conditional jumps to same target --------
+    changed |= rule_collapse_double_conditional(lines);
+
+    // --- Rule 49: Dead conditional after XRA A (Step 12) -----------------
+    changed |= rule_dead_conditional_after_xra_a(lines);
+
+    // --- Rule 50: Extended CALL+RET → JMP (Step 12) ----------------------
+    changed |= rule_call_ret_extended(lines);
+
     // --- Rule 10: Remove dead code after unconditional jump --------------
     changed |= rule_dead_code_after_jump(lines);
 
@@ -1566,6 +1578,186 @@ fn is_compiler_label(name: &str) -> bool {
         || name.starts_with("__cmp_done_")
 }
 
+// ---------------------------------------------------------------------------
+// Step 12: Expanded peephole control-flow rules
+// ---------------------------------------------------------------------------
+
+/// Rule 47: Conditional jump-to-RET folding.
+///
+/// Extend Rule 34 (JMP→RET) to conditional jumps.  When a conditional jump
+/// targets a label whose next significant instruction is RET, replace the
+/// conditional jump with a conditional return (Rcc).
+///
+/// ```asm
+/// Jcc  label         →    Rcc
+/// ...
+/// label: RET
+/// ```
+fn rule_conditional_jump_to_ret(lines: &mut Vec<Line>) -> bool {
+    let mut label_index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (idx, line) in lines.iter().enumerate() {
+        if let Line::Label(name) = line {
+            label_index.insert(name.clone(), idx);
+        }
+    }
+
+    let cond_to_ret: std::collections::HashMap<&str, &str> = [
+        ("JZ", "RZ"), ("JNZ", "RNZ"), ("JC", "RC"), ("JNC", "RNC"),
+        ("JM", "RM"), ("JP", "RP"), ("JPE", "RPE"), ("JPO", "RPO"),
+    ].iter().copied().collect();
+
+    let mut changed = false;
+    let mut replacements: Vec<(usize, Line)> = Vec::new();
+    for i in 0..lines.len() {
+        if let Line::Instruction { opcode, operands } = &lines[i] {
+            if let Some(&ret_opcode) = cond_to_ret.get(opcode.as_str()) {
+                let target = operands.trim();
+                if let Some(&label_idx) = label_index.get(target) {
+                    if let Some(next_idx) = next_significant_line(lines, label_idx + 1) {
+                        if let Line::Instruction { opcode: op, .. } = &lines[next_idx] {
+                            if op == "RET" {
+                                replacements.push((i, Line::Instruction {
+                                    opcode: ret_opcode.to_string(),
+                                    operands: String::new(),
+                                }));
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for (idx, line) in replacements {
+        lines[idx] = line;
+    }
+    changed
+}
+
+/// Rule 48: Collapse double conditional jumps to the same target.
+///
+/// When two consecutive conditional jumps go to the same target, and the
+/// second is redundant given the first (e.g., JZ target / JZ target),
+/// remove the duplicate.
+///
+/// ```asm
+/// Jcc target       →    Jcc target
+/// Jcc target       (removed)
+/// ```
+fn rule_collapse_double_conditional(lines: &mut Vec<Line>) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+    while i + 1 < lines.len() {
+        let Some(next_idx) = next_significant_line(lines, i + 1) else {
+            break;
+        };
+        if let (
+            Line::Instruction { opcode: op1, operands: tgt1 },
+            Line::Instruction { opcode: op2, operands: tgt2 },
+        ) = (&lines[i], &lines[next_idx]) {
+            if is_conditional_jump(op1) && op1 == op2 && tgt1.trim() == tgt2.trim() {
+                lines.remove(next_idx);
+                changed = true;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    changed
+}
+
+/// Rule 49: Remove dead conditional jumps after known-flag instructions.
+///
+/// After `XRA A` (which sets A=0, Z=1, S=0, CY=0, P=1), certain
+/// conditional jumps can never fire and are dead code:
+///   - JNZ (Z is set, so JNZ never fires)
+///   - JC  (CY is cleared, so JC never fires)
+///   - JM  (sign is clear, so JM never fires)
+///
+/// Similarly, after `XRA A`, these always fire and become JMP:
+///   - JZ  (always taken)
+///   - JNC (always taken)
+///   - JP  (always taken)
+fn rule_dead_conditional_after_xra_a(lines: &mut Vec<Line>) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+    while i + 1 < lines.len() {
+        let Some(next_idx) = next_significant_line(lines, i + 1) else {
+            break;
+        };
+        if let Line::Instruction { opcode, operands } = &lines[i] {
+            let is_xra_a = opcode == "XRA" && operands.trim() == "A";
+            if is_xra_a {
+                if let Line::Instruction { opcode: jmp_op, operands: jmp_tgt } = &lines[next_idx] {
+                    match jmp_op.as_str() {
+                        // Never-taken branches: remove
+                        "JNZ" | "JC" | "JM" => {
+                            lines.remove(next_idx);
+                            changed = true;
+                            continue;
+                        }
+                        // Always-taken branches: convert to JMP
+                        "JZ" | "JNC" | "JP" => {
+                            lines[next_idx] = Line::Instruction {
+                                opcode: "JMP".to_string(),
+                                operands: jmp_tgt.clone(),
+                            };
+                            changed = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    changed
+}
+
+/// Rule 50: Extended CALL+RET → JMP for conditional calls.
+///
+/// When a CALL immediately precedes a conditional return (Rcc), and the
+/// CALL was the only call before the return, this pattern can't easily
+/// be simplified. However, we can extend the tail-call pattern:
+/// when CALL is followed by RET and sandwiched with only no-ops between,
+/// convert to JMP even when intervening comments exist.
+///
+/// This rule is already handled by rule_two_window for the direct case.
+/// Here we extend to handle CALL / <comments> / RET.
+fn rule_call_ret_extended(lines: &mut Vec<Line>) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+    while i < lines.len() {
+        if let Line::Instruction { opcode, .. } = &lines[i] {
+            if opcode == "CALL" {
+                if let Some(ret_idx) = next_significant_line(lines, i + 1) {
+                    if ret_idx > i + 1 {
+                        // There are comments/empty lines between CALL and the next instruction
+                        if let Line::Instruction { opcode: ret_op, .. } = &lines[ret_idx] {
+                            if ret_op == "RET" {
+                                // Convert CALL to JMP and remove the RET
+                                if let Line::Instruction { operands, .. } = &lines[i] {
+                                    let target = operands.clone();
+                                    lines[i] = Line::Instruction {
+                                        opcode: "JMP".to_string(),
+                                        operands: target,
+                                    };
+                                    lines.remove(ret_idx);
+                                    changed = true;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    changed
+}
+
 /// Invert a conditional jump opcode.
 fn invert_condition(opcode: &str) -> Option<String> {
     match opcode {
@@ -2104,7 +2296,11 @@ mod tests {
             "\tRET",
         ]);
         let out = peephole_optimize(input);
-        assert!(has_line(&out, "JNZ L2"));
+        // Rule 19 inverts JZ L1 / JMP L2 / L1: → JNZ L2.
+        // Rule 47 then folds JNZ L2 (where L2: RET) → RNZ.
+        // Accept either form.
+        assert!(has_line(&out, "JNZ L2") || has_line(&out, "RNZ"),
+            "should have JNZ L2 or RNZ; got:\n{:?}", out);
         assert!(!has_line(&out, "MOV A,B"));
     }
 
