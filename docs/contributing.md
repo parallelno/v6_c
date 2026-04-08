@@ -52,6 +52,11 @@ cargo test
 cargo test --test execution          # end-to-end ROM execution
 cargo test --test asm_inline         # inline assembly tests
 cargo test --test optimization_small # small optimization checks
+cargo test --lib                     # Rust unit tests only
+
+# Add -- --nocapture for verbose per-test output
+cargo test --test execution -- --nocapture
+cargo test --test optimization_small -- --nocapture
 ```
 
 ### Optimization Unit Checks (PowerShell)

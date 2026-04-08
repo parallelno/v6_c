@@ -696,6 +696,24 @@ impl CodeGenerator {
             self.emit_inst(&format!("SHLD __va_base_{}", func.name));
         }
 
+        // Register parameter vregs with the register allocator so it knows
+        // their physical locations at function entry (calling convention:
+        // arg0 → HL or A for W8, arg1 → DE).
+        for (i, param) in func.params.iter().enumerate() {
+            let reg = match i {
+                0 => {
+                    if param.vreg.width == Width::W8 {
+                        PhysReg::A
+                    } else {
+                        PhysReg::HL
+                    }
+                }
+                1 => PhysReg::DE,
+                _ => break,
+            };
+            self.regalloc.mark_allocated(param.vreg, reg);
+        }
+
         for (idx, instr) in func.body.iter().enumerate() {
             self.instr_index = idx;
             if instr.line != 0 && instr.line != self.current_c_line {

@@ -247,6 +247,7 @@ fn run_unit_rom_execution_suite() {
             emul_output
         );
 
+        eprintln!("PASS {}: HL=0 ({})", rel, emul_output.lines().find(|l| l.starts_with("HALT")).unwrap_or(""));
         executed_count += 1;
     }
 

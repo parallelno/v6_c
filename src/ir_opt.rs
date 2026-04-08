@@ -1156,7 +1156,9 @@ fn constant_fold_and_propagate(func: &mut IrFunction) -> bool {
                 if let (Some(&a), Some(&b)) = (constants.get(&lhs.id), constants.get(&rhs.id)) {
                     if b != 0 {
                         let result = if *signed {
-                            wrap_result(a.wrapping_div(b), *width)
+                            let sa = sign_extend(a, *width);
+                            let sb = sign_extend(b, *width);
+                            wrap_result(sa.wrapping_div(sb), *width)
                         } else {
                             let ua = to_unsigned(a, *width);
                             let ub = to_unsigned(b, *width);
@@ -1181,7 +1183,9 @@ fn constant_fold_and_propagate(func: &mut IrFunction) -> bool {
                 if let (Some(&a), Some(&b)) = (constants.get(&lhs.id), constants.get(&rhs.id)) {
                     if b != 0 {
                         let result = if *signed {
-                            wrap_result(a.wrapping_rem(b), *width)
+                            let sa = sign_extend(a, *width);
+                            let sb = sign_extend(b, *width);
+                            wrap_result(sa.wrapping_rem(sb), *width)
                         } else {
                             let ua = to_unsigned(a, *width);
                             let ub = to_unsigned(b, *width);
@@ -1905,7 +1909,9 @@ fn dead_code_eliminate(func: &mut IrFunction) -> bool {
     for (idx, instr) in body.iter().enumerate() {
         match &instr.op {
             IrOp::Jump { .. } => {
-                if fall_through_jumps.contains(&idx) {
+                if unreachable {
+                    changed = true;
+                } else if fall_through_jumps.contains(&idx) {
                     // Trivial jump-to-next-label: skip it entirely.
                     changed = true;
                 } else {
@@ -1914,8 +1920,12 @@ fn dead_code_eliminate(func: &mut IrFunction) -> bool {
                 }
             }
             IrOp::Return { .. } => {
-                new_body.push(instr.clone());
-                unreachable = true;
+                if unreachable {
+                    changed = true;
+                } else {
+                    new_body.push(instr.clone());
+                    unreachable = true;
+                }
             }
             IrOp::Label { .. } => {
                 unreachable = false;

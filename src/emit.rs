@@ -640,7 +640,15 @@ fn extract_main_body(code_lines: &[String]) -> (Vec<String>, Vec<String>) {
         }
         if let Some(stripped) = trimmed.strip_suffix(':') {
             // Internal block labels for main are formatted L{n}__main; skip them.
-            if stripped != "" && !stripped.ends_with("__main") {
+            // Compiler-generated temporaries (__cg_, __cmp_done_, __w32_) are
+            // also internal to the current function and must not terminate
+            // extraction.
+            if stripped != ""
+                && !stripped.ends_with("__main")
+                && !stripped.starts_with("__cg_")
+                && !stripped.starts_with("__cmp_done_")
+                && !stripped.starts_with("__w32_")
+            {
                 main_end = i;
                 break;
             }

@@ -998,7 +998,11 @@ fn rule_w16_compare_branch_collapse(lines: &mut Vec<Line>) -> bool {
         let mut replacement: Vec<Line> = Vec::new();
 
         if branch_is_jnz {
-            // Jump to actual_target when comparison is true → same conditional jumps
+            // Jump to actual_target when comparison is true → same conditional jumps.
+            // Preserve first_jcc_target as a label BEFORE the branch so that any
+            // earlier jump to it (e.g. a low-byte early-exit in a W16 ne check) lands
+            // here and immediately executes the same conditional branch.
+            replacement.push(Line::Label(first_jcc_target.clone()));
             replacement.push(Line::Instruction {
                 opcode: first_jcc_op.clone(),
                 operands: format!(" {}", actual_target),
@@ -1010,37 +1014,78 @@ fn rule_w16_compare_branch_collapse(lines: &mut Vec<Line>) -> bool {
                 });
             }
         } else {
-            // Jump to actual_target when comparison is FALSE → invert
+            // Jump to actual_target when comparison is FALSE → invert.
+            // Preserve first_jcc_target as a label AFTER the branch so that any
+            // earlier jump to it (e.g. a low-byte early-exit in a W16 ne check) lands
+            // past the false-branch instruction and continues as the true-case path.
             if second_jcc.is_none() {
                 if let Some(inv) = invert_condition(&first_jcc_op) {
                     replacement.push(Line::Instruction {
                         opcode: inv,
                         operands: format!(" {}", actual_target),
                     });
+                    replacement.push(Line::Label(first_jcc_target.clone()));
                 } else {
                     i += 1;
                     continue;
                 }
             } else {
-                // Double Jcc (gt/le): first Jcc fires when true, second fires
-                // for a sub-condition.  For JZ (jump when false), we need to
-                // invert the whole logic.
+                // Double Jcc (gt/le): two conditional jumps implement the
+                // comparison result.  For JZ (jump when false), we need to
+                // invert the combined condition.
                 //
-                // Example gt pattern: JP true / JZ done → true when positive & not zero
-                // Inverted (false): JM target / JZ target (negative or zero)
-                if let Some(inv) = invert_condition(&first_jcc_op) {
+                // Two cases based on whether both Jcc target the same label:
+                //
+                // (a) gt pattern: JP true_lbl / JZ done_lbl — targets differ.
+                //     The second Jcc goes to done_lbl (false path).
+                //     Inverted: JM target / JZ target (= le).  Direct inversion.
+                //
+                // (b) le pattern: JM true_lbl / JZ true_lbl — both target true.
+                //     The two conditions form an OR for the true case.
+                //     NOT(A OR B) = NOT A AND NOT B, which can't be done by
+                //     simple inversion.  Instead keep original conditions as
+                //     skip-branches: cond1 skip / cond2 skip / JMP target / skip:
+                let both_same_target = match &second_jcc {
+                    Some((_, tgt)) => *tgt == first_jcc_target,
+                    None => false,
+                };
+
+                if both_same_target {
+                    // le-style: both conditions OR into true.  Invert to AND-NOT
+                    // using a skip pattern.
+                    // first_jcc_target serves as the skip label (preserved for
+                    // any backward references too).
                     replacement.push(Line::Instruction {
-                        opcode: inv,
+                        opcode: first_jcc_op.clone(),
+                        operands: format!(" {}", first_jcc_target),
+                    });
+                    if let Some((ref op2, _)) = second_jcc {
+                        replacement.push(Line::Instruction {
+                            opcode: op2.clone(),
+                            operands: format!(" {}", first_jcc_target),
+                        });
+                    }
+                    replacement.push(Line::Instruction {
+                        opcode: "JMP".to_string(),
                         operands: format!(" {}", actual_target),
                     });
-                }
-                if let Some((ref op2, _)) = second_jcc {
-                    // The second Jcc's target was done_lbl (false path),
-                    // so if it fires the result is false → for JZ we want to jump
-                    replacement.push(Line::Instruction {
-                        opcode: op2.clone(),
-                        operands: format!(" {}", actual_target),
-                    });
+                    replacement.push(Line::Label(first_jcc_target.clone()));
+                } else {
+                    // gt-style: second Jcc targets done_lbl (false path).
+                    // Simple inversion: invert first, keep second.
+                    if let Some(inv) = invert_condition(&first_jcc_op) {
+                        replacement.push(Line::Instruction {
+                            opcode: inv,
+                            operands: format!(" {}", actual_target),
+                        });
+                    }
+                    if let Some((ref op2, _)) = second_jcc {
+                        replacement.push(Line::Instruction {
+                            opcode: op2.clone(),
+                            operands: format!(" {}", actual_target),
+                        });
+                    }
+                    replacement.push(Line::Label(first_jcc_target.clone()));
                 }
             }
         }
@@ -1414,6 +1459,16 @@ fn rule_elim_dead_spills(lines: &mut Vec<Line>) -> bool {
                     if is_compiler_local_label(label) {
                         live.insert(label.to_string());
                     }
+                }
+            }
+        }
+        // Inline asm content is stored as Raw lines (between __asm_begin__
+        // and __asm_end__ markers).  Scan raw text for references to
+        // compiler-local labels so their stores are not removed.
+        if let Line::Raw(text) = line {
+            for word in text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+                if is_compiler_local_label(word) {
+                    live.insert(word.to_string());
                 }
             }
         }

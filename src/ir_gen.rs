@@ -75,6 +75,8 @@ pub struct IrGenerator {
     global_syms: HashMap<String, (String, CType)>,
     /// Known function return types.
     func_return_types: HashMap<String, CType>,
+    /// Known function parameter types (for argument narrowing at call sites).
+    func_param_types: HashMap<String, Vec<CType>>,
 
     // ---- per-function state ----
     current_func_name: String,
@@ -145,6 +147,7 @@ impl IrGenerator {
             strings: Vec::new(),
             global_syms: HashMap::new(),
             func_return_types: HashMap::new(),
+            func_param_types: HashMap::new(),
             current_func_name: String::new(),
             current_return_type: CType::Void,
             local_syms: HashMap::new(),
@@ -263,7 +266,25 @@ impl IrGenerator {
             return reg;
         }
         let dst = self.vreg_alloc.alloc(to_w.unwrap_or(Width::W16));
-        self.emit(IrOp::cast(dst, reg, to.clone()));
+        // For widening casts, the extension method (sign vs zero) is determined
+        // by the *source* type's signedness, not the destination type.
+        // E.g. (int)(unsigned char)255 must zero-extend to 255, not sign-extend
+        // to -1.  Build a cast type with the destination width but source
+        // signedness so the constant folder and codegen extend correctly.
+        let widening = match (from_w, to_w) {
+            (Some(fw), Some(tw)) => fw.bytes() < tw.bytes(),
+            _ => false,
+        };
+        let cast_type = if widening {
+            match to {
+                CType::Int { .. } => CType::Int { signed: from.is_signed() },
+                CType::Long { .. } => CType::Long { signed: from.is_signed() },
+                _ => to.clone(),
+            }
+        } else {
+            to.clone()
+        };
+        self.emit(IrOp::cast(dst, reg, cast_type));
         dst
     }
 
@@ -393,12 +414,14 @@ impl IrGenerator {
             TopLevelKind::FuncDecl {
                 name,
                 return_type,
-                params: _,
+                params,
                 storage: _,
                 is_variadic: _,
             } => {
                 self.func_return_types
                     .insert(name.clone(), return_type.clone());
+                self.func_param_types
+                    .insert(name.clone(), params.iter().map(|p| p.ty.clone()).collect());
             }
 
             // Type declarations and typedefs are resolved at parse time;
@@ -519,6 +542,8 @@ impl IrGenerator {
 
         self.func_return_types
             .insert(name.to_string(), return_type.clone());
+        self.func_param_types
+            .insert(name.to_string(), params.iter().map(|p| p.ty.clone()).collect());
 
         // Detect full-body asm function: body is a single raw asm block.
         let is_asm_body = Self::is_asm_only_body(body_stmt);
@@ -1436,7 +1461,7 @@ impl IrGenerator {
     // ---- function call ----------------------------------------------------
 
     fn gen_func_call(&mut self, callee: &Expr, args: &[Expr]) -> (VReg, CType) {
-        let arg_regs: Vec<VReg> = args.iter().map(|a| self.gen_expr(a).0).collect();
+        let mut arg_regs: Vec<VReg> = args.iter().map(|a| self.gen_expr(a).0).collect();
 
         let (func_name, ret_ty) = match &callee.kind {
             ExprKind::Ident(name) => {
@@ -1452,6 +1477,21 @@ impl IrGenerator {
                 ("_unknown".to_string(), CType::int_signed())
             }
         };
+
+        // Narrow arguments to match callee parameter types (e.g. int → char).
+        if let Some(param_types) = self.func_param_types.get(&func_name).cloned() {
+            for (i, pty) in param_types.iter().enumerate() {
+                if i >= arg_regs.len() {
+                    break;
+                }
+                let param_w = Width::from_ctype(pty).unwrap_or(Width::W16);
+                if arg_regs[i].width != param_w {
+                    let narrowed = self.vreg_alloc.alloc(param_w);
+                    self.emit(IrOp::cast(narrowed, arg_regs[i], pty.clone()));
+                    arg_regs[i] = narrowed;
+                }
+            }
+        }
 
         if ret_ty.is_void() {
             self.emit(IrOp::call(&func_name, arg_regs, None));
