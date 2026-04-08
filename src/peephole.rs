@@ -2373,4 +2373,87 @@ mod tests {
         assert!(has_line(&out, "JC") && has_line(&out, "L_target"), "should redirect JC to target; got:\n{:?}", out);
         assert!(!has_line(&out, "LXI H,0"), "should eliminate boolean materialisation");
     }
+
+    // -- Step 12: Expanded peephole control-flow rules --------------------
+
+    #[test]
+    fn rule47_conditional_jump_to_ret() {
+        // JZ label ... label: RET → RZ
+        let input = asm(&[
+            "\tJZ L_end",
+            "\tMOV A,B",
+            "L_end:",
+            "\tRET",
+        ]);
+        let out = peephole_optimize(input);
+        assert!(has_line(&out, "RZ"), "JZ to RET should become RZ; got:\n{:?}", out);
+    }
+
+    #[test]
+    fn rule47_conditional_jnz_to_ret() {
+        let input = asm(&[
+            "\tJNZ L_end",
+            "\tMOV A,B",
+            "L_end:",
+            "\tRET",
+        ]);
+        let out = peephole_optimize(input);
+        assert!(has_line(&out, "RNZ"), "JNZ to RET should become RNZ; got:\n{:?}", out);
+    }
+
+    #[test]
+    fn rule48_collapse_double_conditional() {
+        // JZ target / JZ target → JZ target (remove duplicate)
+        let input = asm(&[
+            "\tJZ L_target",
+            "\tJZ L_target",
+            "L_target:",
+            "\tRET",
+        ]);
+        let out = peephole_optimize(input);
+        let jz_count = out.iter().filter(|l| l.contains("JZ") || l.contains("RZ")).count();
+        assert!(jz_count <= 1, "double JZ should be collapsed to one; got:\n{:?}", out);
+    }
+
+    #[test]
+    fn rule49_dead_jnz_after_xra_a() {
+        // XRA A sets Z=1, so JNZ never fires
+        let input = asm(&[
+            "\tXRA A",
+            "\tJNZ L_never",
+            "\tMOV B,A",
+            "L_never:",
+            "\tRET",
+        ]);
+        let out = peephole_optimize(input);
+        assert!(!has_line(&out, "JNZ"), "JNZ after XRA A should be removed; got:\n{:?}", out);
+    }
+
+    #[test]
+    fn rule49_always_jz_after_xra_a() {
+        // XRA A sets Z=1, so JZ always fires → becomes JMP
+        let input = asm(&[
+            "\tXRA A",
+            "\tJZ L_always",
+            "\tMOV B,A",
+            "L_always:",
+            "\tRET",
+        ]);
+        let out = peephole_optimize(input);
+        // JZ should become JMP (or be optimized further)
+        assert!(!has_line(&out, "JZ"), "JZ after XRA A should become JMP; got:\n{:?}", out);
+    }
+
+    #[test]
+    fn rule50_call_comments_ret_to_jmp() {
+        // CALL f / ; comment / RET → JMP f
+        let input = asm(&[
+            "\tCALL _func",
+            "; some comment",
+            "\tRET",
+        ]);
+        let out = peephole_optimize(input);
+        assert!(has_line(&out, "JMP _func"), "CALL+comment+RET should become JMP; got:\n{:?}", out);
+        assert!(!has_line(&out, "CALL"), "CALL should be replaced by JMP");
+    }
 }

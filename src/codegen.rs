@@ -3672,4 +3672,102 @@ mod tests {
         assert!(!has_shuffle, "should not have register shuffles between add and compare; got:\n{}",
             between.iter().map(|l| l.as_str()).collect::<Vec<_>>().join("\n"));
     }
+
+    // -- Step 7: W16 compare-branch fusion --------------------------------
+
+    #[test]
+    fn w16_compare_branch_fusion_lt_unsigned() {
+        // if (a < b) should fuse: no LXI H,0 / LXI H,1 materialisation
+        let mut f = IrFunction::new("test", CType::Void);
+        let a = VReg::new(0, Width::W16);
+        let b = VReg::new(1, Width::W16);
+        let cmp = VReg::new(2, Width::W8);
+        let lbl = Label::new(10);
+        f.push_op(IrOp::load_global(a, "_g_a"));
+        f.push_op(IrOp::load_global(b, "_g_b"));
+        f.push_op(IrOp::Lt { dst: cmp, lhs: a, rhs: b, width: Width::W16, signed: false });
+        f.push_op(IrOp::JumpIfTrue { cond: cmp, target: lbl });
+        f.push_op(IrOp::Label { label: lbl });
+        f.push_op(IrOp::ret(None));
+        let out = gen_single_func(f);
+        assert!(!has_line(&out, "LXI H,0"), "fused compare should not materialise boolean");
+        assert!(!has_line(&out, "LXI H,1"), "fused compare should not materialise boolean");
+        assert!(has_line(&out, "JC"), "unsigned lt should emit JC");
+    }
+
+    #[test]
+    fn w16_compare_branch_fusion_eq() {
+        // if (a == b) should fuse
+        let mut f = IrFunction::new("test", CType::Void);
+        let a = VReg::new(0, Width::W16);
+        let b = VReg::new(1, Width::W16);
+        let cmp = VReg::new(2, Width::W8);
+        let lbl = Label::new(10);
+        f.push_op(IrOp::load_global(a, "_g_a"));
+        f.push_op(IrOp::load_global(b, "_g_b"));
+        f.push_op(IrOp::Eq { dst: cmp, lhs: a, rhs: b, width: Width::W16 });
+        f.push_op(IrOp::JumpIfTrue { cond: cmp, target: lbl });
+        f.push_op(IrOp::Label { label: lbl });
+        f.push_op(IrOp::ret(None));
+        let out = gen_single_func(f);
+        assert!(!has_line(&out, "LXI H,0"), "fused eq compare should not materialise boolean");
+        assert!(!has_line(&out, "LXI H,1"), "fused eq compare should not materialise boolean");
+    }
+
+    #[test]
+    fn w16_compare_branch_fusion_ne_jump_if_false() {
+        // if !(a != b) should fuse
+        let mut f = IrFunction::new("test", CType::Void);
+        let a = VReg::new(0, Width::W16);
+        let b = VReg::new(1, Width::W16);
+        let cmp = VReg::new(2, Width::W8);
+        let lbl = Label::new(10);
+        f.push_op(IrOp::load_global(a, "_g_a"));
+        f.push_op(IrOp::load_global(b, "_g_b"));
+        f.push_op(IrOp::Ne { dst: cmp, lhs: a, rhs: b, width: Width::W16 });
+        f.push_op(IrOp::JumpIfFalse { cond: cmp, target: lbl });
+        f.push_op(IrOp::Label { label: lbl });
+        f.push_op(IrOp::ret(None));
+        let out = gen_single_func(f);
+        assert!(!has_line(&out, "LXI H,0"), "fused ne/false compare should not materialise boolean");
+    }
+
+    #[test]
+    fn w16_compare_branch_fusion_gt_signed() {
+        // if (a > b) signed should fuse with two-branch sequence
+        let mut f = IrFunction::new("test", CType::Void);
+        let a = VReg::new(0, Width::W16);
+        let b = VReg::new(1, Width::W16);
+        let cmp = VReg::new(2, Width::W8);
+        let lbl = Label::new(10);
+        f.push_op(IrOp::load_global(a, "_g_a"));
+        f.push_op(IrOp::load_global(b, "_g_b"));
+        f.push_op(IrOp::Gt { dst: cmp, lhs: a, rhs: b, width: Width::W16, signed: true });
+        f.push_op(IrOp::JumpIfTrue { cond: cmp, target: lbl });
+        f.push_op(IrOp::Label { label: lbl });
+        f.push_op(IrOp::ret(None));
+        let out = gen_single_func(f);
+        assert!(!has_line(&out, "LXI H,0"), "fused gt compare should not materialise boolean");
+        // gt signed needs JZ skip + JP target
+        assert!(has_line(&out, "JZ"), "gt needs JZ skip");
+        assert!(has_line(&out, "JP"), "gt signed needs JP");
+    }
+
+    #[test]
+    fn w16_compare_branch_fusion_le_unsigned() {
+        // if (a <= b) unsigned should fuse
+        let mut f = IrFunction::new("test", CType::Void);
+        let a = VReg::new(0, Width::W16);
+        let b = VReg::new(1, Width::W16);
+        let cmp = VReg::new(2, Width::W8);
+        let lbl = Label::new(10);
+        f.push_op(IrOp::load_global(a, "_g_a"));
+        f.push_op(IrOp::load_global(b, "_g_b"));
+        f.push_op(IrOp::Le { dst: cmp, lhs: a, rhs: b, width: Width::W16, signed: false });
+        f.push_op(IrOp::JumpIfTrue { cond: cmp, target: lbl });
+        f.push_op(IrOp::Label { label: lbl });
+        f.push_op(IrOp::ret(None));
+        let out = gen_single_func(f);
+        assert!(!has_line(&out, "LXI H,0"), "fused le compare should not materialise boolean");
+    }
 }

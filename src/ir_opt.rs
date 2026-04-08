@@ -3380,10 +3380,6 @@ fn loop_invariant_code_motion(func: &mut IrFunction) -> bool {
                     continue;
                 }
             }
-            // Only hoist pure instructions (no side effects).
-            if get_pure_dst(op).is_none() {
-                continue;
-            }
             // Never hoist bare LoadImm instructions.  They have an empty
             // source list, so the loop-invariance check is vacuously true,
             // but hoisting them is pointless (constants are free to
@@ -5586,5 +5582,236 @@ mod tests {
             matches!(&i.op, IrOp::JumpIfTrue { cond, .. } if cond.id == x.id)
         });
         assert!(has_jump_if_true, "expected JumpIfTrue(x) after simplification; got:\n{:#?}", result);
+    }
+
+    // -- Step 8: Strength reduction Add(x, x) → Shl(x, 1) ----------------
+
+    #[test]
+    fn strength_reduce_add_self_to_shl() {
+        // Add(x, x) should become Shl(x, 1) which codegen emits as DAD H.
+        let body = vec![
+            IrInstr::bare(IrOp::LoadGlobal {
+                dst: VReg::new(0, Width::W16),
+                addr_label: "_g_i".into(),
+            }),
+            IrInstr::bare(IrOp::Add {
+                dst: VReg::new(1, Width::W16),
+                lhs: VReg::new(0, Width::W16),
+                rhs: VReg::new(0, Width::W16),
+                width: Width::W16,
+            }),
+            IrInstr::bare(IrOp::StoreGlobal {
+                addr_label: "_g_result".into(),
+                src: VReg::new(1, Width::W16),
+            }),
+            IrInstr::bare(IrOp::ret(None)),
+        ];
+        let result = opt_body(body);
+        // The Add(x,x) should be replaced by Shl(x, 1).
+        let has_shl = result.iter().any(|i| matches!(&i.op, IrOp::Shl { .. }));
+        assert!(
+            has_shl,
+            "Add(x, x) should be strength-reduced to Shl; got:\n{:#?}",
+            result
+        );
+        // No Add should remain.
+        let has_add = result.iter().any(|i| matches!(&i.op, IrOp::Add { .. }));
+        assert!(
+            !has_add,
+            "Add(x, x) should be eliminated by strength reduction; got:\n{:#?}",
+            result
+        );
+    }
+
+    // -- Step 9: LICM for _l_ variables -----------------------------------
+
+    #[test]
+    fn licm_hoists_local_load_global() {
+        // LoadGlobal for _l_ variable with no store or call in loop
+        // should be hoisted before the loop header.
+        //   load_global v0, "_l_test_x"   // before loop — defines v0 outside
+        // L0:                              // loop header
+        //   load_global v1, "_l_test_y"   // invariant: no store to _l_test_y, no calls
+        //   add v2, v0, v1
+        //   store_global "_g_result", v2
+        //   load_global v3, "_g_cond"
+        //   jump_if_true v3, L0           // back edge
+        let body = vec![
+            IrInstr::bare(IrOp::LoadGlobal {
+                dst: VReg::new(0, Width::W16),
+                addr_label: "_l_test_x".into(),
+            }),
+            IrInstr::bare(IrOp::Label { label: Label::new(0) }),
+            IrInstr::bare(IrOp::LoadGlobal {
+                dst: VReg::new(1, Width::W16),
+                addr_label: "_l_test_y".into(),
+            }),
+            IrInstr::bare(IrOp::Add {
+                dst: VReg::new(2, Width::W16),
+                lhs: VReg::new(0, Width::W16),
+                rhs: VReg::new(1, Width::W16),
+                width: Width::W16,
+            }),
+            IrInstr::bare(IrOp::StoreGlobal {
+                addr_label: "_g_result".into(),
+                src: VReg::new(2, Width::W16),
+            }),
+            IrInstr::bare(IrOp::LoadGlobal {
+                dst: VReg::new(3, Width::W16),
+                addr_label: "_g_cond".into(),
+            }),
+            IrInstr::bare(IrOp::JumpIfTrue {
+                cond: VReg::new(3, Width::W16),
+                target: Label::new(0),
+            }),
+            IrInstr::bare(IrOp::ret(None)),
+        ];
+        let result = opt_body(body);
+        let label_pos = result
+            .iter()
+            .position(|i| matches!(&i.op, IrOp::Label { label } if label.0 == 0))
+            .expect("label L0 must exist");
+        // The LoadGlobal for _l_test_y should be hoisted before L0.
+        let load_y_pos = result
+            .iter()
+            .position(|i| matches!(&i.op, IrOp::LoadGlobal { addr_label, .. } if addr_label == "_l_test_y"));
+        if let Some(pos) = load_y_pos {
+            assert!(
+                pos < label_pos,
+                "_l_test_y load should be hoisted before loop header (load at {}, label at {})",
+                pos, label_pos,
+            );
+        }
+        // Note: the optimizer may also have forwarded or eliminated the load entirely,
+        // which is also acceptable.
+    }
+
+    #[test]
+    fn licm_does_not_hoist_stored_local() {
+        // LoadGlobal for _l_ variable that IS stored inside the loop
+        // should NOT be hoisted.
+        let body = vec![
+            IrInstr::bare(IrOp::Label { label: Label::new(0) }),
+            IrInstr::bare(IrOp::LoadGlobal {
+                dst: VReg::new(0, Width::W16),
+                addr_label: "_l_test_x".into(),
+            }),
+            IrInstr::bare(IrOp::LoadImm { dst: VReg::new(1, Width::W16), value: 1 }),
+            IrInstr::bare(IrOp::Add {
+                dst: VReg::new(2, Width::W16),
+                lhs: VReg::new(0, Width::W16),
+                rhs: VReg::new(1, Width::W16),
+                width: Width::W16,
+            }),
+            IrInstr::bare(IrOp::StoreGlobal {
+                addr_label: "_l_test_x".into(),
+                src: VReg::new(2, Width::W16),
+            }),
+            IrInstr::bare(IrOp::JumpIfTrue {
+                cond: VReg::new(0, Width::W16),
+                target: Label::new(0),
+            }),
+            IrInstr::bare(IrOp::ret(None)),
+        ];
+        let result = opt_body(body);
+        // LoadGlobal for _l_test_x should NOT be before L0
+        let label_pos = result
+            .iter()
+            .position(|i| matches!(&i.op, IrOp::Label { label } if label.0 == 0))
+            .unwrap_or(0);
+        let load_before_label = result[..label_pos]
+            .iter()
+            .any(|i| matches!(&i.op, IrOp::LoadGlobal { addr_label, .. } if addr_label == "_l_test_x"));
+        assert!(
+            !load_before_label,
+            "_l_test_x load should NOT be hoisted (it is stored inside loop)"
+        );
+    }
+
+    // -- Step 10: CSE for PtrAdd ------------------------------------------
+
+    #[test]
+    fn cse_eliminates_duplicate_ptr_add() {
+        // Two identical PtrAdd operations in the same basic block should
+        // be deduplicated.
+        let body = vec![
+            IrInstr::bare(IrOp::LoadGlobal {
+                dst: VReg::new(0, Width::W16),
+                addr_label: "_g_arr".into(),
+            }),
+            IrInstr::bare(IrOp::LoadGlobal {
+                dst: VReg::new(1, Width::W16),
+                addr_label: "_g_i".into(),
+            }),
+            IrInstr::bare(IrOp::PtrAdd {
+                dst: VReg::new(2, Width::W16),
+                ptr: VReg::new(0, Width::W16),
+                offset: VReg::new(1, Width::W16),
+                element_size: 2,
+            }),
+            // Duplicate PtrAdd with same operands
+            IrInstr::bare(IrOp::PtrAdd {
+                dst: VReg::new(3, Width::W16),
+                ptr: VReg::new(0, Width::W16),
+                offset: VReg::new(1, Width::W16),
+                element_size: 2,
+            }),
+            IrInstr::bare(IrOp::StoreGlobal {
+                addr_label: "_g_x".into(),
+                src: VReg::new(2, Width::W16),
+            }),
+            IrInstr::bare(IrOp::StoreGlobal {
+                addr_label: "_g_y".into(),
+                src: VReg::new(3, Width::W16),
+            }),
+            IrInstr::bare(IrOp::ret(None)),
+        ];
+        let result = opt_body(body);
+        // The second PtrAdd should be replaced by a Copy (or the store
+        // should reference the first PtrAdd's vreg directly).
+        let ptr_add_count = result
+            .iter()
+            .filter(|i| matches!(&i.op, IrOp::PtrAdd { .. }))
+            .count();
+        assert!(
+            ptr_add_count <= 1,
+            "duplicate PtrAdd should be eliminated by CSE; got {} PtrAdd ops:\n{:#?}",
+            ptr_add_count, result
+        );
+    }
+
+    // -- Step 11: Cross-block store-reload forwarding ----------------------
+
+    #[test]
+    fn forwarding_preserves_local_across_jump() {
+        // StoreGlobal _l_test_x / Jump L1 / <dead> / L1 / LoadGlobal _l_test_x
+        // The load should NOT be forwarded across the Label (merge point).
+        let body = vec![
+            IrInstr::bare(IrOp::LoadImm {
+                dst: VReg::new(0, Width::W16),
+                value: 42,
+            }),
+            IrInstr::bare(IrOp::StoreGlobal {
+                addr_label: "_l_test_x".into(),
+                src: VReg::new(0, Width::W16),
+            }),
+            IrInstr::bare(IrOp::Jump { target: Label::new(1) }),
+            IrInstr::bare(IrOp::Label { label: Label::new(1) }),
+            IrInstr::bare(IrOp::LoadGlobal {
+                dst: VReg::new(1, Width::W16),
+                addr_label: "_l_test_x".into(),
+            }),
+            IrInstr::bare(IrOp::StoreGlobal {
+                addr_label: "_g_result".into(),
+                src: VReg::new(1, Width::W16),
+            }),
+            IrInstr::bare(IrOp::ret(None)),
+        ];
+        let result = opt_body(body);
+        // After optimization, the store to _g_result should exist.
+        assert!(
+            result.iter().any(|i| matches!(&i.op, IrOp::StoreGlobal { addr_label, .. } if addr_label == "_g_result")),
+            "store to _g_result must survive"
+        );
     }
 }

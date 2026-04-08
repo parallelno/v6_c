@@ -159,7 +159,7 @@ in DE, then requesting lhs in HL evicts DE's value to BC.
 
 ---
 
-## Step 7: W16 Compare-Branch Fusion (CRITICAL)
+## Step 7: W16 Compare-Branch Fusion (CRITICAL) ✅ COMPLETE
 
 **Difficulty:** Medium  
 **Est. savings:** ~70–100 cycles per comparison (~50% cycle reduction)  
@@ -188,7 +188,7 @@ fuse compare + conditional jump). W16 comparisons always materialise a boolean
 
 ---
 
-## Step 8: Strength Reduction for `2*i + k` Patterns
+## Step 8: Strength Reduction for `2*i + k` Patterns ✅ COMPLETE
 
 **Difficulty:** Medium  
 **Est. savings:** ~40 cycles per occurrence  
@@ -208,7 +208,7 @@ loading `i` twice. This should become `DAD H` + `LXI D,3` + `DAD D`.
 
 ---
 
-## Step 9: LICM for `_l_` Variables in Loops
+## Step 9: LICM for `_l_` Variables in Loops ✅ COMPLETE
 
 **Difficulty:** Medium  
 **Est. savings:** ~20 cycles per loop iteration  
@@ -231,7 +231,7 @@ compiler-local variables (`_l_*`) are not aliased by external code.
 
 ---
 
-## Step 10: CSE for Repeated PtrAdd
+## Step 10: CSE for Repeated PtrAdd ✅ COMPLETE
 
 **Difficulty:** Medium  
 **Est. savings:** ~200–1800 cycles per repeated occurrence  
@@ -253,7 +253,7 @@ recognize `PtrAdd` as a common sub-expression.
 
 ---
 
-## Step 11: Cross-Block Store-Reload Forwarding
+## Step 11: Cross-Block Store-Reload Forwarding ✅ COMPLETE
 
 **Difficulty:** Medium  
 **Est. savings:** ~40 cycles per eliminated reload  
@@ -276,7 +276,7 @@ back-edges is not forwarded. Peephole Rule 1 (`SHLD addr` / `LHLD addr` →
 
 ---
 
-## Step 12: Expanded Peephole Control-Flow Rules
+## Step 12: Expanded Peephole Control-Flow Rules ✅ COMPLETE
 
 **Difficulty:** Medium  
 **Source:** Plan Phase 1.4
