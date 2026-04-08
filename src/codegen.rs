@@ -2073,8 +2073,11 @@ impl CodeGenerator {
             }
             Width::W16 | Width::W32 => {
                 // Subtract: HL - DE, check flags.
-                // Load lhs into HL first: if lhs is already in HL (common case),
-                // no move is needed.  Then load rhs into DE.
+                // Load lhs into HL first (swapped from original `ensure_de(rhs)`
+                // → `ensure_hl(lhs)` order): when lhs is already in HL (common
+                // after arithmetic), no move is needed, and rhs can go straight
+                // to DE via LXI D,imm — avoiding the evict-and-restore round-trip
+                // through BC.
                 self.ensure_hl(lhs);
                 self.ensure_de(rhs);
                 // For equality/inequality: XOR compare

@@ -876,7 +876,7 @@ fn rule_w16_compare_branch_collapse(lines: &mut Vec<Line>) -> bool {
     let mut changed = false;
     let mut i = 0;
 
-    while i + 6 < lines.len() {
+    while i < lines.len() {
         // Step 1: Look for a conditional jump (first Jcc)
         let (first_jcc_op, first_jcc_target) = match &lines[i] {
             Line::Instruction { opcode, operands } if is_conditional_jump(opcode) => {
@@ -894,6 +894,7 @@ fn rule_w16_compare_branch_collapse(lines: &mut Vec<Line>) -> bool {
         pos = skip_non_code(lines, pos);
 
         let second_jcc: Option<(String, String)>;
+        if pos >= lines.len() { i += 1; continue; }
         match &lines[pos] {
             Line::Instruction { opcode, operands } if is_conditional_jump(opcode) => {
                 second_jcc = Some((opcode.clone(), operands.trim().to_string()));

@@ -2770,8 +2770,10 @@ fn normalize_op(
             let dst_str = dst.map(|d| nv(d.id, vreg_map, next_vreg, map_vreg)).unwrap_or_default();
             format!("Call {} [{}] {}", func_name, arg_strs.join(","), dst_str)
         }
-        // Fallback: use Debug representation (won't normalize vreg IDs but
-        // covers less common ops that are unlikely to appear in spec bodies).
+        // Fallback: use Debug representation.  This will NOT normalize vreg/label
+        // IDs, so functions differing only in those IDs won't be deduplicated
+        // through this branch.  In practice, uncommon ops (InlineAsm, LoadLocal,
+        // StoreLocal, etc.) rarely appear in specialization clones.
         other => format!("{:?}", other),
     }
 }
