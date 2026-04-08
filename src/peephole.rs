@@ -234,6 +234,9 @@ fn apply_rules(lines: &mut Vec<Line>) -> bool {
     // --- Rule 41: Remove unused _l_ / __spill_ .STORAGE declarations ----
     changed |= rule_elim_unused_storage(lines);
 
+    // --- Rule 46: W16 compare-branch collapse (Step 5) -------------------
+    changed |= rule_w16_compare_branch_collapse(lines);
+
     // --- Rule 32: Jump threading (resolve JMP chains) --------------------
     changed |= rule_jump_threading(lines);
 
@@ -845,6 +848,220 @@ fn rule_lda_sta_pairs(lines: &mut Vec<Line>) -> bool {
         i += 1;
     }
     changed
+}
+
+// ---------------------------------------------------------------------------
+// Rule 46: W16 compare-branch collapse (Step 5)
+// ---------------------------------------------------------------------------
+
+/// Detect the boolean materialisation pattern produced by W16 comparisons:
+///
+/// ```text
+///     Jcc  <true_lbl>      ; one or two conditional jumps
+///    [JZ   <done_lbl>]     ; optional (for gt/le)
+///     LXI  H,0
+///     JMP  <done_lbl>
+/// <true_lbl>:
+///     LXI  H,1
+/// <done_lbl>:
+///    [MOV  B,H]            ; optional spill
+///    [MOV  C,L]
+///     MOV  A,H
+///     ORA  L
+///     JZ/JNZ <target>
+/// ```
+///
+/// Collapse to direct conditional jumps to `<target>` or fall-through.
+fn rule_w16_compare_branch_collapse(lines: &mut Vec<Line>) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+
+    while i + 6 < lines.len() {
+        // Step 1: Look for a conditional jump (first Jcc)
+        let (first_jcc_op, first_jcc_target) = match &lines[i] {
+            Line::Instruction { opcode, operands } if is_conditional_jump(opcode) => {
+                (opcode.clone(), operands.trim().to_string())
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let first_jcc_idx = i;
+
+        // Step 2: Check for optional second conditional jump or LXI H,0
+        let mut pos = i + 1;
+        pos = skip_non_code(lines, pos);
+
+        let second_jcc: Option<(String, String)>;
+        match &lines[pos] {
+            Line::Instruction { opcode, operands } if is_conditional_jump(opcode) => {
+                second_jcc = Some((opcode.clone(), operands.trim().to_string()));
+                pos += 1;
+                pos = skip_non_code(lines, pos);
+            }
+            _ => {
+                second_jcc = None;
+            }
+        }
+
+        // Step 3: LXI H,0
+        if pos >= lines.len() { i += 1; continue; }
+        match &lines[pos] {
+            Line::Instruction { opcode, operands } if opcode == "LXI" && operands.trim() == "H,0" => {}
+            _ => { i += 1; continue; }
+        }
+        pos += 1;
+        pos = skip_non_code(lines, pos);
+
+        // Step 4: JMP <done_lbl>
+        if pos >= lines.len() { i += 1; continue; }
+        let done_lbl = match &lines[pos] {
+            Line::Instruction { opcode, operands } if opcode == "JMP" => {
+                operands.trim().to_string()
+            }
+            _ => { i += 1; continue; }
+        };
+        pos += 1;
+        pos = skip_non_code(lines, pos);
+
+        // Step 5: <true_lbl>: label matching first Jcc target
+        if pos >= lines.len() { i += 1; continue; }
+        match &lines[pos] {
+            Line::Label(name) if *name == first_jcc_target => {}
+            _ => { i += 1; continue; }
+        }
+        pos += 1;
+        pos = skip_non_code(lines, pos);
+
+        // Step 6: LXI H,1
+        if pos >= lines.len() { i += 1; continue; }
+        match &lines[pos] {
+            Line::Instruction { opcode, operands } if opcode == "LXI" && operands.trim() == "H,1" => {}
+            _ => { i += 1; continue; }
+        }
+        pos += 1;
+        pos = skip_non_code(lines, pos);
+
+        // Step 7: <done_lbl>: label matching JMP target
+        if pos >= lines.len() { i += 1; continue; }
+        match &lines[pos] {
+            Line::Label(name) if *name == done_lbl => {}
+            _ => { i += 1; continue; }
+        }
+        pos += 1;
+        pos = skip_non_code(lines, pos);
+
+        // Step 8: Optional MOV B,H / MOV C,L (spill to BC)
+        if pos >= lines.len() { i += 1; continue; }
+        if matches!(&lines[pos], Line::Instruction { opcode, operands } if opcode == "MOV" && operands.trim() == "B,H") {
+            pos += 1;
+            pos = skip_non_code(lines, pos);
+            if pos < lines.len() && matches!(&lines[pos], Line::Instruction { opcode, operands } if opcode == "MOV" && operands.trim() == "C,L") {
+                pos += 1;
+                pos = skip_non_code(lines, pos);
+            }
+        }
+
+        // Step 9: MOV A,H
+        if pos >= lines.len() { i += 1; continue; }
+        match &lines[pos] {
+            Line::Instruction { opcode, operands } if opcode == "MOV" && operands.trim() == "A,H" => {}
+            _ => { i += 1; continue; }
+        }
+        pos += 1;
+        pos = skip_non_code(lines, pos);
+
+        // Step 10: ORA L
+        if pos >= lines.len() { i += 1; continue; }
+        match &lines[pos] {
+            Line::Instruction { opcode, operands } if opcode == "ORA" && operands.trim() == "L" => {}
+            _ => { i += 1; continue; }
+        }
+        pos += 1;
+        pos = skip_non_code(lines, pos);
+
+        // Step 11: JZ or JNZ <actual_target>
+        if pos >= lines.len() { i += 1; continue; }
+        let (branch_is_jnz, actual_target) = match &lines[pos] {
+            Line::Instruction { opcode, operands } if opcode == "JNZ" => (true, operands.trim().to_string()),
+            Line::Instruction { opcode, operands } if opcode == "JZ" => (false, operands.trim().to_string()),
+            _ => { i += 1; continue; }
+        };
+        let end_pos = pos + 1; // exclusive end of pattern
+
+        // ============================================================
+        // Pattern matched! Now transform.
+        // ============================================================
+
+        let mut replacement: Vec<Line> = Vec::new();
+
+        if branch_is_jnz {
+            // Jump to actual_target when comparison is true → same conditional jumps
+            replacement.push(Line::Instruction {
+                opcode: first_jcc_op.clone(),
+                operands: format!(" {}", actual_target),
+            });
+            if let Some((ref op2, _)) = second_jcc {
+                replacement.push(Line::Instruction {
+                    opcode: op2.clone(),
+                    operands: format!(" {}", actual_target),
+                });
+            }
+        } else {
+            // Jump to actual_target when comparison is FALSE → invert
+            if second_jcc.is_none() {
+                if let Some(inv) = invert_condition(&first_jcc_op) {
+                    replacement.push(Line::Instruction {
+                        opcode: inv,
+                        operands: format!(" {}", actual_target),
+                    });
+                } else {
+                    i += 1;
+                    continue;
+                }
+            } else {
+                // Double Jcc (gt/le): first Jcc fires when true, second fires
+                // for a sub-condition.  For JZ (jump when false), we need to
+                // invert the whole logic.
+                //
+                // Example gt pattern: JP true / JZ done → true when positive & not zero
+                // Inverted (false): JM target / JZ target (negative or zero)
+                if let Some(inv) = invert_condition(&first_jcc_op) {
+                    replacement.push(Line::Instruction {
+                        opcode: inv,
+                        operands: format!(" {}", actual_target),
+                    });
+                }
+                if let Some((ref op2, _)) = second_jcc {
+                    // The second Jcc's target was done_lbl (false path),
+                    // so if it fires the result is false → for JZ we want to jump
+                    replacement.push(Line::Instruction {
+                        opcode: op2.clone(),
+                        operands: format!(" {}", actual_target),
+                    });
+                }
+            }
+        }
+
+        lines.splice(first_jcc_idx..end_pos, replacement);
+        changed = true;
+        // Don't advance i — re-scan from same position
+    }
+
+    changed
+}
+
+/// Skip comment and empty lines, returning the next non-comment/non-empty index.
+fn skip_non_code(lines: &[Line], start: usize) -> usize {
+    let mut pos = start;
+    while pos < lines.len() {
+        match &lines[pos] {
+            Line::Comment(_) | Line::Empty => pos += 1,
+            _ => break,
+        }
+    }
+    pos
 }
 
 /// Rule 32 – Jump threading.
@@ -1894,5 +2111,69 @@ mod tests {
 
     fn has_line(output: &[String], needle: &str) -> bool {
         output.iter().any(|l| l.contains(needle))
+    }
+
+    // -- Rule 46: W16 compare-branch collapse (Step 5) --------------------
+
+    #[test]
+    fn rule46_w16_cmp_branch_collapse_jnz() {
+        // Pattern: JM true / LXI H,0 / JMP done / true: / LXI H,1 / done: / MOV A,H / ORA L / JNZ target
+        // Should collapse to: JM target
+        let input = asm(&[
+            "\tJM __cg_0",
+            "\tLXI H,0",
+            "\tJMP __cg_1",
+            "__cg_0:",
+            "\tLXI H,1",
+            "__cg_1:",
+            "\tMOV A,H",
+            "\tORA L",
+            "\tJNZ L_target",
+        ]);
+        let out = peephole_optimize(input);
+        assert!(has_line(&out, "JM") && has_line(&out, "L_target"), "should redirect JM to target; got:\n{:?}", out);
+        assert!(!has_line(&out, "LXI H,0"), "should eliminate boolean materialisation");
+        assert!(!has_line(&out, "ORA L"), "should eliminate re-test");
+    }
+
+    #[test]
+    fn rule46_w16_cmp_branch_collapse_jz_inverts() {
+        // Same pattern but ending with JZ target (jump when false)
+        // JM true → inverted to JP target
+        let input = asm(&[
+            "\tJM __cg_0",
+            "\tLXI H,0",
+            "\tJMP __cg_1",
+            "__cg_0:",
+            "\tLXI H,1",
+            "__cg_1:",
+            "\tMOV A,H",
+            "\tORA L",
+            "\tJZ L_target",
+        ]);
+        let out = peephole_optimize(input);
+        assert!(has_line(&out, "JP") && has_line(&out, "L_target"), "should invert JM to JP; got:\n{:?}", out);
+        assert!(!has_line(&out, "LXI H,0"), "should eliminate boolean materialisation");
+    }
+
+    #[test]
+    fn rule46_w16_cmp_branch_with_spill() {
+        // Same pattern but with MOV B,H / MOV C,L spill before re-test
+        let input = asm(&[
+            "\tJC __cg_0",
+            "\tLXI H,0",
+            "\tJMP __cg_1",
+            "__cg_0:",
+            "\tLXI H,1",
+            "__cg_1:",
+            "\tMOV B,H",
+            "\tMOV C,L",
+            "\tMOV A,H",
+            "\tORA L",
+            "\tJNZ L_target",
+        ]);
+        let out = peephole_optimize(input);
+        assert!(has_line(&out, "JC") && has_line(&out, "L_target"), "should redirect JC to target; got:\n{:?}", out);
+        assert!(!has_line(&out, "LXI H,0"), "should eliminate boolean materialisation");
     }
 }
