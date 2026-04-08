@@ -1319,4 +1319,376 @@ mod tests {
         let has_ref = has_line(&out, "CALL printf") || has_line(&out, "JMP printf");
         assert!(has_ref, "must call or jump to printf");
     }
+
+    // -----------------------------------------------------------------------
+    // Phase 4 – Assembler improvement steps 1–6
+    // Each test compiles a representative C snippet and asserts that the
+    // improvement is actually visible in the generated assembly.
+    // -----------------------------------------------------------------------
+
+    /// Step 1a – PtrAdd fast-path: `int` array (element_size = 2).
+    ///
+    /// `arr[i] = 5` must use one `DAD H` (i * 2) instead of `CALL __mul16`.
+    #[test]
+    fn step1_ptadd_fastpath_int_array() {
+        let src = r#"
+            int arr[10];
+            int i;
+            int result;
+            void main(void) {
+                arr[i] = 5;
+                result = arr[i];
+            }
+        "#;
+        let out = compile_source(src, "test.c", &[]).expect("step1 int array failed");
+        assert!(
+            !has_line(&out, "CALL __mul16"),
+            "int array access (×2) should use DAD H, not __mul16"
+        );
+        assert!(
+            has_line(&out, "DAD H"),
+            "int array access must use DAD H to scale index by 2"
+        );
+    }
+
+    /// Step 1b – PtrAdd fast-path: `long` array (element_size = 4).
+    ///
+    /// `arr[idx] = 100` must use two `DAD H` (i * 4) instead of `CALL __mul16`.
+    #[test]
+    fn step1_ptadd_fastpath_long_array() {
+        let src = r#"
+            long arr[8];
+            int idx;
+            void main(void) {
+                arr[idx] = 100;
+            }
+        "#;
+        let out = compile_source(src, "test.c", &[]).expect("step1 long array failed");
+        assert!(
+            !has_line(&out, "CALL __mul16"),
+            "long array access (×4) should use DAD H twice, not __mul16"
+        );
+        let dad_count = out.iter().filter(|l| l.contains("DAD H")).count();
+        assert!(
+            dad_count >= 2,
+            "long array access must use DAD H at least twice; got {} DAD H",
+            dad_count
+        );
+    }
+
+    /// Step 2 – MVI M,n for constant stores through a pointer.
+    ///
+    /// Storing compile-time constants (0, 42, 255) through a pointer must use
+    /// `MVI M,` not `LXI D,` + register moves.
+    #[test]
+    fn step2_mvi_m_constant_store() {
+        let src = r#"
+            int buf[4];
+            int *ptr;
+            void main(void) {
+                ptr = buf;
+                *ptr = 0;
+                ptr = buf + 1;
+                *ptr = 42;
+                ptr = buf + 2;
+                *ptr = 255;
+            }
+        "#;
+        let out = compile_source(src, "test.c", &[]).expect("step2 constant store failed");
+        assert!(
+            has_line(&out, "MVI M,"),
+            "constant pointer store should use MVI M,n"
+        );
+        assert!(
+            has_line(&out, "MVI M,0"),
+            "store of 0 should use MVI M,0"
+        );
+        assert!(
+            has_line(&out, "MVI M,42"),
+            "store of 42 should use MVI M,42"
+        );
+        // Small constants must not go through DE register
+        assert!(
+            !has_line(&out, "LXI D,42"),
+            "store of 42 should not use LXI D,42"
+        );
+        assert!(
+            !has_line(&out, "LXI D,0"),
+            "store of 0 should not use LXI D,0"
+        );
+    }
+
+    /// Step 3 – Dedup identical function specializations.
+    ///
+    /// Calling the same function twice with identical constant arguments must
+    /// produce only ONE `__spec_*` variant, not two.
+    #[test]
+    fn step3_dedup_identical_specializations() {
+        let src = r#"
+            int acc;
+            int fib_step(int a, int b, int n) {
+                int i;
+                int t;
+                i = 0;
+                while (i < n) {
+                    t = a + b;
+                    a = b;
+                    b = t;
+                    i = i + 1;
+                }
+                return b;
+            }
+            void main(void) {
+                acc = fib_step(0, 1, 5);
+                acc = acc + fib_step(0, 1, 5);
+            }
+        "#;
+        let out = compile_source(src, "test.c", &[]).expect("step3 dedup failed");
+        // Count __spec_ function *definitions* (lines starting with __spec_...)
+        let spec_defs: Vec<&String> = out
+            .iter()
+            .filter(|l| l.starts_with("__spec_fib_step"))
+            .collect();
+        assert_eq!(
+            spec_defs.len(),
+            1,
+            "identical calls with same args must produce exactly 1 __spec_ definition; got {:?}",
+            spec_defs
+        );
+        // Both call sites must reference the same spec (no second unique label)
+        let call_count = out
+            .iter()
+            .filter(|l| l.contains("__spec_fib_step_0"))
+            .count();
+        assert!(
+            call_count >= 2,
+            "both calls should reference __spec_fib_step_0; references = {}",
+            call_count
+        );
+    }
+
+    /// Step 3b – Different constant arguments must produce two separate specializations.
+    ///
+    /// This is a negative counterpart: verifies dedup only happens when bodies are identical.
+    #[test]
+    fn step3_different_args_produce_two_specializations() {
+        let src = r#"
+            int acc;
+            int fib_step(int a, int b, int n) {
+                int i;
+                int t;
+                i = 0;
+                while (i < n) {
+                    t = a + b;
+                    a = b;
+                    b = t;
+                    i = i + 1;
+                }
+                return b;
+            }
+            void main(void) {
+                acc = fib_step(0, 1, 5);
+                acc = acc + fib_step(0, 1, 7);
+            }
+        "#;
+        let out = compile_source(src, "test.c", &[]).expect("step3 two specs failed");
+        let spec_defs: Vec<&String> = out
+            .iter()
+            .filter(|l| l.starts_with("__spec_fib_step"))
+            .collect();
+        assert_eq!(
+            spec_defs.len(),
+            2,
+            "different args must produce 2 __spec_ definitions; got {:?}",
+            spec_defs
+        );
+    }
+
+    /// Step 4 – Compare-with-zero fast path.
+    ///
+    /// `if (x == 0)` and `if (x != 0)` must emit only the direct `ORA L` / `JZ`
+    /// or `JNZ` test, not the full W16 boolean materialisation sequence
+    /// (`LXI H,0` / `JMP` / `LXI H,1` / `MOV A,H` / `ORA L`).
+    #[test]
+    fn step4_compare_zero_fast_path() {
+        let src = r#"
+            int x;
+            int r;
+            void main(void) {
+                if (x == 0) {
+                    r = 1;
+                }
+                if (x != 0) {
+                    r = 2;
+                }
+            }
+        "#;
+        let out = compile_source(src, "test.c", &[]).expect("step4 zero-compare failed");
+        // Must test with ORA L (zero-test of HL)
+        assert!(
+            has_line(&out, "ORA L"),
+            "zero comparison must use ORA L to test HL"
+        );
+        // Must NOT have boolean materialisation — the false path assigns LXI H,0.
+        // The `r = 1` and `r = 2` assignments only generate `LXI H,1` / `LXI H,2`
+        // (not `LXI H,0`), so any `LXI H,0` in the output is from materialisation.
+        assert!(
+            !has_line(&out, "LXI H,0"),
+            "zero comparison must not materialise bool via LXI H,0 false path"
+        );
+        // Must use direct conditional jump from the ORA L result
+        let has_jz = has_line(&out, "JZ ");
+        let has_jnz = has_line(&out, "JNZ ");
+        assert!(
+            has_jz || has_jnz,
+            "zero comparison must branch directly with JZ or JNZ"
+        );
+        // Must NOT go through a W16 SUB-based comparison for the zero check
+        assert!(
+            !has_line(&out, "SUB D"),
+            "zero comparison should not use SUB D"
+        );
+        assert!(
+            !has_line(&out, "SUB E"),
+            "zero comparison should not use SUB E"
+        );
+    }
+
+    /// Step 5 – Peephole W16 compare-branch collapse.
+    ///
+    /// `if (a < b)` on two `int` variables must collapse the boolean
+    /// materialisation sequence into a direct conditional jump: no
+    /// `LXI H,0` / `JMP` / `LXI H,1` / `ORA L` re-test in the output.
+    #[test]
+    fn step5_w16_compare_branch_collapsed() {
+        let src = r#"
+            int a;
+            int b;
+            int r;
+            void main(void) {
+                if (a < b) {
+                    r = 1;
+                }
+                if (a >= b) {
+                    r = 2;
+                }
+            }
+        "#;
+        let out = compile_source(src, "test.c", &[]).expect("step5 compare-branch failed");
+        // The compare subtraction must be present (real comparison happens)
+        assert!(
+            has_line(&out, "SUB D"),
+            "W16 comparison must subtract high bytes (SUB D)"
+        );
+        // Boolean materialisation false path (LXI H,0 / JMP) must be eliminated.
+        // Note: `LXI H,1` and `LXI H,2` legitimately appear for `r = 1` / `r = 2`
+        // assignments, but `LXI H,0` only appears when bool materialisation is present
+        // (the test body never assigns 0).
+        assert!(
+            !has_line(&out, "LXI H,0"),
+            "W16 compare-branch should not materialise bool false path (LXI H,0 found)"
+        );
+        // The ORA L re-test pattern must be gone
+        assert!(
+            !has_line(&out, "ORA L"),
+            "W16 compare-branch collapse must remove ORA L re-test"
+        );
+        // Direct conditional jump must remain
+        let has_cond_jump = has_line(&out, "JP ") || has_line(&out, "JM ")
+            || has_line(&out, "JC ") || has_line(&out, "JNC ");
+        assert!(
+            has_cond_jump,
+            "W16 compare-branch must produce a direct conditional jump (JP/JM/JC/JNC)"
+        );
+    }
+
+    /// Step 6 – Register shuffle elimination around compares.
+    ///
+    /// When lhs is a freshly computed value (already in HL) and rhs is a small
+    /// immediate, `ensure_hl(lhs)` is a no-op and `ensure_de(rhs)` emits
+    /// `LXI D,n` — no LHLD needed for rhs, so no evict/restore shuffle.
+    #[test]
+    fn step6_no_register_shuffle_for_immediate_rhs() {
+        let src = r#"
+            int counter;
+            int result;
+            void main(void) {
+                counter = counter + 1;
+                if (counter < 10) {
+                    result = counter;
+                }
+            }
+        "#;
+        let out = compile_source(src, "test.c", &[]).expect("step6 shuffle test failed");
+        // After `counter + 1` the value is in HL; rhs 10 is an immediate.
+        // The compare should load rhs directly via LXI D,10 (no LHLD for rhs).
+        assert!(
+            has_line(&out, "LXI D,10"),
+            "immediate rhs (10) should be loaded via LXI D,10, not LHLD"
+        );
+        // Verify no evict-and-restore shuffle pattern between INX H and SUB D.
+        // The shuffle is: MOV B,H / MOV C,L / (LHLD rhs) / XCHG / MOV H,B / MOV L,C
+        let line_text = out.join("\n");
+        let has_bc_evict = line_text.contains("MOV B,H") && line_text.contains("MOV C,L");
+        // Only check for the BC evict if it appears BEFORE the SUB D (compare)
+        if has_bc_evict {
+            let bc_h_pos = out.iter().position(|l| l.contains("MOV B,H"));
+            let sub_d_pos = out.iter().position(|l| l.contains("SUB D"));
+            if let (Some(bc_pos), Some(sd_pos)) = (bc_h_pos, sub_d_pos) {
+                assert!(
+                    bc_pos >= sd_pos,
+                    "register shuffle (MOV B,H before compare) should not occur; \
+                     LXI D,10 should avoid the LHLD/evict round-trip"
+                );
+            }
+        }
+    }
+
+    /// Bug fix: W16 comparison with live lhs used in if-body — BC must not be
+    /// stale.
+    ///
+    /// When `lhs` is live after a W16 comparison (because the if-body assigns
+    /// it to another variable), `gen_compare` used to call `mark(dst, HL)`
+    /// *after* `LXI H,0`/`LXI H,1`, so the eviction `MOV B,H; MOV C,L`
+    /// copied 0 or 1 (the boolean result) into BC instead of the original
+    /// operand.  The body then read a stale BC via `MOV H,B; MOV L,C`.
+    ///
+    /// The fix: call `mark(dst, HL)` *before* the first conditional branch so
+    /// that HL still holds `lhs` when the eviction fires.
+    #[test]
+    fn fix_w16_compare_bc_not_stale_when_lhs_live_in_body() {
+        let src = r#"
+            int counter;
+            int g_result;
+            void main(void) {
+                counter = counter + 1;
+                if (counter < 10) {
+                    g_result = counter;
+                }
+            }
+        "#;
+        let out = compile_source(src, "test.c", &[]).expect("bc stale test failed");
+        let text = out.join("\n");
+        // BC spill (MOV B,H / MOV C,L) must appear in the output: lhs is live
+        // across the comparison and is saved to BC.
+        assert!(
+            text.contains("MOV B,H") && text.contains("MOV C,L"),
+            "lhs must be spilled to BC: MOV B,H / MOV C,L missing"
+        );
+        // BC reload (MOV H,B / MOV L,C) must appear in the body.
+        assert!(
+            text.contains("MOV H,B") && text.contains("MOV L,C"),
+            "lhs must be reloaded from BC in body: MOV H,B / MOV L,C missing"
+        );
+        // The spill must happen BEFORE the reload (BC is set before use).
+        let spill_pos = out.iter().position(|l| l.contains("MOV B,H")).unwrap();
+        let reload_pos = out.iter().position(|l| l.contains("MOV H,B")).unwrap();
+        assert!(
+            spill_pos < reload_pos,
+            "BC spill (MOV B,H) must precede BC reload (MOV H,B); \
+             got spill at line {} reload at line {}",
+            spill_pos,
+            reload_pos
+        );
+    }
 }

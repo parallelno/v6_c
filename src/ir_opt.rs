@@ -60,6 +60,9 @@ pub fn optimize(program: &mut IrProgram) {
         optimize_function(func, profile);
     }
 
+    // Dedup identical specializations before removing dead functions.
+    dedup_specializations(program);
+
     // Remove functions unreachable from main (only when main exists).
     if program.functions.iter().any(|f| f.name == "main") {
         remove_dead_functions(program);
@@ -93,6 +96,7 @@ fn optimize_function(func: &mut IrFunction, profile: OptProfile) {
         match profile {
             OptProfile::Default => {
                 changed |= constant_fold_and_propagate(func);
+                changed |= compare_zero_simplify(func);
                 changed |= dead_branch_eliminate(func);
                 changed |= load_store_forwarding(func);
                 changed |= copy_propagate(func);
@@ -108,6 +112,7 @@ fn optimize_function(func: &mut IrFunction, profile: OptProfile) {
             }
             OptProfile::Benchmark => {
                 changed |= constant_fold_and_propagate(func);
+                changed |= compare_zero_simplify(func);
                 changed |= dead_branch_eliminate(func);
                 changed |= load_store_forwarding(func);
                 changed |= copy_propagate(func);
@@ -2085,6 +2090,165 @@ fn collect_used_vregs(body: &[IrInstr]) -> HashSet<u32> {
 }
 
 // ---------------------------------------------------------------------------
+// Compare-with-zero simplification (Step 4)
+// ---------------------------------------------------------------------------
+
+/// Recognize `Eq/Ne(x, 0)` followed by `JumpIfTrue/JumpIfFalse` and simplify
+/// to a direct `JumpIfTrue(x)` or `JumpIfFalse(x)`, eliminating the
+/// unnecessary comparison vreg.
+///
+/// Patterns:
+///   Eq(dst, x, 0)  + JumpIfTrue(dst, t)   → JumpIfFalse(x, t)
+///   Eq(dst, x, 0)  + JumpIfFalse(dst, t)  → JumpIfTrue(x, t)
+///   Ne(dst, x, 0)  + JumpIfTrue(dst, t)   → JumpIfTrue(x, t)
+///   Ne(dst, x, 0)  + JumpIfFalse(dst, t)  → JumpIfFalse(x, t)
+fn compare_zero_simplify(func: &mut IrFunction) -> bool {
+    let mut changed = false;
+
+    // Build a map: vreg id → known constant value (just from LoadImm).
+    let constants: HashMap<u32, i64> = func
+        .body
+        .iter()
+        .filter_map(|instr| {
+            if let IrOp::LoadImm { dst, value } = &instr.op {
+                Some((dst.id, *value))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Build use-count map for comparison destinations to ensure we only
+    // eliminate comparisons whose result is used exactly once (by the branch).
+    let mut use_count: HashMap<u32, u32> = HashMap::new();
+    for instr in &func.body {
+        for vreg_id in collect_src_vreg_ids(&instr.op) {
+            *use_count.entry(vreg_id).or_insert(0) += 1;
+        }
+    }
+
+    // Scan pairs of adjacent instructions.
+    let mut i = 0;
+    while i + 1 < func.body.len() {
+        let (cmp_kind, cmp_dst_id, operand, cmp_width) = match &func.body[i].op {
+            IrOp::Eq { dst, lhs, rhs, width } => {
+                if let Some(&0) = constants.get(&rhs.id) {
+                    ("eq", dst.id, *lhs, *width)
+                } else if let Some(&0) = constants.get(&lhs.id) {
+                    ("eq", dst.id, *rhs, *width)
+                } else {
+                    i += 1;
+                    continue;
+                }
+            }
+            IrOp::Ne { dst, lhs, rhs, width } => {
+                if let Some(&0) = constants.get(&rhs.id) {
+                    ("ne", dst.id, *lhs, *width)
+                } else if let Some(&0) = constants.get(&lhs.id) {
+                    ("ne", dst.id, *rhs, *width)
+                } else {
+                    i += 1;
+                    continue;
+                }
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+
+        // Only simplify if the comparison result is used exactly once (by the
+        // following branch).
+        if use_count.get(&cmp_dst_id).copied().unwrap_or(0) != 1 {
+            i += 1;
+            continue;
+        }
+
+        let line = func.body[i].line;
+        match &func.body[i + 1].op {
+            IrOp::JumpIfTrue { cond, target } if cond.id == cmp_dst_id => {
+                let target = *target;
+                // Eq(x,0) + JumpIfTrue → jump when x==0 → JumpIfFalse(x)
+                // Ne(x,0) + JumpIfTrue → jump when x≠0 → JumpIfTrue(x)
+                let new_op = if cmp_kind == "eq" {
+                    IrOp::JumpIfFalse { cond: VReg::new(operand.id, cmp_width), target }
+                } else {
+                    IrOp::JumpIfTrue { cond: VReg::new(operand.id, cmp_width), target }
+                };
+                // Replace comparison with a dead LoadImm placeholder (value=0).
+                // This makes cmp_dst_id dead; DCE will remove it in the next pass.
+                func.body[i] = IrInstr { op: IrOp::LoadImm { dst: VReg::new(cmp_dst_id, Width::W8), value: 0 }, line };
+                func.body[i + 1] = IrInstr { op: new_op, line: func.body[i + 1].line };
+                changed = true;
+                i += 2;
+            }
+            IrOp::JumpIfFalse { cond, target } if cond.id == cmp_dst_id => {
+                let target = *target;
+                // Eq(x,0) + JumpIfFalse → jump when x≠0 → JumpIfTrue(x)
+                // Ne(x,0) + JumpIfFalse → jump when x==0 → JumpIfFalse(x)
+                let new_op = if cmp_kind == "eq" {
+                    IrOp::JumpIfTrue { cond: VReg::new(operand.id, cmp_width), target }
+                } else {
+                    IrOp::JumpIfFalse { cond: VReg::new(operand.id, cmp_width), target }
+                };
+                // Replace comparison with a dead LoadImm placeholder (value=0).
+                // This makes cmp_dst_id dead; DCE will remove it in the next pass.
+                func.body[i] = IrInstr { op: IrOp::LoadImm { dst: VReg::new(cmp_dst_id, Width::W8), value: 0 }, line };
+                func.body[i + 1] = IrInstr { op: new_op, line: func.body[i + 1].line };
+                changed = true;
+                i += 2;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    changed
+}
+
+/// Collect source (non-destination) vreg IDs referenced by an IR operation.
+/// (Note: the existing `collect_src_vregs` at module scope returns `Vec<u32>`;
+///  this local variant returns `Vec<u32>` IDs for use in compare_zero_simplify.)
+fn collect_src_vreg_ids(op: &IrOp) -> Vec<u32> {
+    // Delegate to the existing function.
+    let mut srcs = Vec::new();
+    match op {
+        IrOp::StoreGlobal { src, .. } | IrOp::StoreLocal { src, .. } => { srcs.push(src.id); }
+        IrOp::LoadPtr { ptr, .. } => { srcs.push(ptr.id); }
+        IrOp::StorePtr { ptr, src } => { srcs.push(ptr.id); srcs.push(src.id); }
+        IrOp::Add { lhs, rhs, .. } | IrOp::Sub { lhs, rhs, .. }
+        | IrOp::Mul { lhs, rhs, .. } | IrOp::Div { lhs, rhs, .. }
+        | IrOp::Mod { lhs, rhs, .. } | IrOp::And { lhs, rhs, .. }
+        | IrOp::Or { lhs, rhs, .. } | IrOp::Xor { lhs, rhs, .. }
+        | IrOp::Shl { lhs, rhs, .. } | IrOp::Shr { lhs, rhs, .. }
+        | IrOp::Eq { lhs, rhs, .. } | IrOp::Ne { lhs, rhs, .. }
+        | IrOp::Lt { lhs, rhs, .. } | IrOp::Le { lhs, rhs, .. }
+        | IrOp::Gt { lhs, rhs, .. } | IrOp::Ge { lhs, rhs, .. } => {
+            srcs.push(lhs.id);
+            srcs.push(rhs.id);
+        }
+        IrOp::Neg { src, .. } | IrOp::Not { src, .. } | IrOp::LogicalNot { src, .. } => {
+            srcs.push(src.id);
+        }
+        IrOp::Copy { src, .. } | IrOp::Cast { src, .. } => { srcs.push(src.id); }
+        IrOp::JumpIfTrue { cond, .. } | IrOp::JumpIfFalse { cond, .. } => { srcs.push(cond.id); }
+        IrOp::Call { args, .. } => {
+            for a in args { srcs.push(a.id); }
+        }
+        IrOp::Return { value } => {
+            if let Some(v) = value { srcs.push(v.id); }
+        }
+        IrOp::PtrAdd { ptr, offset, .. } => {
+            srcs.push(ptr.id);
+            srcs.push(offset.id);
+        }
+        _ => {}
+    }
+    srcs
+}
+
+// ---------------------------------------------------------------------------
 // Common sub-expression elimination (CSE)
 // ---------------------------------------------------------------------------
 
@@ -2423,6 +2587,200 @@ fn jump_threading(func: &mut IrFunction) -> bool {
 /// Reachability is seeded from every function that is never the target of a
 /// `Call` instruction in any other function (i.e., all potential entry points,
 /// Remove functions that are never reachable from `main`.
+// ---------------------------------------------------------------------------
+// Dedup identical function specializations (Step 3)
+// ---------------------------------------------------------------------------
+
+/// After function specialization, multiple `__spec_*` variants may end up with
+/// identical IR bodies (e.g. when different call-sites supply the same constant
+/// value for different argument positions but the specialized bodies simplify to
+/// the same code).  This pass compares their bodies structurally (normalizing
+/// vreg IDs and labels) and redirects duplicate call-sites to a single copy.
+fn dedup_specializations(program: &mut IrProgram) {
+    // Collect indices of __spec_* functions.
+    let spec_indices: Vec<usize> = program
+        .functions
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.name.contains("__spec_"))
+        .map(|(i, _)| i)
+        .collect();
+
+    if spec_indices.len() < 2 {
+        return;
+    }
+
+    // Build a map from normalized body → canonical name (first occurrence).
+    let mut canonical: HashMap<Vec<NormalizedOp>, String> = HashMap::new();
+    // Map from duplicate name → canonical name.
+    let mut redirect: HashMap<String, String> = HashMap::new();
+
+    for &idx in &spec_indices {
+        let norm = normalize_body(&program.functions[idx].body);
+        let name = program.functions[idx].name.clone();
+        if let Some(existing) = canonical.get(&norm) {
+            redirect.insert(name, existing.clone());
+        } else {
+            canonical.insert(norm, name);
+        }
+    }
+
+    if redirect.is_empty() {
+        return;
+    }
+
+    // Rewrite all Call instructions that reference duplicates.
+    for func in &mut program.functions {
+        for instr in &mut func.body {
+            if let IrOp::Call { func_name, .. } = &mut instr.op {
+                if let Some(canon) = redirect.get(func_name) {
+                    *func_name = canon.clone();
+                }
+            }
+        }
+    }
+
+    // The duplicate functions are now unreferenced and will be removed by
+    // remove_dead_functions().
+}
+
+/// A normalized representation of an IR operation where vreg IDs and label IDs
+/// are replaced with sequential indices based on first-occurrence order.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct NormalizedOp {
+    /// String representation of the op with normalized IDs.
+    repr: String,
+}
+
+/// Normalize an IR function body so that structurally identical functions
+/// produce the same sequence regardless of absolute vreg/label IDs.
+fn normalize_body(body: &[IrInstr]) -> Vec<NormalizedOp> {
+    let mut vreg_map: HashMap<u32, u32> = HashMap::new();
+    let mut label_map: HashMap<u32, u32> = HashMap::new();
+    let mut next_vreg: u32 = 0;
+    let mut next_label: u32 = 0;
+
+    let mut map_vreg = |id: u32, vm: &mut HashMap<u32, u32>, nv: &mut u32| -> u32 {
+        *vm.entry(id).or_insert_with(|| {
+            let r = *nv;
+            *nv += 1;
+            r
+        })
+    };
+
+    let mut map_label = |id: u32, lm: &mut HashMap<u32, u32>, nl: &mut u32| -> u32 {
+        *lm.entry(id).or_insert_with(|| {
+            let r = *nl;
+            *nl += 1;
+            r
+        })
+    };
+
+    body.iter()
+        .map(|instr| {
+            let repr = normalize_op(
+                &instr.op,
+                &mut vreg_map,
+                &mut label_map,
+                &mut next_vreg,
+                &mut next_label,
+                &mut map_vreg,
+                &mut map_label,
+            );
+            NormalizedOp { repr }
+        })
+        .collect()
+}
+
+fn normalize_op(
+    op: &IrOp,
+    vreg_map: &mut HashMap<u32, u32>,
+    label_map: &mut HashMap<u32, u32>,
+    next_vreg: &mut u32,
+    next_label: &mut u32,
+    map_vreg: &mut impl FnMut(u32, &mut HashMap<u32, u32>, &mut u32) -> u32,
+    map_label: &mut impl FnMut(u32, &mut HashMap<u32, u32>, &mut u32) -> u32,
+) -> String {
+    // Helper closures for normalized vreg/label representation.
+    let nv = |id: u32, vm: &mut HashMap<u32, u32>, nv: &mut u32, f: &mut dyn FnMut(u32, &mut HashMap<u32, u32>, &mut u32) -> u32| -> String {
+        format!("v{}", f(id, vm, nv))
+    };
+    let nl = |id: u32, lm: &mut HashMap<u32, u32>, nl: &mut u32, f: &mut dyn FnMut(u32, &mut HashMap<u32, u32>, &mut u32) -> u32| -> String {
+        format!("L{}", f(id, lm, nl))
+    };
+
+    match op {
+        IrOp::LoadImm { dst, value } => {
+            format!("LoadImm {} {} {:?} {}", nv(dst.id, vreg_map, next_vreg, map_vreg), value, dst.width, value)
+        }
+        IrOp::LoadGlobal { dst, addr_label } => {
+            format!("LoadGlobal {} {:?} {}", nv(dst.id, vreg_map, next_vreg, map_vreg), dst.width, addr_label)
+        }
+        IrOp::StoreGlobal { addr_label, src } => {
+            format!("StoreGlobal {} {} {:?}", addr_label, nv(src.id, vreg_map, next_vreg, map_vreg), src.width)
+        }
+        IrOp::Add { dst, lhs, rhs, width } => {
+            format!("Add {} {} {} {:?}",
+                nv(dst.id, vreg_map, next_vreg, map_vreg),
+                nv(lhs.id, vreg_map, next_vreg, map_vreg),
+                nv(rhs.id, vreg_map, next_vreg, map_vreg),
+                width)
+        }
+        IrOp::Sub { dst, lhs, rhs, width } => {
+            format!("Sub {} {} {} {:?}",
+                nv(dst.id, vreg_map, next_vreg, map_vreg),
+                nv(lhs.id, vreg_map, next_vreg, map_vreg),
+                nv(rhs.id, vreg_map, next_vreg, map_vreg),
+                width)
+        }
+        IrOp::Mul { dst, lhs, rhs, width, signed } => {
+            format!("Mul {} {} {} {:?} {}",
+                nv(dst.id, vreg_map, next_vreg, map_vreg),
+                nv(lhs.id, vreg_map, next_vreg, map_vreg),
+                nv(rhs.id, vreg_map, next_vreg, map_vreg),
+                width, signed)
+        }
+        IrOp::Copy { dst, src } => {
+            format!("Copy {} {}",
+                nv(dst.id, vreg_map, next_vreg, map_vreg),
+                nv(src.id, vreg_map, next_vreg, map_vreg))
+        }
+        IrOp::Label { label } => {
+            format!("Label {}", nl(label.0, label_map, next_label, map_label))
+        }
+        IrOp::Jump { target } => {
+            format!("Jump {}", nl(target.0, label_map, next_label, map_label))
+        }
+        IrOp::JumpIfTrue { cond, target } => {
+            format!("JumpIfTrue {} {}",
+                nv(cond.id, vreg_map, next_vreg, map_vreg),
+                nl(target.0, label_map, next_label, map_label))
+        }
+        IrOp::JumpIfFalse { cond, target } => {
+            format!("JumpIfFalse {} {}",
+                nv(cond.id, vreg_map, next_vreg, map_vreg),
+                nl(target.0, label_map, next_label, map_label))
+        }
+        IrOp::Return { value } => {
+            if let Some(v) = value {
+                format!("Return {}", nv(v.id, vreg_map, next_vreg, map_vreg))
+            } else {
+                "ReturnVoid".to_string()
+            }
+        }
+        IrOp::Call { func_name, args, dst } => {
+            let arg_strs: Vec<String> = args.iter().map(|a| nv(a.id, vreg_map, next_vreg, map_vreg)).collect();
+            let dst_str = dst.map(|d| nv(d.id, vreg_map, next_vreg, map_vreg)).unwrap_or_default();
+            format!("Call {} [{}] {}", func_name, arg_strs.join(","), dst_str)
+        }
+        // Fallback: use Debug representation.  This will NOT normalize vreg/label
+        // IDs, so functions differing only in those IDs won't be deduplicated
+        // through this branch.  In practice, uncommon ops (InlineAsm, LoadLocal,
+        // StoreLocal, etc.) rarely appear in specialization clones.
+        other => format!("{:?}", other),
+    }
+}
+
 fn remove_dead_functions(program: &mut IrProgram) {
     // Build a call-graph adjacency list (caller → callees) indexed by name.
     let func_map: HashMap<String, usize> = program
@@ -5015,5 +5373,111 @@ mod tests {
             "expected dead widen cast to be removed; got:\n{:#?}",
             result
         );
+    }
+
+    // -- Dedup specializations (Step 3) -----------------------------------
+
+    #[test]
+    fn dedup_identical_specializations() {
+        // Two call sites calling `add_one(x, 1)` with the same constant.
+        // function_specialization creates two __spec_ variants, but they are
+        // identical after optimization.  dedup_specializations should redirect
+        // both call sites to a single copy.
+        let mut callee = IrFunction::new("add_one", CType::int_signed());
+        let p0 = VReg::new(100, Width::W16);
+        let p1 = VReg::new(101, Width::W16);
+        let r  = VReg::new(102, Width::W16);
+        callee.params = vec![
+            crate::ir::IrParam { name: "a".into(), ty: CType::int_signed(), vreg: VReg::new(100, Width::W16) },
+            crate::ir::IrParam { name: "b".into(), ty: CType::int_signed(), vreg: VReg::new(101, Width::W16) },
+        ];
+        callee.body = vec![
+            IrInstr::bare(IrOp::LoadGlobal { dst: p0, addr_label: "_l_add_one_a".into() }),
+            IrInstr::bare(IrOp::LoadGlobal { dst: p1, addr_label: "_l_add_one_b".into() }),
+            IrInstr::bare(IrOp::Add { dst: r, lhs: p0, rhs: p1, width: Width::W16 }),
+            IrInstr::bare(IrOp::ret(Some(r))),
+        ];
+
+        let mut main_fn = IrFunction::new("main", CType::Void);
+        let c1  = VReg::new(0, Width::W16);
+        let a1  = VReg::new(1, Width::W16);
+        let r1  = VReg::new(2, Width::W16);
+        let c2  = VReg::new(3, Width::W16);
+        let a2  = VReg::new(4, Width::W16);
+        let r2  = VReg::new(5, Width::W16);
+        main_fn.body = vec![
+            // First call: add_one(10, 1)
+            IrInstr::bare(IrOp::LoadImm { dst: a1, value: 10 }),
+            IrInstr::bare(IrOp::LoadImm { dst: c1, value: 1 }),
+            IrInstr::bare(IrOp::Call { func_name: "add_one".into(), args: vec![a1, c1], dst: Some(r1) }),
+            // Second call: add_one(20, 1) — same constant arg at position 1
+            IrInstr::bare(IrOp::LoadImm { dst: a2, value: 20 }),
+            IrInstr::bare(IrOp::LoadImm { dst: c2, value: 1 }),
+            IrInstr::bare(IrOp::Call { func_name: "add_one".into(), args: vec![a2, c2], dst: Some(r2) }),
+            IrInstr::bare(IrOp::ret(None)),
+        ];
+
+        let mut program = IrProgram::new();
+        program.functions.push(main_fn);
+        program.functions.push(callee);
+        optimize(&mut program);
+
+        // After optimization: at most one __spec_ function should survive.
+        let spec_count = program.functions.iter()
+            .filter(|f| f.name.contains("__spec_"))
+            .count();
+        assert!(
+            spec_count <= 1,
+            "expected at most 1 __spec_ function after dedup, got {}: {:?}",
+            spec_count,
+            program.functions.iter().map(|f| &f.name).collect::<Vec<_>>()
+        );
+    }
+
+    // -- Compare-with-zero simplification (Step 4) ------------------------
+
+    #[test]
+    fn compare_zero_eq_jump_if_true_simplified() {
+        // Eq(x, 0) + JumpIfTrue → JumpIfFalse(x)
+        let x = VReg::new(0, Width::W16);
+        let zero = VReg::new(1, Width::W16);
+        let cmp = VReg::new(2, Width::W16);
+        let lbl = Label::new(10);
+        let body = vec![
+            IrInstr::bare(IrOp::LoadGlobal { dst: x, addr_label: "_g_x".into() }),
+            load_imm(1, Width::W16, 0),
+            IrInstr::bare(IrOp::Eq { dst: cmp, lhs: x, rhs: zero, width: Width::W16 }),
+            IrInstr::bare(IrOp::JumpIfTrue { cond: cmp, target: lbl }),
+            IrInstr::bare(IrOp::Label { label: lbl }),
+            IrInstr::bare(IrOp::ret(None)),
+        ];
+        let result = opt_body(body);
+        // Should have JumpIfFalse(x) instead of Eq+JumpIfTrue
+        let has_jump_if_false = result.iter().any(|i| {
+            matches!(&i.op, IrOp::JumpIfFalse { cond, .. } if cond.id == x.id)
+        });
+        assert!(has_jump_if_false, "expected JumpIfFalse(x) after simplification; got:\n{:#?}", result);
+    }
+
+    #[test]
+    fn compare_zero_ne_jump_if_true_simplified() {
+        // Ne(x, 0) + JumpIfTrue → JumpIfTrue(x)
+        let x = VReg::new(0, Width::W16);
+        let zero = VReg::new(1, Width::W16);
+        let cmp = VReg::new(2, Width::W16);
+        let lbl = Label::new(10);
+        let body = vec![
+            IrInstr::bare(IrOp::LoadGlobal { dst: x, addr_label: "_g_x".into() }),
+            load_imm(1, Width::W16, 0),
+            IrInstr::bare(IrOp::Ne { dst: cmp, lhs: x, rhs: zero, width: Width::W16 }),
+            IrInstr::bare(IrOp::JumpIfTrue { cond: cmp, target: lbl }),
+            IrInstr::bare(IrOp::Label { label: lbl }),
+            IrInstr::bare(IrOp::ret(None)),
+        ];
+        let result = opt_body(body);
+        let has_jump_if_true = result.iter().any(|i| {
+            matches!(&i.op, IrOp::JumpIfTrue { cond, .. } if cond.id == x.id)
+        });
+        assert!(has_jump_if_true, "expected JumpIfTrue(x) after simplification; got:\n{:#?}", result);
     }
 }

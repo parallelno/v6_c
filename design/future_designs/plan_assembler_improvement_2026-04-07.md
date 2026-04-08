@@ -17,7 +17,7 @@ All cycle counts use **Vector 06c (КР580ВМ80)** timings.
 
 ---
 
-## Step 1: PtrAdd Fast-Path for element_size 2/4/8
+## Step 1: PtrAdd Fast-Path for element_size 2/4/8 ✅ COMPLETE
 
 **Difficulty:** Easy  
 **Est. savings:** ~200–1800 cycles per array access  
@@ -41,7 +41,7 @@ already has fast-paths for constant `*2`, `*4`, `*8` using `DAD H`, but
 
 ---
 
-## Step 2: MVI M,n for Constant Stores
+## Step 2: MVI M,n for Constant Stores ✅ COMPLETE
 
 **Difficulty:** Easy  
 **Est. savings:** ~4–8 cycles per store  
@@ -64,7 +64,7 @@ frees the DE register pair.
 
 ---
 
-## Step 3: Dedup Identical Function Specializations
+## Step 3: Dedup Identical Function Specializations ✅ COMPLETE
 
 **Difficulty:** Easy  
 **Est. savings:** Code size only  
@@ -85,7 +85,7 @@ Dead originals also survive when they shouldn't.
 
 ---
 
-## Step 4: Compare-with-Zero Fast Path
+## Step 4: Compare-with-Zero Fast Path ✅ COMPLETE
 
 **Difficulty:** Easy  
 **Est. savings:** ~12 cycles per test  
@@ -108,7 +108,7 @@ produced first.
 
 ---
 
-## Step 5: Peephole — W16 Compare-Branch Collapse (Safety Net)
+## Step 5: Peephole — W16 Compare-Branch Collapse (Safety Net) ✅ COMPLETE
 
 **Difficulty:** Medium  
 **Est. savings:** Safety net for Step 7 (covers cases fusion misses)  
@@ -136,7 +136,7 @@ and collapses it.
 
 ---
 
-## Step 6: Eliminate Register Shuffles Around Compares
+## Step 6: Eliminate Register Shuffles Around Compares ✅ COMPLETE
 
 **Difficulty:** Medium  
 **Est. savings:** ~28 cycles per comparison (32 cycles for 4-MOV → 4 cycles for XCHG)  
@@ -544,35 +544,35 @@ variants. Usage may not be aggressive enough.
 
 ## Summary Table
 
-| Step | Optimization | Difficulty | Est. Impact (Vector cycles) |
-|------|-------------|------------|----------------------------|
-| 1 | PtrAdd fast-path (×2/4/8) | Easy | ~200–1800/access |
-| 2 | MVI M,n for constant stores | Easy | ~4–8/store |
-| 3 | Dedup identical specializations | Easy | Code size |
-| 4 | Compare-with-zero fast path | Easy | ~12/test |
-| 5 | Peephole W16 compare-branch collapse | Medium | Safety net |
-| 6 | Register shuffle elimination | Medium | ~28/compare |
-| 7 | W16 compare-branch fusion | Medium | ~70–100/compare |
-| 8 | Strength reduction 2*i+k | Medium | ~40/occurrence |
-| 9 | LICM for _l_ variables | Medium | ~20/loop iter |
-| 10 | CSE for repeated PtrAdd | Medium | ~200–1800/occurrence |
-| 11 | Cross-block store-reload forwarding | Medium | ~40/reload |
-| 12 | Expanded peephole rules | Medium | Variable |
-| 13 | Function-effect summaries | Medium | Architectural |
-| 14 | Selective save/restore | Medium-Hard | Variable |
-| 15 | Benchmark gate | Medium | Infrastructure |
-| 16 | Call-tree static-slot reuse | Hard | RAM savings |
-| 17 | Loop IV register promotion | Hard | ~56/loop iter |
-| 18 | Value-range analysis | Hard | Architectural |
-| 19 | 8-bit narrowing | Hard | Variable |
-| 20 | Call argument lowering | Hard | Variable |
-| 21 | Load/store forwarding + versioning | Hard | ~40/reload |
-| 22 | Rematerialization | Hard | Variable |
-| 23 | CFG block layout | Hard | Variable |
-| 24 | Inter-block register allocation | Very Hard | Variable |
-| 25 | Function specialization | Very Hard | Variable |
-| 26 | Runtime helper specialization | Very Hard | Variable |
-| 27 | Profile-guided pass ordering | Very Hard | Research |
+| Step | Optimization | Difficulty | Est. Impact (Vector cycles) | Status |
+|------|-------------|------------|----------------------------|--------|
+| 1 | PtrAdd fast-path (×2/4/8) | Easy | ~200–1800/access | ✅ DONE |
+| 2 | MVI M,n for constant stores | Easy | ~4–8/store | ✅ DONE |
+| 3 | Dedup identical specializations | Easy | Code size | ✅ DONE |
+| 4 | Compare-with-zero fast path | Easy | ~12/test | ✅ DONE |
+| 5 | Peephole W16 compare-branch collapse | Medium | Safety net | ✅ DONE |
+| 6 | Register shuffle elimination | Medium | ~28/compare | ✅ DONE |
+| 7 | W16 compare-branch fusion | Medium | ~70–100/compare | |
+| 8 | Strength reduction 2*i+k | Medium | ~40/occurrence | |
+| 9 | LICM for _l_ variables | Medium | ~20/loop iter | |
+| 10 | CSE for repeated PtrAdd | Medium | ~200–1800/occurrence | |
+| 11 | Cross-block store-reload forwarding | Medium | ~40/reload | |
+| 12 | Expanded peephole rules | Medium | Variable | |
+| 13 | Function-effect summaries | Medium | Architectural | |
+| 14 | Selective save/restore | Medium-Hard | Variable | |
+| 15 | Benchmark gate | Medium | Infrastructure | |
+| 16 | Call-tree static-slot reuse | Hard | RAM savings | |
+| 17 | Loop IV register promotion | Hard | ~56/loop iter | |
+| 18 | Value-range analysis | Hard | Architectural | |
+| 19 | 8-bit narrowing | Hard | Variable | |
+| 20 | Call argument lowering | Hard | Variable | |
+| 21 | Load/store forwarding + versioning | Hard | ~40/reload | |
+| 22 | Rematerialization | Hard | Variable | |
+| 23 | CFG block layout | Hard | Variable | |
+| 24 | Inter-block register allocation | Very Hard | Variable | |
+| 25 | Function specialization | Very Hard | Variable | |
+| 26 | Runtime helper specialization | Very Hard | Variable | |
+| 27 | Profile-guided pass ordering | Very Hard | Research | |
 
 ## Recommended First Slice (highest ROI)
 
