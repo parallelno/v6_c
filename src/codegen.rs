@@ -2072,6 +2072,9 @@ impl CodeGenerator {
         // This saves ~70–100 cycles per comparison.
         // ----------------------------------------------------------------
         if width == Width::W16 || width == Width::W32 {
+            // Peek at the next IR op: (target_label, branch_if_true).
+            // branch_if_true = true  → JumpIfTrue  (branch when cmp is true)
+            // branch_if_true = false → JumpIfFalse (branch when cmp is false)
             let fuse_target: Option<(Label, bool)> = match next_op {
                 Some(IrOp::JumpIfTrue  { cond, target }) if cond.id == dst.id => Some((*target, true)),
                 Some(IrOp::JumpIfFalse { cond, target }) if cond.id == dst.id => Some((*target, false)),

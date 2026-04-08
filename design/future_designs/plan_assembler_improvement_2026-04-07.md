@@ -552,12 +552,12 @@ variants. Usage may not be aggressive enough.
 | 4 | Compare-with-zero fast path | Easy | ~12/test | ✅ DONE |
 | 5 | Peephole W16 compare-branch collapse | Medium | Safety net | ✅ DONE |
 | 6 | Register shuffle elimination | Medium | ~28/compare | ✅ DONE |
-| 7 | W16 compare-branch fusion | Medium | ~70–100/compare | |
-| 8 | Strength reduction 2*i+k | Medium | ~40/occurrence | |
-| 9 | LICM for _l_ variables | Medium | ~20/loop iter | |
-| 10 | CSE for repeated PtrAdd | Medium | ~200–1800/occurrence | |
-| 11 | Cross-block store-reload forwarding | Medium | ~40/reload | |
-| 12 | Expanded peephole rules | Medium | Variable | |
+| 7 | W16 compare-branch fusion | Medium | ~70–100/compare | ✅ DONE |
+| 8 | Strength reduction 2*i+k | Medium | ~40/occurrence | ✅ DONE |
+| 9 | LICM for _l_ variables | Medium | ~20/loop iter | ✅ DONE |
+| 10 | CSE for repeated PtrAdd | Medium | ~200–1800/occurrence | ✅ DONE |
+| 11 | Cross-block store-reload forwarding | Medium | ~40/reload | ✅ DONE |
+| 12 | Expanded peephole rules | Medium | Variable | ✅ DONE |
 | 13 | Function-effect summaries | Medium | Architectural | |
 | 14 | Selective save/restore | Medium-Hard | Variable | |
 | 15 | Benchmark gate | Medium | Infrastructure | |

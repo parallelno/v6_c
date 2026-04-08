@@ -1623,7 +1623,9 @@ fn strength_reduce(func: &mut IrFunction) -> bool {
 
     for (idx, instr) in func.body.iter().enumerate() {
         match &instr.op {
-            // Add(x, x) → candidate for Shl(x, 1)
+            // Add(x, x) → candidate for Shl(x, 1).
+            // Skip W8: byte-width shifts use a rotate loop in codegen which
+            // is no faster than a self-add (INR A / DAA is shorter).
             IrOp::Add { lhs, rhs, width, .. } if lhs.id == rhs.id && *width != Width::W8 => {
                 max_vreg_id += 1;
                 add_self_conversions.push((idx, max_vreg_id));
@@ -3343,7 +3345,9 @@ fn loop_invariant_code_motion(func: &mut IrFunction) -> bool {
         // Step 9 (LICM for _l_ variables): collect labels that are stored
         // to inside the loop and check for calls.  LoadGlobal for _l_*
         // labels that are not stored inside the loop (and have no calls
-        // that could alias them) can be safely hoisted.
+        // that could alias them) can be safely hoisted.  We disqualify
+        // loops with calls because a callee may store to _l_* variables
+        // through its own local storage or via inline assembly.
         let mut loop_stored_labels: HashSet<String> = HashSet::new();
         let mut loop_has_call = false;
         for idx in lp.header_idx..=lp.back_edge_idx {
