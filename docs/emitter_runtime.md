@@ -102,7 +102,8 @@ The runtime consists of **13 hand-optimized Intel 8080 assembly modules** (~3,30
 | 16-bit shifts | [shift.asm](../runtime/shift.asm) | `__shl16`, `__shr16u`, `__shr16s` | Loop-based, A = shift count |
 | 32-bit shifts | [shift32.asm](../runtime/shift32.asm) | `__shl32`, `__shr32u`, `__shr32s` | Loop-based on `__op1` memory; clamped to 0..31 |
 | 16-bit compare | [cmp.asm](../runtime/cmp.asm) | `__cmp16u`, `__cmp16s` | Sets carry flag; signed handles different-sign cases |
-| Float | [float.asm](../runtime/float.asm) | `__fadd`, `__fsub`, `__fmul`, `__fdiv`, `__fcmp_*`, conversions | IEEE 754 single-precision soft-float: unpack/pack/normalize, int↔float |
+| Float | [float.asm](../runtime/float.asm) | `__fadd`, `__fsub`, `__fmul`, `__fdiv`, `__feq`..`__fge`, `__itof`, `__ftoi` | IEEE 754 single-precision soft-float ([details](float.md)) |
+| Shared operands | [ops.asm](../runtime/ops.asm) | `__op1`, `__op2` | 4-byte memory-resident operand slots shared by float, mul32, div32, shift32 |
 
 ### Memory & String
 
@@ -131,10 +132,11 @@ stdio   ──→ (standalone, port I/O)
 stdlib  ──→ __mul16 (rand uses multiplication)
 string  ──→ (standalone)
 memcpy  ──→ (standalone)
-float   ──→ (standalone)
-div32   ──→ defines __op1/__op2 storage (shared with mul32, shift32)
-mul32   ──→ __op1/__op2 (from div32)
-shift32 ──→ __op1/__op2 (from div32)
+ops     ──→ (standalone, defines __op1/__op2 storage)
+float   ──→ __op1/__op2 (from ops)
+div32   ──→ __op1/__op2 (from ops)
+mul32   ──→ __op1/__op2 (from ops)
+shift32 ──→ __op1/__op2 (from ops)
 ```
 
 ### 32-bit Operand Convention

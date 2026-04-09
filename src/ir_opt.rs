@@ -1380,7 +1380,12 @@ fn constant_fold_and_propagate(func: &mut IrFunction) -> bool {
             // Unary ops
             IrOp::Neg { dst, src, width } => {
                 if let Some(&a) = constants.get(&src.id) {
-                    let result = wrap_result(a.wrapping_neg(), *width);
+                    let result = if *width == Width::W32 {
+                        // Float negation: flip the sign bit (bit 31).
+                        wrap_result(a ^ (1i64 << 31), *width)
+                    } else {
+                        wrap_result(a.wrapping_neg(), *width)
+                    };
                     constants.insert(dst.id, result);
                     new_body.push(IrInstr {
                         op: IrOp::LoadImm { dst: *dst, value: result },

@@ -1,5 +1,4 @@
 /* arith.c — basic arithmetic test for v6c */
-cargo test run_unit_rom_execution_suite -- --nocapturecargo test run_unit_rom_execution_suite -- --nocapture
 int add(int a, int b)
 {
     return a + b;

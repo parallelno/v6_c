@@ -23,6 +23,7 @@ const STRING_ASM: &str = include_str!("../runtime/string.asm");
 const STDIO_ASM: &str = include_str!("../runtime/stdio.asm");
 const STDLIB_ASM: &str = include_str!("../runtime/stdlib.asm");
 const FLOAT_ASM: &str = include_str!("../runtime/float.asm");
+const OPS_ASM: &str = include_str!("../runtime/ops.asm");
 
 // ---------------------------------------------------------------------------
 // Runtime module descriptors
@@ -60,7 +61,7 @@ static MODULES: &[RuntimeModule] = &[
     RuntimeModule {
         symbols: &["__mul32"],
         asm: MUL32_ASM,
-        deps: &[],
+        deps: &["__op1"],
     },
     RuntimeModule {
         symbols: &[
@@ -68,7 +69,7 @@ static MODULES: &[RuntimeModule] = &[
             "__abs32_op1", "__abs32_op2", "__neg32_op1", "__divmod32u",
         ],
         asm: DIV32_ASM,
-        deps: &[],
+        deps: &["__op1"],
     },
     RuntimeModule {
         symbols: &["__shl16", "__shr16u", "__shr16s"],
@@ -78,7 +79,7 @@ static MODULES: &[RuntimeModule] = &[
     RuntimeModule {
         symbols: &["__shl32", "__shr32u", "__shr32s"],
         asm: SHIFT32_ASM,
-        deps: &[],
+        deps: &["__op1"],
     },
     RuntimeModule {
         symbols: &["__cmp16u", "__cmp16s"],
@@ -115,6 +116,11 @@ static MODULES: &[RuntimeModule] = &[
             "__itof", "__ftoi",
         ],
         asm: FLOAT_ASM,
+        deps: &["__op1"],
+    },
+    RuntimeModule {
+        symbols: &["__op1", "__op2"],
+        asm: OPS_ASM,
         deps: &[],
     },
 ];

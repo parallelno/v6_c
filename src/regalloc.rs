@@ -177,6 +177,19 @@ impl RegAllocator {
         label
     }
 
+    /// Allocate a fresh spill label without spilling any register.
+    /// The caller is responsible for emitting the store instructions.
+    pub fn alloc_spill_label(&mut self) -> String {
+        self.fresh_spill_label()
+    }
+
+    /// Mark a vreg as living at the given memory label, without emitting
+    /// any move instructions.  The caller must have already stored the
+    /// value at `label`.
+    pub fn mark_in_memory(&mut self, vreg: VReg, label: String) {
+        self.vreg_map.insert(vreg.id, Location::Memory(label));
+    }
+
     /// Spill the current occupant of `reg` to memory and return the
     /// [`MoveOp`] the caller must emit.  If the register is already free,
     /// returns `None`.

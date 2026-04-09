@@ -27,25 +27,26 @@
 | 13 | [Calling Convention](calling_convention.md) | Register passing, return values, global vs stack mode calling mechanics |
 | 14 | [Inline Assembly](inline_asm.md) | `asm { }` blocks, parameterized asm, full-body asm functions, clobber hints |
 | 15 | [Standard Library](stdlib.md) | C headers, runtime library functions, assembly implementations |
-| 16 | [Testing](testing.md) | Test pipeline, unit tests, execution tests, benchmarks, test harness |
-| 17 | [Contributing Guide](contributing.md) | Building from source, running tests, adding tests, project structure |
+| 16 | [Floating Point](float.md) | IEEE 754 soft-float: format, runtime routines, W32 codegen, test suite |
+| 17 | [Testing](testing.md) | Test pipeline, unit tests, execution tests, benchmarks, test harness |
+| 18 | [Contributing Guide](contributing.md) | Building from source, running tests, adding tests, project structure |
 
 ### Design Documents
 
 | # | Document | Description |
 |---|----------|-------------|
-| 18 | [Project Plan](design/plan.md) | Master plan: audit, design decisions, implementation phases, performance targets |
-| 19 | [Inline Assembly Design](design/design_inline_asm.md) | Full design specification for inline assembly support |
-| 20 | [Inline Assembly Examples](design/design_inline_asm_examples.md) | Clobber hint examples and overhead comparison |
-| 21 | [Execution Test Plan](design/plan_execution_tests_2026-03-31.md) | Plan for v6emul-based ROM execution verification |
-| 22 | [Optimization Unit Test Plan](design/plan_optimization_unit_tests_2026-03-27.md) | Policy and coverage matrix for optimization unit tests |
+| 19 | [Project Plan](design/plan.md) | Master plan: audit, design decisions, implementation phases, performance targets |
+| 20 | [Inline Assembly Design](design/design_inline_asm.md) | Full design specification for inline assembly support |
+| 21 | [Inline Assembly Examples](design/design_inline_asm_examples.md) | Clobber hint examples and overhead comparison |
+| 22 | [Execution Test Plan](design/plan_execution_tests_2026-03-31.md) | Plan for v6emul-based ROM execution verification |
+| 23 | [Optimization Unit Test Plan](design/plan_optimization_unit_tests_2026-03-27.md) | Policy and coverage matrix for optimization unit tests |
 
 ### Future / Planned Work
 
 | # | Document | Description | Status |
 |---|----------|-------------|--------|
-| 23 | [Optimization Improvement Plan](design/future_designs/plan_optimization_2026-03-27.md) | Prioritized roadmap for c8080-inspired optimizations | **Planned** |
-| 24 | [Optimization Report](design/future_designs/report_optimization_2026-03-30.md) | Detailed analysis of generated code with 15 improvement proposals | **Planned** |
+| 24 | [Optimization Improvement Plan](design/future_designs/plan_optimization_2026-03-27.md) | Prioritized roadmap for c8080-inspired optimizations | **Planned** |
+| 25 | [Optimization Report](design/future_designs/report_optimization_2026-03-30.md) | Detailed analysis of generated code with 15 improvement proposals | **Planned** |
 
 ---
 

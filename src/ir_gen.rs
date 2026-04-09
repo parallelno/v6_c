@@ -1038,10 +1038,8 @@ impl IrGenerator {
             ExprKind::Subscript { array, index } => self.gen_subscript(array, index),
 
             ExprKind::Cast { ty, expr: inner } => {
-                let (src, _) = self.gen_expr(inner);
-                let dst_w = Width::from_ctype(ty).unwrap_or(Width::W16);
-                let dst = self.vreg_alloc.alloc(dst_w);
-                self.emit(IrOp::cast(dst, src, ty.clone()));
+                let (src, src_ty) = self.gen_expr(inner);
+                let dst = self.maybe_cast(src, &src_ty, ty);
                 (dst, ty.clone())
             }
 

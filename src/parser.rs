@@ -229,6 +229,7 @@ impl<'t> Parser<'t> {
                 | TokenKind::Int
                 | TokenKind::Long
                 | TokenKind::Short
+                | TokenKind::Float
                 | TokenKind::Signed
                 | TokenKind::Unsigned
                 | TokenKind::Const

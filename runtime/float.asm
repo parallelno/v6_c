@@ -519,7 +519,7 @@ __fmul:
 	MOV B,A
 	LDA __fa_e2
 	ADD B
-	SUI 127                 ; subtract bias
+	SUI 126                 ; subtract bias (126 = 127+24-25 accounts for 24-iter shift-and-add)
 	STA __fa_e1
 	; Multiply mantissas: m1 (24 bit) * m2 (24 bit) -> 48 bits
 	; We only need the top 24 bits for the result.
@@ -555,10 +555,14 @@ __fmul_loop:
 	LDA __fa_m1+2
 	ADC B
 	STA __fa_tmp+5
+	; Carry from addition must be shifted into accumulator
+	JMP __fmul_shift
 __fmul_noadd:
-	; Shift accumulator right by 1 (48 bits)
-	LDA __fa_tmp+5
+	; No addition — clear carry before shift
 	ORA A
+__fmul_shift:
+	; Shift accumulator right by 1 (48 bits), carry propagates from add overflow
+	LDA __fa_tmp+5
 	RAR
 	STA __fa_tmp+5
 	LDA __fa_tmp+4
@@ -638,11 +642,49 @@ __fdiv:
 	MOV C,A
 	MOV A,B
 	SUB C
-	ADI 127                 ; add bias
+	ADI 126                 ; add bias (126 not 127: restoring div gives Q=m1*2^24/m2)
 	STA __fa_e1
 	; Divide mantissas: m1 / m2, producing 24-bit quotient
 	; Use restoring division: shift dividend left, subtract divisor,
 	; quotient bits shift into result.
+	; Pre-check: if m1 >= m2, shift m1 right by 1 and increment exponent
+	; to ensure quotient fits in 24 bits.
+	LDA __fa_m1+2
+	MOV B,A
+	LDA __fa_m2+2
+	CMP B                   ; m2+2 - m1+2
+	JC __fdiv_preadj        ; m2 < m1 -> need adjustment
+	JNZ __fdiv_noadj        ; m2 > m1 -> no adjustment
+	LDA __fa_m1+1
+	MOV B,A
+	LDA __fa_m2+1
+	CMP B
+	JC __fdiv_preadj
+	JNZ __fdiv_noadj
+	LDA __fa_m1
+	MOV B,A
+	LDA __fa_m2
+	CMP B
+	JC __fdiv_preadj
+	; m1 == m2 or m1 <= m2 with equal bytes -> also adjust (m1 >= m2)
+__fdiv_preadj:
+	; Shift m1 right by 1 (halve the dividend)
+	; This compensates for the extra factor of 2 in the restoring division
+	LDA __fa_m1+2
+	ORA A
+	RAR
+	STA __fa_m1+2
+	LDA __fa_m1+1
+	RAR
+	STA __fa_m1+1
+	LDA __fa_m1
+	RAR
+	STA __fa_m1
+	; Increment exponent to compensate for halving
+	LDA __fa_e1
+	INR A
+	STA __fa_e1
+__fdiv_noadj:
 	; Clear quotient in __fa_tmp (3 bytes)
 	XRA A
 	STA __fa_tmp

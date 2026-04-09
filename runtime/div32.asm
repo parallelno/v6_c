@@ -327,9 +327,3 @@ __dm32_sv:
 	.storage 4		; saved remainder for restore
 __dm32_cnt:
 	.storage 1		; loop counter
-
-; Shared operand storage (used by mul32, div32, shift32)
-__op1:
-	.storage 4
-__op2:
-	.storage 4

@@ -1005,19 +1005,16 @@ impl CodeGenerator {
             Width::W32 => {
                 let lo = (value & 0xFFFF) as u16;
                 let hi = ((value >> 16) & 0xFFFF) as u16;
+                // Allocate a spill slot and store both halves directly.
+                // W32 values live in memory; HL only ever holds the low 16.
+                let label = self.regalloc.alloc_spill_label();
+                self.spill_widths.insert(label.clone(), Width::W32);
                 self.emit_inst(&format!("LXI H,{}", lo));
-                self.mark(dst, PhysReg::HL);
-                // Spill immediately so the full value is in memory.
-                let save_ops = self.regalloc.save_all();
-                self.emit_moves(&save_ops);
-                // Store high 16 bits next to the low 16.
-                if let Some(Location::Memory(label)) = self.regalloc.get_location(dst).cloned() {
-                    self.emit_inst(&format!("LXI H,{}", hi));
-                    self.emit_inst(&format!("SHLD {}+2", label));
-                }
-                // Reload low 16 into HL for downstream use.
-                self.emit_inst(&format!("LXI H,{}", lo));
-                self.mark(dst, PhysReg::HL);
+                self.emit_inst(&format!("SHLD {}", label));
+                self.emit_inst(&format!("LXI H,{}", hi));
+                self.emit_inst(&format!("SHLD {}+2", label));
+                // Mark vreg as in memory (not in a register).
+                self.regalloc.mark_in_memory(dst, label);
             }
         }
     }
@@ -1057,11 +1054,22 @@ impl CodeGenerator {
                 self.emit_inst(&format!("LDA {}", addr_label));
                 self.a_mirrors = Some(addr_label.to_string());
             }
-            Width::W16 | Width::W32 => {
+            Width::W16 => {
                 // Evict HL's occupant BEFORE LHLD overwrites HL.
                 let ops = self.regalloc.mark_allocated(dst, PhysReg::HL);
                 self.emit_moves(&ops);
                 self.emit_inst(&format!("LHLD {}", addr_label));
+            }
+            Width::W32 => {
+                // Copy all 4 bytes from the global into a fresh spill slot.
+                let label = self.regalloc.alloc_spill_label();
+                self.spill_widths.insert(label.clone(), Width::W32);
+                self.emit_inst(&format!("LHLD {}", addr_label));
+                self.emit_inst(&format!("SHLD {}", label));
+                self.emit_inst(&format!("LHLD {}+2", addr_label));
+                self.emit_inst(&format!("SHLD {}+2", label));
+                self.regalloc.mark_in_memory(dst, label);
+                self.regalloc.clobber(PhysReg::HL);
             }
         }
     }
@@ -1076,9 +1084,18 @@ impl CodeGenerator {
                 // move a different value into A), so unconditionally set here.
                 self.a_mirrors = Some(addr_label.to_string());
             }
-            Width::W16 | Width::W32 => {
+            Width::W16 => {
                 self.ensure_hl(src);
                 self.emit_inst(&format!("SHLD {}", addr_label));
+            }
+            Width::W32 => {
+                // Copy all 4 bytes from the memory-resident source to the global.
+                let src_label = self.w32_mem_label(src);
+                self.emit_inst(&format!("LHLD {}", src_label));
+                self.emit_inst(&format!("SHLD {}", addr_label));
+                self.emit_inst(&format!("LHLD {}+2", src_label));
+                self.emit_inst(&format!("SHLD {}+2", addr_label));
+                self.regalloc.clobber(PhysReg::HL);
             }
         }
     }
@@ -2181,7 +2198,7 @@ impl CodeGenerator {
                 self.emit_inst("INR A");
                 self.mark(dst, PhysReg::A);
             }
-            Width::W16 | Width::W32 => {
+            Width::W16 => {
                 self.ensure_hl(src);
                 // Complement HL and increment
                 self.emit_inst("MOV A,H");
@@ -2192,6 +2209,24 @@ impl CodeGenerator {
                 self.emit_inst("MOV L,A");
                 self.emit_inst("INX H");
                 self.mark(dst, PhysReg::HL);
+            }
+            Width::W32 => {
+                // Float negation: flip the sign bit (bit 31 = MSB of high word).
+                // Copy src to a new spill, then XOR byte 3 with 0x80.
+                let src_label = self.w32_mem_label(src);
+                let dst_label = self.regalloc.alloc_spill_label();
+                self.spill_widths.insert(dst_label.clone(), Width::W32);
+                // Copy low 16 bits
+                self.emit_inst(&format!("LHLD {}", src_label));
+                self.emit_inst(&format!("SHLD {}", dst_label));
+                // Copy and flip sign bit in high 16 bits
+                self.emit_inst(&format!("LHLD {}+2", src_label));
+                self.emit_inst("MOV A,H");
+                self.emit_inst("XRI 128");
+                self.emit_inst("MOV H,A");
+                self.emit_inst(&format!("SHLD {}+2", dst_label));
+                self.regalloc.mark_in_memory(dst, dst_label);
+                self.regalloc.clobber(PhysReg::HL);
             }
         }
     }
@@ -2495,8 +2530,15 @@ impl CodeGenerator {
             match d.width {
                 // Comparisons and __ftoi return W16 in HL.
                 Width::W16 => self.mark(d, PhysReg::HL),
-                // Arithmetic results: low 16 of __op1 in HL.
-                Width::W32 => self.mark(d, PhysReg::HL),
+                // Arithmetic results: full 32-bit value in __op1, low 16 in HL.
+                // Copy __op1 into a spill slot so the value is self-contained.
+                Width::W32 => {
+                    let label = self.regalloc.alloc_spill_label();
+                    self.spill_widths.insert(label.clone(), Width::W32);
+                    self.emit_op1_to_w32(&label);
+                    self.regalloc.mark_in_memory(d, label);
+                    self.regalloc.clobber(PhysReg::HL);
+                }
                 Width::W8 => self.mark(d, PhysReg::A),
             }
         }
@@ -2649,7 +2691,7 @@ impl CodeGenerator {
             if let Some(pos) = line.find("__spill_") {
                 let rest = &line[pos..];
                 let end = rest
-                    .find(|c: char| c.is_whitespace() || c == ',' || c == ')')
+                    .find(|c: char| c.is_whitespace() || c == ',' || c == ')' || c == '+')
                     .unwrap_or(rest.len());
                 let label = rest[..end].to_string();
                 if !spill_labels.contains(&label) {
