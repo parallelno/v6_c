@@ -26,21 +26,23 @@ $v6emulBin = Join-Path $repoRoot "tools\v6emul\v6emul"
 $strictMode = $RequireV6asm -or (-not $AllowAsmFailure)
 
 function Resolve-V6asm {
-    if (Test-Path $v6asmExe) {
-        return $v6asmExe
-    }
-    if (Test-Path $v6asmBin) {
-        return $v6asmBin
+    if ($IsWindows -or (-not (Test-Path variable:IsWindows))) {
+        if (Test-Path $v6asmExe) { return $v6asmExe }
+        if (Test-Path $v6asmBin) { return $v6asmBin }
+    } else {
+        if (Test-Path $v6asmBin) { return $v6asmBin }
+        if (Test-Path $v6asmExe) { return $v6asmExe }
     }
     return $null
 }
 
 function Resolve-V6emul {
-    if (Test-Path $v6emulExe) {
-        return $v6emulExe
-    }
-    if (Test-Path $v6emulBin) {
-        return $v6emulBin
+    if ($IsWindows -or (-not (Test-Path variable:IsWindows))) {
+        if (Test-Path $v6emulExe) { return $v6emulExe }
+        if (Test-Path $v6emulBin) { return $v6emulBin }
+    } else {
+        if (Test-Path $v6emulBin) { return $v6emulBin }
+        if (Test-Path $v6emulExe) { return $v6emulExe }
     }
     return $null
 }

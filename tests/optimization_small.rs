@@ -10,8 +10,16 @@ fn run_optimization_small_test_suite() {
     let v6emul_exe = repo_root.join("tools").join("v6emul").join("v6emul.exe");
     let v6emul_bin = repo_root.join("tools").join("v6emul").join("v6emul");
 
-    let has_v6asm = v6asm_exe.exists() || v6asm_bin.exists();
-    let has_v6emul = v6emul_exe.exists() || v6emul_bin.exists();
+    let has_v6asm = if cfg!(windows) {
+        v6asm_exe.exists()
+    } else {
+        v6asm_bin.exists()
+    };
+    let has_v6emul = if cfg!(windows) {
+        v6emul_exe.exists()
+    } else {
+        v6emul_bin.exists()
+    };
 
     if !has_v6asm {
         eprintln!("Skipping optimization_small test: v6asm not found in tools/v6asm");
