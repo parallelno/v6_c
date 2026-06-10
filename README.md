@@ -2,6 +2,9 @@
 
 > C compiler for Intel 8080 (KR580VM80A).
 
+## Is Not Supported
+This project has been superseded by [v6llvmc](https://github.com/parallelno/v6llvmc) and will no longer be supported.
+
 ## Quick Start
 
 ```bash
